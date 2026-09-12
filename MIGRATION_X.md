@@ -69,6 +69,11 @@ comments and bundled smoke tests do not by themselves establish passing tests.
   its importer/render path is fully validated.
 - `next` defaults are restored: new/legacy-missing tracks use
   `smoothOverlaps=false`, and project WAV export writes stereo 24-bit audio.
+- UTAU and Melodyne-compatible tracks now share the same editor geometry: the
+  tools stay in a fixed common row and the mode-specific fields occupy a fixed
+  second row.  Melodyne tracks show their common expression controls in that
+  row; UTAU tracks replace those fields with voicebank/alias/flag controls.
+  Tool buttons retain this project's `icon.*` IDs and artwork.
 - `/mnt/c` probing currently finds Melodyne 5/4 executables, VST3 and core DLL
   candidates.  This is discovery only; no DLL or licence is loaded.
 - `MelodyneProvider` now gates the import button and merged-render scheduler.

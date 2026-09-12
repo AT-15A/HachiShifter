@@ -2188,10 +2188,13 @@ void MainComponent::resized()
     volumeParamButton.setTooltip(utauEditorActive
         ? utf8("显示全部 UTAU 音符的振幅包络；拖动标点编辑，双击曲线加点，右键内部标点删除")
         : strings.text("param.volume"));
-    const auto utauEditorHeight = utauEditorActive ? 36 : 0;
+    // Both editing modes reserve the same second row.  Its contents change,
+    // but the piano-roll origin must not jump when switching between the
+    // Melodyne-compatible and UTAU workflows.
+    constexpr auto modeEditorHeight = 36;
     const auto sampleEditorHeight = sourceEditActive ? 36 : 0;
     const auto splitAvailable = std::max(1, area.getHeight() - 8 - 36
-        - sampleEditorHeight - utauEditorHeight);
+        - sampleEditorHeight - modeEditorHeight);
     // Folded away, the arrangement takes no room at all and the splitter goes
     // with it -- there is nothing left above to drag against.
     const auto upperHeight = tracksCollapsed ? 0
@@ -2262,6 +2265,9 @@ void MainComponent::resized()
     takeParameter(pointButton, 27);
     takeParameter(wrenchButton, 27);
     takeParameter(connectButton, 27);
+    // The common row ends with the view menu and optional robust-pitch toggle.
+    // Parameter controls are placed in the mode row below, not mixed into the
+    // tool row, so both modes retain the same tool geometry.
     for (auto* component : { static_cast<juce::Component*>(&smoothCaption),
          static_cast<juce::Component*>(&smoothSlider),
          static_cast<juce::Component*>(&pitchParamButton),
@@ -2270,34 +2276,11 @@ void MainComponent::resized()
          static_cast<juce::Component*>(&breathParamButton),
          static_cast<juce::Component*>(&tensionParamButton),
          static_cast<juce::Component*>(&formantParamButton),
-         static_cast<juce::Component*>(&volumeParamButton) })
-        component->setVisible(!utauEditorActive);
-    volumeParamButton.setVisible(true);
-    if (!utauEditorActive)
-    {
-        takeParameter(smoothCaption, 42);
-        takeParameter(smoothSlider, 118);
-        takeParameter(pitchParamButton, 50);
-        takeParameter(driftParamButton, 50);
-        takeParameter(attackParamButton, 50);
-        takeParameter(breathParamButton, 50);
-        takeParameter(tensionParamButton, 50);
-        takeParameter(formantParamButton, 50);
-        takeParameter(volumeParamButton, 50);
-    }
-    else
-    {
-        takeParameter(volumeParamButton, 78);
-        takeParameter(flagEnvelopeButton, 78);
-    }
-    flagEnvelopeButton.setVisible(utauEditorActive);
-    envelopePresetCaption.setVisible(utauEditorActive);
-    if (utauEditorActive) takeParameter(envelopePresetCaption, 60);
-    for (auto& button : envelopePresetButtons)
-    {
-        button.setVisible(utauEditorActive);
-        if (utauEditorActive) takeParameter(button, 46);
-    }
+         static_cast<juce::Component*>(&volumeParamButton),
+         static_cast<juce::Component*>(&flagEnvelopeButton),
+         static_cast<juce::Component*>(&envelopePresetCaption) })
+        component->setVisible(false);
+    for (auto& button : envelopePresetButtons) button.setVisible(false);
     // After the envelope presets, at the end of the row, as asked.  That puts
     // it past the controls that come and go with the mode, so unlike before it
     // does not sit at a fixed x.
@@ -2335,7 +2318,7 @@ void MainComponent::resized()
         takeSample(otoImportButton, 82);
         takeSample(otoExportButton, 82);
     }
-    auto utauBar = area.removeFromTop(utauEditorHeight).reduced(4, 3);
+    auto modeBar = area.removeFromTop(modeEditorHeight).reduced(4, 3);
     for (auto* component : { static_cast<juce::Component*>(&utauVoicebankLabel),
          static_cast<juce::Component*>(&utauVoicebankButton),
          static_cast<juce::Component*>(&utauVoicebankPath),
@@ -2346,17 +2329,17 @@ void MainComponent::resized()
          static_cast<juce::Component*>(&noteFlagsLabel),
          static_cast<juce::Component*>(&noteFlagsEditor),
          static_cast<juce::Component*>(&flagCurveButton) })
-        component->setVisible(utauEditorActive);
+         component->setVisible(utauEditorActive);
     if (utauEditorActive)
     {
-        const auto takeUtau = [&utauBar](juce::Component& component, int width)
+        const auto takeUtau = [&modeBar](juce::Component& component, int width)
         {
-            component.setBounds(utauBar.removeFromLeft(width));
-            utauBar.removeFromLeft(4);
+            component.setBounds(modeBar.removeFromLeft(width));
+            modeBar.removeFromLeft(4);
         };
         takeUtau(utauVoicebankLabel, 76);
         takeUtau(utauVoicebankButton, 108);
-        takeUtau(utauVoicebankPath, std::min(330, std::max(100, utauBar.getWidth() - 620)));
+        takeUtau(utauVoicebankPath, std::min(330, std::max(100, modeBar.getWidth() - 620)));
         takeUtau(noteAliasLabel, 92);
         takeUtau(noteAliasEditor, 130);
         takeUtau(noteConsonantVelocityLabel, 72);
@@ -2364,8 +2347,31 @@ void MainComponent::resized()
         takeUtau(noteFlagsLabel, 42);
         // Leave room for the switch beside it rather than running the box to
         // the end of the bar.
-        takeUtau(noteFlagsEditor, std::max(90, utauBar.getWidth() - 96));
-        takeUtau(flagCurveButton, std::min(92, std::max(0, utauBar.getWidth())));
+        takeUtau(noteFlagsEditor, std::max(90, modeBar.getWidth() - 96));
+        takeUtau(flagCurveButton, std::min(92, std::max(0, modeBar.getWidth())));
+    }
+    else
+    {
+        // Melodyne-compatible tracks use the same row for their common
+        // expression controls.  The buttons keep their existing handlers and
+        // the project's custom icons; only their placement is shared with UTAU.
+        const auto takeCommon = [&modeBar](juce::Component& component, int width)
+        {
+            component.setVisible(true);
+            component.setBounds(modeBar.removeFromLeft(width));
+            modeBar.removeFromLeft(4);
+        };
+        takeCommon(smoothCaption, 42);
+        takeCommon(smoothSlider, 118);
+        takeCommon(pitchParamButton, 50);
+        takeCommon(driftParamButton, 50);
+        takeCommon(attackParamButton, 50);
+        takeCommon(breathParamButton, 50);
+        takeCommon(tensionParamButton, 50);
+        takeCommon(formantParamButton, 50);
+        takeCommon(volumeParamButton, 50);
+        robustPitchCurveButton.setVisible(pitchAlgorithm.getSelectedId() == 1);
+        if (robustPitchCurveButton.isVisible()) takeCommon(robustPitchCurveButton, 104);
     }
     constexpr auto zoomButtonSize = 24;
     constexpr auto zoomButtonGap = 2;
