@@ -27,14 +27,17 @@ jobs:
             hachi-fetch-windows-
 
       - name: Configure
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
         run: |
           cmake -S juce -B build-windows `
-            -G "Visual Studio 17 2022" -A x64 `
+            -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DFETCHCONTENT_BASE_DIR="$env:FETCH_CACHE"
 
       - name: Build
-        run: cmake --build build-windows --config Release --target HachiShifterNext -- -m
+        run: cmake --build build-windows --target HachiShifterNext -- -j32
 
       - name: Package
         shell: pwsh
@@ -42,7 +45,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $binary = Get-ChildItem -Path build-windows -Recurse -Filter "*.exe" |
-            Where-Object { $_.FullName -match "_artefacts" } |
+            Where-Object { $_.FullName -match "_artefacts" -and $_.Name -like "HachiShifter*.exe" } |
             Select-Object -First 1
           if (-not $binary) { throw "No HachiShifter executable was produced" }
 
