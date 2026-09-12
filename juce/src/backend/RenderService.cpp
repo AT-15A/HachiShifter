@@ -897,6 +897,33 @@ private:
     FileCompletion completion;
 };
 
+class RenderService::UtauRenderJob final : public juce::ThreadPoolJob
+{
+public:
+    UtauRenderJob(UtauRenderRequest requestToUse, FileCompletion completionToUse)
+        : ThreadPoolJob("utau-phrase-render"), request(std::move(requestToUse)),
+          completion(std::move(completionToUse))
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        if (shouldExit()) return jobHasFinished;
+        auto rendered = UtauRenderer::render(request);
+        if (shouldExit()) return jobHasFinished;
+        if (rendered.warning.isNotEmpty())
+            juce::Logger::writeToLog("UTAU: " + rendered.warning);
+        if (completion)
+            completion({ std::move(rendered.buffer), rendered.sampleRate,
+                         std::move(rendered.backend), std::move(rendered.warning) });
+        return jobHasFinished;
+    }
+
+private:
+    UtauRenderRequest request;
+    FileCompletion completion;
+};
+
 RenderService::RenderService()
     : pool(std::max(1, juce::SystemStats::getNumCpus() - 1))
 {
@@ -915,6 +942,11 @@ void RenderService::renderMld5(Mld5RenderRequest request, Completion completion)
 void RenderService::renderMld5File(Mld5FileRenderRequest request, FileCompletion completion)
 {
     pool.addJob(new FileRenderJob(std::move(request), std::move(completion)), true);
+}
+
+void RenderService::renderUtau(UtauRenderRequest request, FileCompletion completion)
+{
+    pool.addJob(new UtauRenderJob(std::move(request), std::move(completion)), true);
 }
 
 void RenderService::cancelAll()

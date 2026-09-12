@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.24)
 
 project(HachiShifterNext VERSION 0.2.0 LANGUAGES C CXX)
 
+option(HACHI_ENABLE_ASAN "Enable AddressSanitizer for native crash diagnosis" OFF)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -108,6 +110,8 @@ target_sources(HachiShifterNext PRIVATE
     src/SettingsComponent.cpp
     src/SettingsComponent.h
     src/SampleSettings.cpp
+    src/VoicebankSettingsComponent.cpp
+    src/OtoWaveformEditorComponent.cpp
     src/SampleSettings.h
     src/AssetManagerComponent.cpp
     src/AssetManagerComponent.h
@@ -116,19 +120,24 @@ target_sources(HachiShifterNext PRIVATE
     src/backend/Mld3Renderer.cpp
     src/backend/Mld3Renderer.h
     src/backend/MelodyneImporter.cpp
+    src/backend/MelodyneProvider.cpp
+    src/backend/UstImporter.cpp
     src/backend/MelodyneImporter.h
+    src/backend/MelodyneProvider.h
     src/backend/McpServer.cpp
     src/backend/McpServer.h
     src/backend/RenderService.cpp
     src/backend/RenderService.h
+    src/backend/UtauRenderer.cpp
+    src/backend/UtauRenderer.h
     src/backend/WorldRenderer.cpp
     src/backend/WorldRenderer.h
+    src/backend/AudioFileReader.cpp
+    src/backend/AudioFileReader.h
     src/backend/NativeAnalyzer.cpp
     src/backend/NativeAnalyzer.h
     src/backend/AnalysisService.cpp
     src/backend/AnalysisService.h
-    src/backend/AudioFileReader.cpp
-    src/backend/AudioFileReader.h
     src/backend/GameAnalyzer.cpp
     src/backend/GameAnalyzer.h
     src/backend/FcpeAnalyzer.cpp
@@ -146,7 +155,10 @@ target_sources(HachiShifterNext PRIVATE
 # legacy v5 COMCTL32 first and aborts at startup with "ordinal 345 not found".
 # Keep the manifest as an explicit PE resource because the cross linker runs
 # with /manifest:no and therefore does not invoke mt.exe implicitly.
-if(WIN32)
+# The explicit manifest resource is only required by the xwin cross build.
+# Native Visual Studio builds already receive JUCE's manifest; adding this
+# resource there produces a duplicate MANIFEST:1 and fails with CVT1100.
+if(WIN32 AND CMAKE_TOOLCHAIN_FILE MATCHES "windows-msvc-xwin\\.cmake$")
     target_sources(HachiShifterNext PRIVATE
         resources/windows/HachiShifterNext.rc
         resources/windows/HachiShifterNext.manifest
@@ -161,6 +173,7 @@ target_compile_definitions(HachiShifterNext PRIVATE
     JUCE_USE_CURL=0
     JUCE_WEB_BROWSER=0
     JUCE_MODAL_LOOPS_PERMITTED=0
+    JUCE_PLUGINHOST_VST3=1
 )
 
 target_include_directories(HachiShifterNext PRIVATE
@@ -174,7 +187,6 @@ target_link_libraries(HachiShifterNext PRIVATE
     juce::juce_gui_extra
     juce::juce_data_structures
     juce::juce_recommended_config_flags
-    juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
     world::core
     llsm
@@ -222,6 +234,15 @@ endif()
 
 if(MSVC)
     target_compile_options(HachiShifterNext PRIVATE /utf-8 /W4)
+    if(HACHI_ENABLE_ASAN)
+        target_compile_options(HachiShifterNext PRIVATE /fsanitize=address /Zi /GL-)
+        target_link_options(HachiShifterNext PRIVATE /INCREMENTAL:NO)
+    endif()
+    # Keep a linker address map beside native builds.  It is small, is not
+    # packaged with the application, and makes field crash addresses from
+    # Windows Event Viewer actionable even for optimised Release binaries.
+    target_link_options(HachiShifterNext PRIVATE
+        "/MAP:${CMAKE_BINARY_DIR}/HachiShifterNext-$<CONFIG>.map")
 else()
     target_compile_options(HachiShifterNext PRIVATE -Wall -Wextra -Wpedantic)
 endif()

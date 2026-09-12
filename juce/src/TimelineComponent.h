@@ -29,7 +29,21 @@ public:
     [[nodiscard]] int pixelForSeconds(double seconds) const;
     [[nodiscard]] double secondsForPixel(int pixel) const;
     [[nodiscard]] juce::String trackIdForPixel(int pixel) const;
+    // The lane and the moment under the pointer, or nothing when the pointer
+    // is not over the lanes.  A copied piece of material lands here, which is
+    // the only way to say "that track, there" -- clicking an empty lane
+    // reports no clip and does not name the track it belongs to, so the
+    // selection alone could never carry a paste onto another track.
+    struct Anchor { juce::String trackId; double seconds = 0.0; };
+    [[nodiscard]] std::optional<Anchor> pointerAnchor() const;
+    // The lane geometry, so a check can aim at a lane without guessing it.
+    [[nodiscard]] int diagnosticRulerHeight() const { return rulerHeight; }
+    [[nodiscard]] int diagnosticRowHeight() const { return rowHeight; }
+    // Takes the model's current state, as a change message would.
+    void diagnosticRefresh() { snapshot = model.snapshot(); }
     std::function<void(double)> onSeek;
+    // A right-click on empty lane space, in screen coordinates.
+    std::function<void(juce::Point<int>)> onEmptyAreaMenu;
     std::function<void(const juce::String&)> onClipSelected;
     std::function<void(const juce::String&)> onClipGainRequested;
 
@@ -38,7 +52,10 @@ private:
     void timerCallback() override;
     void rebuild();
     [[nodiscard]] float timeToX(double seconds) const;
-    [[nodiscard]] double gridSeconds() const;
+    [[nodiscard]] double gridQuarterNotes() const;
+    [[nodiscard]] double snapToGrid(double seconds) const;
+    void showTempoMenu(double quarterPosition, juce::Point<int> screenPosition);
+    void showTempoDialog(double quarterPosition);
 
     struct ClipHit
     {
@@ -60,6 +77,8 @@ private:
     float pixelsPerSecond = 140.0f;
     static constexpr int rulerHeight = 24;
     int rowHeight = 96;
+    std::optional<Anchor> hoverAnchor;
+    void rememberPointer(const juce::MouseEvent& event);
     double playheadSeconds = 0.0;
     juce::String selectedClip;
     juce::String draggedClip;

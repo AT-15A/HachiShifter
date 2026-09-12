@@ -19,6 +19,12 @@ namespace
 constexpr std::size_t maxGraphBytes = 256u * 1024u * 1024u;
 constexpr std::uint32_t nullReference = 0xffffffffu;
 
+bool hasVoicedPitch(const NoteData& note)
+{
+    return std::any_of(note.contour.begin(), note.contour.end(),
+                       [](const auto& point) { return point.voiced; });
+}
+
 template <typename T>
 std::optional<T> readLittle(const std::vector<std::uint8_t>& data, std::size_t offset)
 {
@@ -625,6 +631,22 @@ std::optional<std::pair<float, float>> pitchAt(const std::vector<SourcePitchPoin
 }
 }
 
+std::vector<MelodyneConsonantMapping>
+MelodyneImporter::consonantCandidates(const std::vector<NoteData>& notes)
+{
+    std::vector<MelodyneConsonantMapping> mappings;
+    for (std::size_t index = 0; index + 1 < notes.size(); ++index)
+    {
+        const auto& consonant = notes[index];
+        const auto& vowel = notes[index + 1];
+        const auto adjacent = std::abs(consonant.startSeconds + consonant.durationSeconds
+                                        - vowel.startSeconds) <= 0.002;
+        if (!adjacent || hasVoicedPitch(consonant) || !hasVoicedPitch(vowel)) continue;
+        mappings.push_back({ consonant.id, vowel.id, consonant.durationSeconds });
+    }
+    return mappings;
+}
+
 std::optional<MelodyneImportResult> MelodyneImporter::importProject(
     const juce::File& file, juce::String& error, Progress progress,
     MelodyneImportOptions options)
@@ -842,16 +864,6 @@ std::optional<MelodyneImportResult> MelodyneImporter::importProject(
                 note.robustPitchCurve = note.robustPitchCurve
                     || graph.booleanAlias(*parameterSet, robustFields);
             note.connectedToPrevious = connectedPrevious.contains(element);
-            note.connectedToNext = false;
-            if (const auto join = graph.reference(element, "followingJoin"))
-            {
-                note.connectedToNext = graph.boolean(*join, "joinsPitches");
-                if (graph.boolean(*join, "joinsAmplitudes"))
-                    if (const auto atd = graph.number(*join, "amplitudeTransitionDuration"))
-                        clip.crossfadeOutSeconds = std::clamp(*atd * 0.5, 0.0, duration);
-            }
-            clip.glideConnectedToNext = note.connectedToNext;
-            clip.glideConnectedFromPrevious = note.connectedToPrevious;
 
             std::vector<SourcePitchPoint> propertyPoints;
             if (const auto propertyList = graph.reference(item, "propertyPoints"))
@@ -908,12 +920,32 @@ std::optional<MelodyneImportResult> MelodyneImporter::importProject(
             addSibilant("startSibilantEndSampleOffset");
             addSibilant("endSibilantStartSampleOffset");
 
+            if (const auto join = graph.reference(element, "followingJoin"))
+            {
+                note.connectedToNext = graph.boolean(*join, "joinsPitches");
+                // Melodyne's real crossfade: a LINEAR amplitude transition of
+                // MUSuccessiveJoin.amplitudeTransitionDuration when amplitudes
+                // are joined.  The element is placed exactly back-to-back with
+                // its join partner, so each side ramps for half the duration.
+                if (graph.boolean(*join, "joinsAmplitudes"))
+                    if (const auto atd = graph.number(*join, "amplitudeTransitionDuration"))
+                        clip.crossfadeOutSeconds = std::clamp(*atd * 0.5, 0.0, duration);
+            }
             if (const auto join = graph.reference(element, "precedingJoin"))
             {
                 if (graph.boolean(*join, "joinsAmplitudes"))
                     if (const auto atd = graph.number(*join, "amplitudeTransitionDuration"))
                         clip.crossfadeInSeconds = std::clamp(*atd * 0.5, 0.0, duration);
             }
+            // The same joins, recorded on the clip as well.  The note flags say
+            // a join edit is in effect and drive the crossfade; these say the
+            // recording itself runs continuously through the seam, which is
+            // what lets stretchSpliceThenPitch decode the chain in one pass.
+            // Two questions, so the edit-neutralising block below clears the
+            // first and leaves this one -- neutralising a user's edits does not
+            // make a continuous take discontinuous.
+            clip.glideConnectedToNext = note.connectedToNext;
+            clip.glideConnectedFromPrevious = note.connectedToPrevious;
             if (!options.preserveProjectEdits)
             {
                 // Keep the project arrangement and the analysed source F0,

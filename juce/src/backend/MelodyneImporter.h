@@ -19,6 +19,13 @@ struct MelodyneImportOptions
     bool preserveProjectEdits = true;
 };
 
+struct MelodyneConsonantMapping
+{
+    juce::String consonantNoteId;
+    juce::String vowelNoteId;
+    double preutteranceSeconds = 0.0;
+};
+
 class MelodyneImporter final
 {
 public:
@@ -27,5 +34,11 @@ public:
     [[nodiscard]] static std::optional<MelodyneImportResult>
         importProject(const juce::File& file, juce::String& error, Progress progress = {},
                       MelodyneImportOptions options = {});
+
+    // Conservative mapping used by the later UTAU conversion step.  It only
+    // classifies an adjacent note with no voiced pitch samples as an onset;
+    // it does not delete or merge source notes in the Melodyne project.
+    [[nodiscard]] static std::vector<MelodyneConsonantMapping>
+        consonantCandidates(const std::vector<NoteData>& notes);
 };
 }

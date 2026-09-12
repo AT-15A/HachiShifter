@@ -3,6 +3,41 @@
 
 namespace hachi
 {
+SettingsComponent::PathPicker::PathPicker()
+{
+    addAndMakeVisible(editor);
+    addAndMakeVisible(browseButton);
+    editor.setSelectAllWhenFocused(true);
+    browseButton.onClick = [this]
+    {
+        if (onBrowse) onBrowse();
+    };
+}
+
+void SettingsComponent::PathPicker::resized()
+{
+    auto area = getLocalBounds();
+    auto buttonArea = area.removeFromRight(38);
+    area.removeFromRight(5);
+    editor.setBounds(area);
+    browseButton.setBounds(buttonArea);
+}
+
+void SettingsComponent::PathPicker::setText(const juce::String& text)
+{
+    editor.setText(text, false);
+}
+
+juce::String SettingsComponent::PathPicker::getText() const
+{
+    return editor.getText().trim();
+}
+
+void SettingsComponent::PathPicker::setBrowseTooltip(const juce::String& text)
+{
+    browseButton.setTooltip(text);
+}
+
 void SettingsComponent::FormPage::addRow(juce::Label& label, juce::Component& editor)
 {
     addAndMakeVisible(label);
@@ -98,15 +133,20 @@ SettingsComponent::SettingsComponent(I18n& stringsToUse,
     algorithmPage.addRow(hifiganPathLabel, hifiganPath);
     algorithmPage.addRow(inferenceLabel, inference);
     algorithmPage.addRow(inferenceDeviceLabel, inferenceDevice);
+    algorithmPage.addRow(utauVoicebankLabel, utauVoicebankPath);
+    algorithmPage.addRow(utauWavtoolLabel, utauWavtoolPath);
     algorithmPage.addRow(utauResamplerLabel, utauResamplerPath);
+    utauVoicebankPath.onBrowse = [this] { chooseUtauVoicebank(); };
+    utauWavtoolPath.onBrowse = [this] { chooseUtauWavtool(); };
+    utauResamplerPath.onBrowse = [this] { chooseUtauResampler(); };
 
     shortcutPreset.addItem("HachiShifter", 1);
     shortcutPreset.addItem("Melodyne", 2);
     shortcutPreset.addItem("UTAU", 3);
-    wheelAction.addItem("Zoom", 1);
-    wheelAction.addItem("Scroll", 2);
+    // The wheel-action choice is gone: the wheel scrolls and ctrl zooms, so
+    // there is no longer a decision to offer.  Leaving the box would be a
+    // control that changes nothing, which is worse than one less setting.
     operationPage.addRow(shortcutLabel, shortcutPreset);
-    operationPage.addRow(wheelLabel, wheelAction);
     operationPage.addWide(spacePlayback);
     operationPage.addWide(confirmDestructive);
 
@@ -120,7 +160,6 @@ SettingsComponent::SettingsComponent(I18n& stringsToUse,
     importedAlgorithm.addItem("nsf-hifigan", 2);
     importedAlgorithm.addItem("WORLD", 3);
     importedAlgorithm.addItem("vslib", 4);
-    importedAlgorithm.addItem("mld3", 5);
     importedAlgorithm.addItem("llsm2", 6);
     refreshImportedStretchItems(1);
     importedAlgorithm.onChange = [this]
@@ -191,14 +230,17 @@ void SettingsComponent::loadValues()
     hifiganPath.setText(properties.getValue("algorithm.hifiganPath"), false);
     inference.setSelectedId(properties.getIntValue("algorithm.inference", 1), juce::dontSendNotification);
     inferenceDevice.setSelectedId(properties.getIntValue("algorithm.device", 1), juce::dontSendNotification);
-    utauResamplerPath.setText(properties.getValue("algorithm.utauResampler"), false);
+    utauVoicebankPath.setText(properties.getValue("algorithm.utauVoicebank"));
+    utauWavtoolPath.setText(properties.getValue("algorithm.utauWavtool"));
+    utauResamplerPath.setText(properties.getValue("algorithm.utauResampler"));
     shortcutPreset.setSelectedId(properties.getIntValue("operation.shortcutPreset", 1), juce::dontSendNotification);
-    wheelAction.setSelectedId(properties.getIntValue("operation.wheelAction", 1), juce::dontSendNotification);
     spacePlayback.setToggleState(properties.getBoolValue("operation.spacePlayback", true), juce::dontSendNotification);
     confirmDestructive.setToggleState(properties.getBoolValue("operation.confirmDestructive", true), juce::dontSendNotification);
     melodyneCompose.setSelectedId(properties.getIntValue("import.melodyneCompose", 1), juce::dontSendNotification);
     melodynePitchSource.setSelectedId(properties.getIntValue("import.melodynePitchSource", 1), juce::dontSendNotification);
-    importedAlgorithm.setSelectedId(properties.getIntValue("import.algorithm", 1), juce::dontSendNotification);
+    const auto importedAlgorithmId = properties.getIntValue("import.algorithm", 1);
+    importedAlgorithm.setSelectedId(importedAlgorithm.indexOfItemId(importedAlgorithmId) >= 0
+        ? importedAlgorithmId : 1, juce::dontSendNotification);
     refreshImportedStretchItems(properties.getIntValue("import.stretchAlgorithm", 1));
     preserveProjectEdits.setToggleState(properties.getBoolValue("import.preserveEdits", true), juce::dontSendNotification);
     locateMediaRecursively.setToggleState(properties.getBoolValue("import.recursiveMedia", true), juce::dontSendNotification);
@@ -221,14 +263,16 @@ void SettingsComponent::saveValues()
     properties.setValue("algorithm.hifiganPath", hifiganPath.getText());
     properties.setValue("algorithm.inference", inference.getSelectedId());
     properties.setValue("algorithm.device", inferenceDevice.getSelectedId());
+    properties.setValue("algorithm.utauVoicebank", utauVoicebankPath.getText());
+    properties.setValue("algorithm.utauWavtool", utauWavtoolPath.getText());
     properties.setValue("algorithm.utauResampler", utauResamplerPath.getText());
     properties.setValue("operation.shortcutPreset", shortcutPreset.getSelectedId());
-    properties.setValue("operation.wheelAction", wheelAction.getSelectedId());
     properties.setValue("operation.spacePlayback", spacePlayback.getToggleState());
     properties.setValue("operation.confirmDestructive", confirmDestructive.getToggleState());
     properties.setValue("import.melodyneCompose", melodyneCompose.getSelectedId());
     properties.setValue("import.melodynePitchSource", melodynePitchSource.getSelectedId());
-    properties.setValue("import.algorithm", importedAlgorithm.getSelectedId());
+    properties.setValue("import.algorithm", importedAlgorithm.getSelectedId() > 0
+        ? importedAlgorithm.getSelectedId() : 1);
     properties.setValue("import.stretchAlgorithm", importedStretchAlgorithm.getSelectedId());
     properties.setValue("import.preserveEdits", preserveProjectEdits.getToggleState());
     properties.setValue("import.recursiveMedia", locateMediaRecursively.getToggleState());
@@ -268,11 +312,14 @@ void SettingsComponent::setTexts()
     inferenceDeviceLabel.setText(strings.text("settings.device"), juce::dontSendNotification);
     inference.changeItemText(1, strings.text("settings.auto"));
     inferenceDevice.changeItemText(1, strings.text("settings.auto"));
+    utauVoicebankLabel.setText(strings.text("settings.utauVoicebank"), juce::dontSendNotification);
+    utauWavtoolLabel.setText(strings.text("settings.utauWavtool"), juce::dontSendNotification);
     utauResamplerLabel.setText(strings.text("settings.utauResampler"), juce::dontSendNotification);
+    const auto browseText = strings.text("settings.browse");
+    utauVoicebankPath.setBrowseTooltip(browseText);
+    utauWavtoolPath.setBrowseTooltip(browseText);
+    utauResamplerPath.setBrowseTooltip(browseText);
     shortcutLabel.setText(strings.text("settings.shortcuts"), juce::dontSendNotification);
-    wheelLabel.setText(strings.text("settings.wheel"), juce::dontSendNotification);
-    wheelAction.changeItemText(1, strings.text("settings.wheelZoom"));
-    wheelAction.changeItemText(2, strings.text("settings.wheelScroll"));
     spacePlayback.setButtonText(strings.text("settings.spacePlayback"));
     confirmDestructive.setButtonText(strings.text("settings.confirmDestructive"));
     melodyneComposeLabel.setText(strings.text("settings.melodyneCompose"), juce::dontSendNotification);
@@ -309,6 +356,64 @@ void SettingsComponent::refreshImportedStretchItems(int preferredId)
         || importedAlgorithm.getSelectedId() == 2;
     importedStretchAlgorithm.setSelectedId(canUsePreferred && previous > 0 ? previous : 1,
                                              juce::dontSendNotification);
+}
+
+juce::File SettingsComponent::initialPathFor(const PathPicker& picker,
+                                             bool directory) const
+{
+    const juce::File selected(picker.getText());
+    if (directory && selected.isDirectory()) return selected;
+    if (!directory && selected.existsAsFile()) return selected;
+    if (selected.getParentDirectory().isDirectory()) return selected.getParentDirectory();
+    return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+}
+
+void SettingsComponent::chooseUtauVoicebank()
+{
+    pathChooser = std::make_unique<juce::FileChooser>(
+        strings.text("settings.chooseUtauVoicebank"),
+        initialPathFor(utauVoicebankPath, true));
+    juce::Component::SafePointer<SettingsComponent> safe(this);
+    pathChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                 | juce::FileBrowserComponent::canSelectDirectories,
+        [safe](const juce::FileChooser& chooser)
+        {
+            if (safe == nullptr) return;
+            const auto directory = chooser.getResult();
+            if (directory.isDirectory()) safe->utauVoicebankPath.setText(directory.getFullPathName());
+        });
+}
+
+void SettingsComponent::chooseUtauWavtool()
+{
+    pathChooser = std::make_unique<juce::FileChooser>(
+        strings.text("settings.chooseUtauWavtool"),
+        initialPathFor(utauWavtoolPath, false), "*.exe;*.bat;*.cmd");
+    juce::Component::SafePointer<SettingsComponent> safe(this);
+    pathChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                 | juce::FileBrowserComponent::canSelectFiles,
+        [safe](const juce::FileChooser& chooser)
+        {
+            if (safe == nullptr) return;
+            const auto file = chooser.getResult();
+            if (file.existsAsFile()) safe->utauWavtoolPath.setText(file.getFullPathName());
+        });
+}
+
+void SettingsComponent::chooseUtauResampler()
+{
+    pathChooser = std::make_unique<juce::FileChooser>(
+        strings.text("settings.chooseUtauResampler"),
+        initialPathFor(utauResamplerPath, false), "*.exe;*.bat;*.cmd");
+    juce::Component::SafePointer<SettingsComponent> safe(this);
+    pathChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                 | juce::FileBrowserComponent::canSelectFiles,
+        [safe](const juce::FileChooser& chooser)
+        {
+            if (safe == nullptr) return;
+            const auto file = chooser.getResult();
+            if (file.existsAsFile()) safe->utauResamplerPath.setText(file.getFullPathName());
+        });
 }
 
 void SettingsComponent::resized()

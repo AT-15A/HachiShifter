@@ -43,7 +43,7 @@ double TimelineComponent::secondsForPixel(int pixel) const
     return std::max(0.0, static_cast<double>(pixel) / pixelsPerSecond);
 }
 
-double TimelineComponent::gridSeconds() const
+double TimelineComponent::gridQuarterNotes() const
 {
     auto text = snapshot.gridDivision.trim().toLowerCase();
     auto dotted = text.endsWithChar('.');
@@ -51,11 +51,18 @@ double TimelineComponent::gridSeconds() const
     if (dotted || triplet) text = text.dropLastCharacters(1);
     const auto slash = text.indexOfChar('/');
     const auto denominator = slash >= 0 ? text.substring(slash + 1).getIntValue() : 16;
-    auto duration = 60.0 / std::max(1.0, snapshot.bpm)
-        * 4.0 / static_cast<double>(std::max(1, denominator));
-    if (dotted) duration *= 1.5;
-    if (triplet) duration *= 2.0 / 3.0;
-    return std::max(0.005, duration);
+    auto quarters = 4.0 / static_cast<double>(std::max(1, denominator));
+    if (dotted) quarters *= 1.5;
+    if (triplet) quarters *= 2.0 / 3.0;
+    return std::max(1.0 / 256.0, quarters);
+}
+
+double TimelineComponent::snapToGrid(double seconds) const
+{
+    const auto step = gridQuarterNotes();
+    const auto quarter = snapshot.quarterPositionForSeconds(seconds);
+    return std::max(0.0, snapshot.secondsForQuarterPosition(
+        std::round(quarter / step) * step));
 }
 
 juce::String TimelineComponent::trackIdForPixel(int pixel) const
@@ -68,7 +75,10 @@ juce::String TimelineComponent::trackIdForPixel(int pixel) const
 
 void TimelineComponent::setPixelsPerSecond(float value)
 {
-    pixelsPerSecond = juce::jlimit(40.0f, 600.0f, value);
+    // Matches the roll: the two are driven by one slider, and letting them
+    // clamp differently put them on different scales past 600, after which
+    // nothing that translated between them could be right.
+    pixelsPerSecond = juce::jlimit(40.0f, 8000.0f, value);
     rebuild();
 }
 
@@ -80,8 +90,16 @@ void TimelineComponent::setRowHeight(float value)
 
 void TimelineComponent::setPlayheadSeconds(double seconds)
 {
+    // Same as the roll: a one pixel line does not need the whole arrangement
+    // repainted thirty times a second, and the band has to cover where the
+    // line was as well as where it is going.
+    if (std::abs(seconds - playheadSeconds) < 1.0e-9) return;
+    const auto before = timeToX(playheadSeconds);
     playheadSeconds = seconds;
-    repaint();
+    const auto after = timeToX(playheadSeconds);
+    const auto left = static_cast<int>(std::floor(std::min(before, after))) - 3;
+    const auto right = static_cast<int>(std::ceil(std::max(before, after))) + 3;
+    repaint(left, 0, std::max(1, right - left), getHeight());
 }
 
 void TimelineComponent::changeListenerCallback(juce::ChangeBroadcaster*)
@@ -122,7 +140,8 @@ void TimelineComponent::rebuild()
             next.emplace(key, std::move(thumbnail));
         }
     thumbnails = std::move(next);
-    setSize(static_cast<int>(timeToX(snapshot.durationSeconds()) + 400.0f),
+    setSize(static_cast<int>(juce::jlimit(470.0, 3.2e7,
+        static_cast<double>(timeToX(snapshot.durationSeconds())) + 400.0)),
             rulerHeight + std::max(rowHeight, static_cast<int>(snapshot.tracks.size()) * rowHeight));
     repaint();
 }
@@ -135,20 +154,21 @@ void TimelineComponent::paint(juce::Graphics& g)
     g.fillRect(0, 0, getWidth(), rulerHeight);
     g.setColour(Palette::border);
     g.drawHorizontalLine(rulerHeight - 1, 0.0f, static_cast<float>(getWidth()));
-    const auto secondsPerBeat = 60.0 / std::max(1.0, snapshot.bpm);
-    const auto gridStep = gridSeconds();
-    const auto firstTick = static_cast<int>(std::floor(-snapshot.beatOriginSeconds / gridStep)) - 1;
+    const auto gridStep = gridQuarterNotes();
+    const auto firstQuarter = snapshot.quarterPositionForSeconds(0.0);
+    const auto firstTick = static_cast<int>(std::floor(firstQuarter / gridStep)) - 1;
+    const auto barQuarters = static_cast<double>(std::max(1, snapshot.numerator))
+        * 4.0 / static_cast<double>(std::max(1, snapshot.denominator));
     for (int tick = firstTick;; ++tick)
     {
-        const auto seconds = snapshot.beatOriginSeconds + static_cast<double>(tick) * gridStep;
+        const auto quarter = static_cast<double>(tick) * gridStep;
+        const auto seconds = snapshot.secondsForQuarterPosition(quarter);
         const auto x = timeToX(seconds);
         if (x > static_cast<float>(getWidth())) break;
         if (x < 0.0f) continue;
-        const auto beat = seconds / secondsPerBeat;
-        const auto isBeat = std::abs(beat - std::llround(beat)) < 1.0e-6;
-        const auto barBeat = static_cast<int>(std::llround(beat));
-        const auto isBar = isBeat && ((barBeat % std::max(1, snapshot.numerator)) + snapshot.numerator)
-            % snapshot.numerator == 0;
+        const auto isBeat = std::abs(quarter - std::round(quarter)) < 1.0e-6;
+        const auto bar = quarter / barQuarters;
+        const auto isBar = std::abs(bar - std::round(bar)) < 1.0e-6;
         g.setColour(isBar ? Palette::grid.brighter(0.28f)
                    : isBeat ? Palette::grid.withAlpha(0.62f) : Palette::grid.withAlpha(0.30f));
         g.drawVerticalLine(static_cast<int>(x), 0.0f, static_cast<float>(getHeight()));
@@ -156,9 +176,21 @@ void TimelineComponent::paint(juce::Graphics& g)
         {
             g.setColour(Palette::textMuted);
             g.setFont(10.0f);
-            g.drawText(juce::String(barBeat / std::max(1, snapshot.numerator) + 1) + ".1",
+            g.drawText(juce::String(static_cast<int>(std::llround(bar)) + 1) + ".1",
                        static_cast<int>(x) + 4, 3, 42, 16, juce::Justification::left);
         }
+    }
+
+    for (const auto& change : snapshot.tempoChanges)
+    {
+        const auto x = timeToX(snapshot.secondsForQuarterPosition(change.quarterPosition));
+        if (x < 0.0f || x > getWidth()) continue;
+        g.setColour(juce::Colour(0xffffa94d));
+        g.drawVerticalLine(static_cast<int>(x), 0.0f, static_cast<float>(getHeight()));
+        g.setFont(9.5f);
+        g.drawText(juce::String(change.bpm, 2).trimCharactersAtEnd("0").trimCharactersAtEnd(".")
+                + " BPM", static_cast<int>(x) + 4, 3, 66, 16,
+            juce::Justification::centredLeft, false);
     }
 
     for (std::size_t trackIndex = 0; trackIndex < snapshot.tracks.size(); ++trackIndex)
@@ -269,8 +301,26 @@ void TimelineComponent::paint(juce::Graphics& g)
     g.drawVerticalLine(static_cast<int>(timeToX(playheadSeconds)), 0.0f, static_cast<float>(getHeight()));
 }
 
+std::optional<TimelineComponent::Anchor> TimelineComponent::pointerAnchor() const
+{
+    return hoverAnchor;
+}
+
+void TimelineComponent::rememberPointer(const juce::MouseEvent& event)
+{
+    const auto trackId = trackIdForPixel(event.y);
+    if (trackId.isEmpty())
+    {
+        hoverAnchor.reset();
+        return;
+    }
+    hoverAnchor = Anchor { trackId, std::max(0.0,
+        static_cast<double>(event.position.x) / pixelsPerSecond) };
+}
+
 void TimelineComponent::mouseMove(const juce::MouseEvent& event)
 {
+    rememberPointer(event);
     for (auto it = clipHits.rbegin(); it != clipHits.rend(); ++it)
         if (it->bounds.contains(event.position))
         {
@@ -303,6 +353,8 @@ void TimelineComponent::mouseMove(const juce::MouseEvent& event)
 
 void TimelineComponent::mouseExit(const juce::MouseEvent&)
 {
+    // Off the lanes there is no track to paste onto.
+    hoverAnchor.reset();
     if (draggedClip.isEmpty()) setMouseCursor(juce::MouseCursor::NormalCursor);
 }
 
@@ -321,11 +373,70 @@ void TimelineComponent::mouseDoubleClick(const juce::MouseEvent& event)
             if (onClipGainRequested) onClipGainRequested(selectedClip);
             repaint();
             return;
-        }
+    }
+}
+
+void TimelineComponent::showTempoMenu(double quarterPosition,
+                                      juce::Point<int> screenPosition)
+{
+    juce::PopupMenu menu;
+    menu.addItem(1, juce::String::fromUTF8("改变曲速…"));
+    juce::Component::SafePointer<TimelineComponent> safe(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(
+        juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1)),
+        [safe, quarterPosition](int result)
+        {
+            if (safe == nullptr || result != 1) return;
+            juce::MessageManager::callAsync([safe, quarterPosition]
+            {
+                if (safe != nullptr) safe->showTempoDialog(quarterPosition);
+            });
+        });
+}
+
+void TimelineComponent::showTempoDialog(double quarterPosition)
+{
+    const auto initialTempo = snapshot.tempoAtQuarterPosition(quarterPosition);
+    auto* dialog = new juce::AlertWindow(
+        juce::String::fromUTF8("改变曲速"),
+        juce::String::fromUTF8("从当前四分之一小节开始使用新的曲速。"),
+        juce::MessageBoxIconType::NoIcon);
+    dialog->addTextEditor("bpm", juce::String(initialTempo, 2),
+                          juce::String::fromUTF8("BPM（20–400）"));
+    dialog->addButton(juce::String::fromUTF8("确定"), 1);
+    dialog->addButton(juce::String::fromUTF8("取消"), 0,
+                      juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<TimelineComponent> safe(this);
+    dialog->enterModalState(true,
+        juce::ModalCallbackFunction::create(
+            [safe, dialog, quarterPosition](int result)
+            {
+                if (safe != nullptr && result == 1)
+                {
+                    const auto bpm = dialog->getTextEditorContents("bpm").getDoubleValue();
+                    if (bpm >= 20.0 && bpm <= 400.0)
+                        safe->model.setTempoChange(quarterPosition, bpm);
+                }
+                delete dialog;
+            }), false);
 }
 
 void TimelineComponent::mouseDown(const juce::MouseEvent& event)
 {
+    rememberPointer(event);
+    if (event.y < rulerHeight && event.mods.isPopupMenu())
+    {
+        const auto seconds = std::max(0.0,
+            static_cast<double>(event.position.x) / pixelsPerSecond);
+        const auto barQuarters = static_cast<double>(std::max(1, snapshot.numerator))
+            * 4.0 / static_cast<double>(std::max(1, snapshot.denominator));
+        const auto quarterBar = std::max(1.0 / 256.0, barQuarters / 4.0);
+        const auto clickedQuarter = snapshot.quarterPositionForSeconds(seconds);
+        const auto snappedQuarter = std::max(0.0,
+            std::floor((clickedQuarter + 1.0e-9) / quarterBar) * quarterBar);
+        showTempoMenu(snappedQuarter, event.getScreenPosition());
+        return;
+    }
     for (auto it = clipHits.rbegin(); it != clipHits.rend(); ++it)
         if (it->bounds.contains(event.position))
         {
@@ -384,23 +495,21 @@ void TimelineComponent::mouseDown(const juce::MouseEvent& event)
     selectedClip.clear();
     if (onClipSelected) onClipSelected({});
     repaint();
+    if (event.mods.isPopupMenu())
+    {
+        // Below the ruler and on no clip: the space around the tracks.  It
+        // used to move the playhead, which no other right-click in the app
+        // does, and which left no way to act on the lane itself.
+        if (onEmptyAreaMenu) onEmptyAreaMenu(event.getScreenPosition());
+        return;
+    }
     if (onSeek) onSeek(std::max(0.0, static_cast<double>(event.position.x) / pixelsPerSecond));
 }
 
 void TimelineComponent::mouseDrag(const juce::MouseEvent& event)
 {
     if (draggedClip.isEmpty()) return;
-    const auto secondsPerBeat = 60.0 / std::max(1.0, snapshot.bpm);
-    const auto division = snapshot.gridDivision.contains("32") ? 8.0
-        : snapshot.gridDivision.contains("16") ? 4.0
-        : snapshot.gridDivision.contains("8") ? 2.0
-        : snapshot.gridDivision.contains("4") ? 1.0 : 0.5;
-    const auto quantum = secondsPerBeat / division;
-    const auto snap = [&](double seconds)
-    {
-        return std::max(0.0, snapshot.beatOriginSeconds
-            + std::round((seconds - snapshot.beatOriginSeconds) / quantum) * quantum);
-    };
+    const auto snap = [&](double seconds) { return snapToGrid(seconds); };
     const auto delta = static_cast<double>(event.position.x - dragAnchorX) / pixelsPerSecond;
     if (dragMode == DragMode::fadeIn)
         draggedClipPreviewFadeIn = juce::jlimit(0.0, draggedClipDuration,

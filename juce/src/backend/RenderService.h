@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Mld5Renderer.h"
+#include "UtauRenderer.h"
 #include "OrtExecution.h"
 #include <juce_events/juce_events.h>
 #include <functional>
@@ -61,6 +62,7 @@ struct RenderedAudio
     juce::AudioBuffer<float> buffer;
     double sampleRate = 0.0;
     juce::String backend;
+    juce::String warning;
 };
 
 class RenderService final
@@ -73,11 +75,13 @@ public:
     ~RenderService();
     void renderMld5(Mld5RenderRequest request, Completion completion);
     void renderMld5File(Mld5FileRenderRequest request, FileCompletion completion);
+    void renderUtau(UtauRenderRequest request, FileCompletion completion);
     void cancelAll();
 
 private:
     class RenderJob;
     class FileRenderJob;
+    class UtauRenderJob;
     juce::ThreadPool pool;
 };
 }

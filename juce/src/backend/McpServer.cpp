@@ -1,6 +1,7 @@
 #include "McpServer.h"
-#include "AnalysisService.h"
+#include "MelodyneProvider.h"
 #include "AudioFileReader.h"
+#include "AnalysisService.h"
 #include <cmath>
 #include <iostream>
 
@@ -107,6 +108,7 @@ juce::String pitchAlgorithmText(PitchAlgorithm value)
     if (value == PitchAlgorithm::vocalShifter) return "vslib";
     if (value == PitchAlgorithm::mld3) return "mld3";
     if (value == PitchAlgorithm::llsm2) return "llsm2";
+    if (value == PitchAlgorithm::utau) return "utau";
     return "mld5";
 }
 
@@ -268,6 +270,7 @@ juce::var McpServer::handle(const juce::var& request, bool& shouldRespond)
             makeTool("analyse_audio", "Run configured GAME+FCPE analysis with native fallback and return actual backend / 执行 GAME+FCPE 分析并报告实际后端"),
             makeTool("analysis_status", "Inspect GAME large/small, FCPE and inference availability / 查看 GAME、FCPE 与推理状态"),
             makeTool("import_midi", "Import MIDI notes and tempo / 导入 MIDI"),
+            makeTool("import_ust", "Import a UTAU project as a plain UTAU track / 导入 UST"),
             makeTool("import_melodyne", "Import Melodyne MPD edits; recursive_media, preserve_edits and source_pitch control import / 导入 Melodyne 工程并控制素材搜索、工程编辑与原始 F0"),
             makeTool("set_tempo", "Set BPM and time signature / 设置速度与拍号"),
             makeTool("add_track", "Create an empty melodic or audio track / 新建空旋律或普通音轨"),
@@ -289,10 +292,12 @@ juce::var McpServer::handle(const juce::var& request, bool& shouldRespond)
             makeTool("remove_track", "Delete a track / 删除轨道"),
             makeTool("undo", "Undo the last project edit / 撤销工程编辑"),
             makeTool("redo", "Redo the last project edit / 重做工程编辑"),
+            makeTool("utau_render_selection", "Choose which UTAU notes render and play; empty selects every note / 选择参与 UTAU 渲染与试听的音符"),
+            makeTool("set_utau_resampler", "Point UTAU rendering at a resampler executable / 指定 UTAU 重采样器"),
             makeTool("render_prepare", "Pre-render the current project with its selected algorithms / 按当前所选算法预渲染工程"),
             makeTool("render_status", "Read pre-render progress and active backends / 读取预渲染进度与实际后端"),
-            makeTool("export_wav", "Render and export the current project to WAV / 渲染并导出当前工程为 WAV"),
-            makeTool("transport_play", "Render if needed and start transport playback / 必要时预渲染并开始播放"),
+            makeTool("export_wav", "Render every note and export to WAV; track_id exports one track alone, from_seconds/to_seconds one stretch / 渲染全曲并导出 WAV，track_id 可单独导出一个轨道"),
+            makeTool("transport_play", "Render if needed and start playback; play_until_seconds stops where a selection ends / 必要时预渲染并开始播放"),
             makeTool("transport_stop", "Stop transport playback / 停止播放"),
             makeTool("transport_seek", "Seek transport to position_seconds / 跳转播放位置"),
             makeTool("transport_status", "Read playback position and render state / 读取播放位置与渲染状态"),
@@ -300,6 +305,7 @@ juce::var McpServer::handle(const juce::var& request, bool& shouldRespond)
             makeTool("sample_settings_save", "Save audio regions to .hjm.csv / 保存音频分段到 .hjm.csv"),
             makeTool("oto_import", "Import one audio file's regions from UTAU oto.ini / 从 UTAU oto.ini 导入单个音频分段"),
             makeTool("oto_export", "Export one audio file's regions to UTAU oto.ini / 将单个音频分段导出为 UTAU oto.ini"),
+            makeTool("jie_oto_create", "Seed a voicebank's four-region oto4.ini from its oto.ini / 按 oto.ini 生成界•OTO"),
             makeTool("voicebank_import", "Import an UTAU voicebank and create .hjm.csv sidecars / 导入 UTAU 音源并生成 .hjm.csv"),
             makeTool("read_file", "Read a byte range as base64 / 读取任意文件内容"),
             makeTool("list_directory", "List a directory with type and size / 列出目录内容")
@@ -426,6 +432,14 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
     {
         if (project.addMidiFile(juce::File(string(args, "path")), error)) return toolResult("ok");
     }
+    else if (name == "import_ust")
+    {
+        juce::StringArray warnings;
+        if (project.addUstFile(juce::File(string(args, "path")), error, warnings))
+            return toolResult(warnings.isEmpty()
+                ? juce::String("ok")
+                : "ok; " + warnings.joinIntoString("; "));
+    }
     else if (name == "import_melodyne")
     {
         MelodyneImportOptions options;
@@ -465,6 +479,11 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
     {
         const auto id = string(args, "track_id");
         if (args.hasProperty("name")) project.setTrackName(id, string(args, "name"));
+        if (args.hasProperty("utau_global_flags"))
+            project.setTrackUtauGlobalFlags(id, string(args, "utau_global_flags"));
+        if (args.hasProperty("voicebank_directory"))
+            project.setTrackVoicebankDirectory(id,
+                juce::File(string(args, "voicebank_directory")));
         if (args.hasProperty("compose")) project.setTrackCompose(id, static_cast<bool>(args["compose"]));
         if (args.hasProperty("muted")) project.setTrackMuted(id, static_cast<bool>(args["muted"]));
         if (args.hasProperty("solo")) project.setTrackSolo(id, static_cast<bool>(args["solo"]));
@@ -482,7 +501,10 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
                 : value == "world" ? PitchAlgorithm::world
                 : value == "vslib" ? PitchAlgorithm::vocalShifter
                 : value == "mld3" ? PitchAlgorithm::mld3
-                : value == "llsm2" ? PitchAlgorithm::llsm2 : PitchAlgorithm::mld5);
+                : value == "llsm2" ? PitchAlgorithm::llsm2
+                : value.startsWith("utau") ? PitchAlgorithm::utau
+                : PitchAlgorithm::mld5);
+            project.setTrackUtauMode(id, parseUtauMode(value));
         }
         if (args.hasProperty("stretch_algorithm"))
         {
@@ -589,6 +611,101 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
     else if (name == "set_note")
     {
         const auto id = string(args, "note_id");
+        if (args.hasProperty("label")) project.setNoteLabel(id, string(args, "label"));
+        if (args.hasProperty("jie_split"))
+        {
+            // Three cumulative fractions of the note, or null to hand the note
+            // back to the engine's own allocation.
+            const auto value = args["jie_split"];
+            if (const auto* fractions = value.getArray(); fractions != nullptr
+                && fractions->size() == 3)
+                project.setNotesUtauJieSplit({ id },
+                    static_cast<double>((*fractions)[0]),
+                    static_cast<double>((*fractions)[1]),
+                    static_cast<double>((*fractions)[2]));
+            else
+                project.clearNotesUtauJieSplit({ id });
+        }
+        if (args.hasProperty("region_flags") || args.hasProperty("flag_split"))
+        {
+            // The four-region flags, as ["f1","f2","f3","f4"]; an empty entry
+            // means that region keeps the note's own flags.
+            juce::String parts[4];
+            if (const auto* given = args["region_flags"].getArray(); given != nullptr)
+                for (int index = 0; index < 4 && index < given->size(); ++index)
+                    parts[index] = (*given)[index].toString();
+            project.setNotesRegionFlags({ id },
+                static_cast<bool>(args.getProperty("flag_split", true)),
+                parts[0], parts[1], parts[2], parts[3]);
+        }
+        if (args.hasProperty("flag_curve_enabled"))
+            project.setNotesUtauFlagCurveEnabled({ id },
+                static_cast<bool>(args["flag_curve_enabled"]));
+        if (args.hasProperty("flag_curve"))
+        {
+            // {"flag": "Mt", "points": [[seconds, value, shape?], ...]}; an
+            // empty list drops that flag's curve and leaves the others.
+            const auto flag = args["flag_curve"].getProperty("flag", "g").toString();
+            std::vector<FlagCurvePoint> points;
+            if (const auto* given = args["flag_curve"].getProperty("points", {})
+                                        .getArray(); given != nullptr)
+                for (const auto& entry : *given)
+                    if (const auto* pair = entry.getArray(); pair != nullptr
+                        && pair->size() >= 2)
+                    {
+                        FlagCurvePoint point;
+                        point.timeSeconds = static_cast<double>((*pair)[0]);
+                        point.value = static_cast<float>(
+                            static_cast<double>((*pair)[1]));
+                        if (pair->size() >= 3)
+                            point.shape = parsePitchCurveShape((*pair)[2].toString());
+                        points.push_back(point);
+                    }
+            project.setNoteUtauFlagCurve(id, flag, std::move(points));
+        }
+        if (args.hasProperty("flag_curve_g"))
+        {
+            // [[seconds, value], ...] against the note start, or an empty list
+            // to drop the curve.  Seconds may be negative to reach into the
+            // preutterance, exactly like an amplitude envelope point.
+            std::vector<FlagCurvePoint> points;
+            if (const auto* given = args["flag_curve_g"].getArray(); given != nullptr)
+                for (const auto& entry : *given)
+                    if (const auto* pair = entry.getArray(); pair != nullptr
+                        && pair->size() >= 2)
+                    {
+                        FlagCurvePoint point;
+                        point.timeSeconds = static_cast<double>((*pair)[0]);
+                        point.value = static_cast<float>(
+                            static_cast<double>((*pair)[1]));
+                        // An optional third entry names the shape of the segment
+                        // arriving here: linear (the default), smooth, ease-in,
+                        // ease-out or custom-bezier.
+                        if (pair->size() >= 3)
+                            point.shape = parsePitchCurveShape((*pair)[2].toString());
+                        points.push_back(point);
+                    }
+            project.setNoteUtauFlagCurve(id, "g", std::move(points));
+        }
+        if (args.hasProperty("utau_consonant_velocity"))
+            project.setNotesUtauConsonantVelocity({ id },
+                static_cast<int>(number(args, "utau_consonant_velocity", 100)));
+        if (args.hasProperty("amplitude_envelope"))
+        {
+            // Pairs of [seconds, dB], relative to the note start.
+            std::vector<AmplitudeEnvelopePoint> points;
+            if (const auto* rows = args["amplitude_envelope"].getArray())
+                for (const auto& row : *rows)
+                    if (const auto* pair = row.getArray(); pair != nullptr
+                        && pair->size() == 2)
+                        points.push_back({ static_cast<double>((*pair)[0]),
+                                           static_cast<float>((*pair)[1]) });
+            project.setNoteAmplitudeEnvelope(id, std::move(points));
+        }
+        if (args.hasProperty("utau_splice"))
+            project.setNotesUtauSplice({ id }, static_cast<bool>(args["utau_splice"]));
+        if (args.hasProperty("utau_flags"))
+            project.setNoteUtauFlags(id, string(args, "utau_flags"));
         if (args.hasProperty("modulation"))
             project.setNoteModulation(id, static_cast<float>(number(args, "modulation", 1.0)));
         if (args.hasProperty("drift"))
@@ -670,6 +787,34 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
         const auto ok = project.redo();
         return toolResult(ok ? "ok" : "history_empty", !ok);
     }
+    else if (name == "set_utau_resampler")
+    {
+        const juce::File executable(string(args, "path"));
+        if (!executable.existsAsFile())
+            return toolResult("Resampler executable not found", true);
+        audio->setUtauResamplerFile(executable);
+        audioPrepared = false;
+        return toolResult("ok");
+    }
+    else if (name == "utau_render_selection")
+    {
+        // UTAU rendering is selection-driven, so without this a headless
+        // caller can only ever export silence from a UTAU track.
+        auto ids = strings(args, "note_ids");
+        if (ids.empty())
+            if (const auto id = string(args, "note_id"); id.isNotEmpty()) ids.push_back(id);
+        if (ids.empty())
+        {
+            const auto data = project.snapshot();
+            for (const auto& track : data.tracks)
+                if (track.pitchAlgorithm == PitchAlgorithm::utau)
+                    for (const auto& clip : track.clips)
+                        for (const auto& note : clip.notes) ids.push_back(note.id);
+        }
+        audio->setUtauRenderNoteSelection(ids);
+        audioPrepared = false;
+        return toolResult("note_ids=" + juce::String(static_cast<int>(ids.size())));
+    }
     else if (name == "render_prepare")
     {
         syncAudio();
@@ -686,12 +831,21 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
     }
     else if (name == "export_wav")
     {
+        // Export renders the whole song, as it does from the window: rendering
+        // is selection-driven, so exporting what happened to be selected would
+        // write one phrase and silence everywhere else.
+        audio->selectEveryUtauNote(project.snapshot());
+        audioPrepared = false;
         syncAudio();
         const auto timeout = juce::jlimit(0.1, 3600.0, number(args, "timeout_seconds", 300.0));
         if (!waitForRender(timeout, error)) return toolResult(error, true);
         const juce::File file(string(args, "path"));
         if (file.getFullPathName().isEmpty()) return toolResult("WAV output path is empty", true);
-        if (audio->exportWav(file, error))
+        // A track id exports that track alone, for one file per track; a
+        // range writes only that stretch, as "export the last render" does.
+        if (audio->exportWav(file, error, string(args, "track_id"),
+                             number(args, "from_seconds", 0.0),
+                             number(args, "to_seconds", 0.0)))
         {
             auto value = object();
             set(value, "path", file.getFullPathName());
@@ -707,6 +861,10 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
         if (!waitForRender(timeout, error)) return toolResult(error, true);
         if (args.hasProperty("position_seconds"))
             audio->setPosition(number(args, "position_seconds"));
+        // Playing a selection stops where the selection ends; the window sets
+        // this from the marquee, and it stays set after the transport stops.
+        if (args.hasProperty("play_until_seconds"))
+            audio->setPlayUntil(number(args, "play_until_seconds"));
         audio->play();
         return toolResult(juce::JSON::toString(transportStatusJson(), false));
     }
@@ -772,6 +930,15 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
         if (SampleSettings::exportOto(otoFile, audioFile, rows, duration, error))
             return toolResult("saved=" + otoFile.getFullPathName()
                               + "; regions=" + juce::String(static_cast<juce::int64>(rows.size())));
+    }
+    else if (name == "jie_oto_create")
+    {
+        const juce::File root(string(args, "voicebank_path"));
+        auto written = 0;
+        auto kept = 0;
+        if (SampleSettings::createJieOto(root, written, kept, error))
+            return toolResult("written=" + juce::String(written)
+                              + "; kept=" + juce::String(kept));
     }
     else if (name == "voicebank_import")
     {
@@ -861,7 +1028,10 @@ juce::var McpServer::projectJson() const
         set(trackValue, "pan", track.pan);
         set(trackValue, "smooth_overlaps", track.smoothOverlaps);
         set(trackValue, "normalize_volume", track.normalizeVolume);
-        set(trackValue, "pitch_algorithm", pitchAlgorithmText(track.pitchAlgorithm));
+        set(trackValue, "pitch_algorithm",
+            track.pitchAlgorithm == PitchAlgorithm::utau
+                ? utauModeKey(track.utauMode)
+                : pitchAlgorithmText(track.pitchAlgorithm));
         set(trackValue, "stretch_algorithm", stretchAlgorithmText(track.stretchAlgorithm));
         set(trackValue, "render_order", renderOrderText(track.renderOrder));
         std::vector<juce::var> clips;
@@ -912,6 +1082,33 @@ juce::var McpServer::projectJson() const
                 set(noteValue, "robust_pitch_curve", note.robustPitchCurve);
                 set(noteValue, "connected_previous", note.connectedToPrevious);
                 set(noteValue, "connected_next", note.connectedToNext);
+                // The flag state, all of it: the plain text, the four-region
+                // split, and the per-frame curve.  These are kept side by side
+                // rather than one replacing another, so a caller has to be able
+                // to see that nothing was lost when the switch was thrown.
+                set(noteValue, "utau_flags", note.utauFlags);
+                set(noteValue, "flag_split", note.utauFlagSplit);
+                std::vector<juce::var> regionFlags;
+                for (const auto& text : { note.utauRegionFlags1, note.utauRegionFlags2,
+                                          note.utauRegionFlags3, note.utauRegionFlags4 })
+                    regionFlags.emplace_back(text);
+                set(noteValue, "region_flags", array(std::move(regionFlags)));
+                set(noteValue, "flag_curve_enabled", note.utauFlagCurveEnabled);
+                auto flagCurves = object();
+                for (const auto& curve : note.utauFlagCurves)
+                {
+                    std::vector<juce::var> written;
+                    for (const auto& point : curve.points)
+                    {
+                        std::vector<juce::var> pair;
+                        pair.emplace_back(point.timeSeconds);
+                        pair.emplace_back(static_cast<double>(point.value));
+                        pair.emplace_back(pitchCurveShapeName(point.shape));
+                        written.push_back(array(std::move(pair)));
+                    }
+                    set(flagCurves, curve.flag.toRawUTF8(), array(std::move(written)));
+                }
+                set(noteValue, "flag_curves", flagCurves);
                 std::vector<juce::var> contour;
                 for (const auto& point : note.contour)
                 {
@@ -943,7 +1140,12 @@ juce::var McpServer::projectJson() const
 
 juce::int64 McpServer::currentProjectFingerprint() const
 {
-    return juce::JSON::toString(projectJson(), false).hashCode64();
+    // Hash what the project serialiser writes, not the JSON view.  That view
+    // is a hand-maintained projection and never carried Flags, vibrato, the
+    // UTAU timing overrides or the region splits, so editing any of them left
+    // the fingerprint unchanged and syncAudio() skipped the re-render -- the
+    // engine then replayed the previous audio for an edit it never saw.
+    return project.contentFingerprint();
 }
 
 void McpServer::syncAudio()

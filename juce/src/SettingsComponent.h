@@ -32,6 +32,21 @@ public:
     }
 
 private:
+    class PathPicker final : public juce::Component
+    {
+    public:
+        PathPicker();
+        void resized() override;
+        void setText(const juce::String& text);
+        [[nodiscard]] juce::String getText() const;
+        void setBrowseTooltip(const juce::String& text);
+        std::function<void()> onBrowse;
+
+    private:
+        juce::TextEditor editor;
+        juce::TextButton browseButton { "..." };
+    };
+
     class FormPage final : public juce::Component
     {
     public:
@@ -51,6 +66,11 @@ private:
     void applyAudioValues();
     void openAdvancedAudioPanel();
     void refreshImportedStretchItems(int preferredId = 0);
+    void chooseUtauVoicebank();
+    void chooseUtauWavtool();
+    void chooseUtauResampler();
+    [[nodiscard]] juce::File initialPathFor(const PathPicker& picker,
+                                             bool directory) const;
 
     I18n& strings;
     juce::AudioDeviceManager& devices;
@@ -75,12 +95,15 @@ private:
     juce::TextButton advancedAudio;
 
     juce::Label gamePathLabel, gameModelLabel, fcpePathLabel, hifiganPathLabel, inferenceLabel,
-                inferenceDeviceLabel, utauResamplerLabel;
-    juce::TextEditor gamePath, fcpePath, hifiganPath, utauResamplerPath;
+                inferenceDeviceLabel, utauVoicebankLabel, utauWavtoolLabel,
+                utauResamplerLabel;
+    juce::TextEditor gamePath, fcpePath, hifiganPath;
+    PathPicker utauVoicebankPath, utauWavtoolPath, utauResamplerPath;
     juce::ComboBox gameModel, inference, inferenceDevice;
+    std::unique_ptr<juce::FileChooser> pathChooser;
 
-    juce::Label shortcutLabel, wheelLabel;
-    juce::ComboBox shortcutPreset, wheelAction;
+    juce::Label shortcutLabel;
+    juce::ComboBox shortcutPreset;
     juce::ToggleButton spacePlayback, confirmDestructive;
 
     juce::Label melodyneComposeLabel, melodynePitchLabel, importedAlgorithmLabel,

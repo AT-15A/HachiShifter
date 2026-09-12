@@ -217,7 +217,18 @@ juce::AudioBuffer<float> Llsm2Renderer::render(
     const auto targetDuration = static_cast<double>(targetSamples) / sampleRate;
     const auto sourceFrameEstimate = std::ceil(sourceDuration / hopSeconds) + 1.0;
     const auto targetFrameEstimate = std::ceil(targetDuration / hopSeconds) + 1.0;
-    constexpr auto maxLlsmFrames = 1'200;
+    // LLSM2 holds every frame at once, so the bound is on memory rather than
+    // on anything musical.  Measured on this machine, the whole path is linear
+    // and stays linear: 1000 frames cost 38 MB and 1.9 s, 8000 cost 185 MB and
+    // 10.6 s, 64000 cost 1.37 GB and 83 s, with the output level unchanged
+    // throughout -- about 21 KB and 1.2 ms per frame.  So the old 1200 was not
+    // holding back a blow-up; at the default 5 ms hop it just refused anything
+    // past six seconds, and a held note or a sung phrase goes past that often.
+    // 24000 frames is two minutes at that hop for about half a gigabyte, which
+    // covers the material this renders and still bounds a nonsense request.
+    // Past it the render returns nothing and RenderService falls back to mld5,
+    // which is audible but not this algorithm -- see --smoke-llsm2-length.
+    constexpr auto maxLlsmFrames = 24'000;
     if (!std::isfinite(sourceFrameEstimate) || !std::isfinite(targetFrameEstimate)
         || sourceFrameEstimate > maxLlsmFrames || targetFrameEstimate > maxLlsmFrames) return empty;
     const auto sourceFrames = std::max(2, static_cast<int>(sourceFrameEstimate));
