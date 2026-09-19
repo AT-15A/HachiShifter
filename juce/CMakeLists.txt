@@ -37,6 +37,16 @@ if(WIN32)
         "VBlankDispatcher::getInstance()->updateDisplay (*this, currentMonitor);"
         "(void) currentMonitor; // HachiShifter software rendering: no DXGI wait thread"
         HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
+    # The peer-level onVBlank used to flush GDI's deferred repaint queue.
+    # Without DXGI notifications, enqueue WM_PAINT directly. Windows still
+    # coalesces invalid rectangles; do not synchronously paint from callbacks.
+    string(REPLACE
+        "deferredRepaints.add (area);"
+        "auto invalidRect = D2DUtilities::toRECT (area); InvalidateRect (peer.getHWND(), &invalidRect, FALSE); // HachiShifter WM_PAINT scheduling"
+        HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
+    if(NOT HACHI_WINDOWING_SOURCE MATCHES "HachiShifter WM_PAINT scheduling")
+        message(FATAL_ERROR "JUCE GDI repaint patch no longer matches")
+    endif()
     file(WRITE "${HACHI_WINDOWING_FILE}" "${HACHI_WINDOWING_SOURCE}")
     set(HACHI_VBLANK_FILE "${juce_SOURCE_DIR}/modules/juce_gui_basics/native/juce_VBlank_windows.cpp")
     file(READ "${HACHI_VBLANK_FILE}" HACHI_VBLANK_SOURCE)
