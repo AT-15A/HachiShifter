@@ -2522,6 +2522,16 @@ void MainComponent::changeListenerCallback(juce::ChangeBroadcaster* source)
 
 void MainComponent::timerCallback()
 {
+    static juce::String previousModalState;
+    auto* modal = juce::Component::getCurrentlyModalComponent();
+    const auto modalState = modal == nullptr ? juce::String("none")
+        : modal->getName() + "; visible=" + juce::String(modal->isShowing())
+            + "; bounds=" + modal->getScreenBounds().toString();
+    if (modalState != previousModalState)
+    {
+        startupLog("UI modal: " + modalState);
+        previousModalState = modalState;
+    }
     const auto expectedPlayIcon = audio.isPlaying() ? juce::String("icon.pause")
                                                      : juce::String("icon.play");
     if (playButton.getComponentID() != expectedPlayIcon)
@@ -4127,6 +4137,7 @@ void MainComponent::loadUstFile(const juce::File& file)
 
 void MainComponent::loadMelodyneFile(const juce::File& file)
 {
+    startupLog("Import: MPD started " + file.getFullPathName());
     importInProgress = true;
     progress = 0.01;
     statusLabel.setText(strings.text("status.loading"), juce::dontSendNotification);
@@ -4183,6 +4194,7 @@ void MainComponent::loadMelodyneFile(const juce::File& file)
         {
             if (safe == nullptr) return;
             safe->importInProgress = false;
+            startupLog("Import: parser returned; success=" + juce::String(imported.has_value()));
             safe->progress = 0.0;
             if (!imported)
             {
@@ -4205,8 +4217,10 @@ void MainComponent::loadMelodyneFile(const juce::File& file)
 
 void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResult imported)
 {
+    startupLog("Import: converting HJM");
     juce::StringArray annotationWarnings;
     SampleSettings::convertMelodyneProject(imported.project, annotationWarnings);
+    startupLog("Import: HJM complete; warnings=" + juce::String(annotationWarnings.size()));
     for (const auto& warning : annotationWarnings)
         DBG("Could not convert Melodyne annotation: " + warning);
 
@@ -4241,8 +4255,12 @@ void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResul
         track.stretchAlgorithm = importedStretch;
     }
 
-    const auto composeMode = preferences != nullptr
+    const auto storedComposeMode = preferences != nullptr
         ? preferences->getIntValue("import.melodyneCompose", 1) : 1;
+    const auto composeMode = storedComposeMode >= 1 && storedComposeMode <= 4
+        ? storedComposeMode : 1;
+    startupLog("Import: track choice mode=" + juce::String(composeMode)
+        + "; stored=" + juce::String(storedComposeMode));
     if (composeMode != 1)
     {
         for (auto& track : imported.project.tracks)
@@ -4261,33 +4279,37 @@ void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResul
     auto* selector = new ComposeTrackSelector(state->project.tracks, strings);
     auto* dialog = new juce::AlertWindow(strings.text("mpd.compose.title"),
                                           strings.text("mpd.compose.description"),
-                                          juce::MessageBoxIconType::QuestionIcon);
+                                          juce::MessageBoxIconType::QuestionIcon, this);
     dialog->addCustomComponent(selector);
     dialog->addButton(strings.text("dialog.import"), 1);
     dialog->addButton(strings.text("dialog.cancel"), 0,
-                      juce::KeyPress(juce::KeyPress::escapeKey));
+                       juce::KeyPress(juce::KeyPress::escapeKey));
+    dialog->centreAroundComponent(getTopLevelComponent(), dialog->getWidth(), dialog->getHeight());
+    startupLog("Import: showing track selector");
     juce::Component::SafePointer<MainComponent> safe(this);
     dialog->enterModalState(true,
         juce::ModalCallbackFunction::create([safe, dialog, selector, state](int result)
         {
+            startupLog("Import: track selector result=" + juce::String(result));
             if (safe != nullptr && result == 1)
             {
                 for (std::size_t index = 0; index < state->project.tracks.size(); ++index)
                     state->project.tracks[index].compose = selector->isCompose(index);
                 safe->project.replace(std::move(state->project));
-                if (!state->missingFiles.isEmpty())
-                    safe->showError(safe->strings.text("warning.missingMedia") + "\n"
-                                    + state->missingFiles.joinIntoString("\n"));
             }
             dialog->removeCustomComponent(0);
             delete selector;
             delete dialog;
+            if (safe != nullptr && result == 1 && !state->missingFiles.isEmpty())
+                safe->showError(safe->strings.text("warning.missingMedia") + "\n"
+                    + state->missingFiles.joinIntoString("\n"));
         }), false);
 }
 
 void MainComponent::showError(const juce::String& message)
 {
+    startupLog("UI warning: " + message);
     juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
-                                            strings.text("app.title"), message);
+                                            strings.text("app.title"), message, {}, this);
 }
 }

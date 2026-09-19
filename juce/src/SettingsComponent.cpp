@@ -238,7 +238,8 @@ void SettingsComponent::loadValues()
     shortcutPreset.setSelectedId(properties.getIntValue("operation.shortcutPreset", 1), juce::dontSendNotification);
     spacePlayback.setToggleState(properties.getBoolValue("operation.spacePlayback", true), juce::dontSendNotification);
     confirmDestructive.setToggleState(properties.getBoolValue("operation.confirmDestructive", true), juce::dontSendNotification);
-    melodyneCompose.setSelectedId(properties.getIntValue("import.melodyneCompose", 1), juce::dontSendNotification);
+    melodyneCompose.setSelectedId(juce::jlimit(1, 4,
+        properties.getIntValue("import.melodyneCompose", 1)), juce::dontSendNotification);
     melodynePitchSource.setSelectedId(properties.getIntValue("import.melodynePitchSource", 1), juce::dontSendNotification);
     const auto configuredHifigan = juce::File(properties.getValue("algorithm.hifiganPath"));
     const auto defaultImportedAlgorithm = backend::NsfHifiganRenderer::modelAvailable(
@@ -275,7 +276,7 @@ void SettingsComponent::saveValues()
     properties.setValue("operation.shortcutPreset", shortcutPreset.getSelectedId());
     properties.setValue("operation.spacePlayback", spacePlayback.getToggleState());
     properties.setValue("operation.confirmDestructive", confirmDestructive.getToggleState());
-    properties.setValue("import.melodyneCompose", melodyneCompose.getSelectedId());
+    properties.setValue("import.melodyneCompose", juce::jlimit(1, 4, melodyneCompose.getSelectedId()));
     properties.setValue("import.melodynePitchSource", melodynePitchSource.getSelectedId());
     properties.setValue("import.algorithm", importedAlgorithm.getSelectedId() > 0
         ? importedAlgorithm.getSelectedId() : 1);
