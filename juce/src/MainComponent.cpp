@@ -2525,7 +2525,7 @@ void MainComponent::timerCallback()
     static juce::String previousModalState;
     auto* modal = juce::Component::getCurrentlyModalComponent();
     const auto modalState = modal == nullptr ? juce::String("none")
-        : modal->getName() + "; visible=" + juce::String(modal->isShowing())
+        : modal->getName() + "; visible=" + juce::String(modal->isShowing() ? 1 : 0)
             + "; bounds=" + modal->getScreenBounds().toString();
     if (modalState != previousModalState)
     {
@@ -4194,7 +4194,7 @@ void MainComponent::loadMelodyneFile(const juce::File& file)
         {
             if (safe == nullptr) return;
             safe->importInProgress = false;
-            startupLog("Import: parser returned; success=" + juce::String(imported.has_value()));
+            startupLog("Import: parser returned; success=" + juce::String(imported.has_value() ? 1 : 0));
             safe->progress = 0.0;
             if (!imported)
             {
