@@ -29,6 +29,9 @@ struct MelodyneConsonantMapping
 class MelodyneImporter final
 {
 public:
+    // Read-only diagnostics including empty/unresolved tracks, before media
+    // filtering. Useful when a named track is absent from an imported project.
+    [[nodiscard]] static juce::var inspectTracks(const juce::File& file, juce::String& error);
     using Progress = std::function<void(double, const juce::String&)>;
 
     [[nodiscard]] static std::optional<MelodyneImportResult>

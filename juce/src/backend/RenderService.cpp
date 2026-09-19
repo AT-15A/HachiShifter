@@ -674,6 +674,15 @@ public:
     {
         if (shouldExit()) return jobHasFinished;
         juce::AudioFormatManager formats;
+        if (request.pitchBackend == PitchRenderBackend::mld5
+            || request.pitchBackend == PitchRenderBackend::mld3
+            || request.pitchBackend == PitchRenderBackend::vslib)
+        {
+            RenderedAudio failure;
+            failure.warning = "Selected backend is disabled or has no native implementation";
+            if (completion) completion(std::move(failure));
+            return jobHasFinished;
+        }
         formats.registerBasicFormats();
         auto reader = std::unique_ptr<juce::AudioFormatReader>(formats.createReaderFor(request.sourceFile));
         if (reader == nullptr || reader->sampleRate <= 0.0)
@@ -716,10 +725,12 @@ public:
             // A malformed or exceptionally constrained source still remains
             // playable through the established model-free route.
             if (rendered.getNumSamples() != targetSamples)
-                rendered = renderFormantPreserved(source, targetSamples, reader->sampleRate,
-                    request.framePeriodMs, request.sourceMidi, request.targetMidi,
-                    request.formantSemitones, request.noteGain, request.tension, request.breath,
-                    request.timeMap, request.pitchBackend, request.stretchAlgorithm);
+            {
+                RenderedAudio failure;
+                failure.warning = "WORLD render failed; backend substitution is prohibited";
+                if (completion) completion(std::move(failure));
+                return jobHasFinished;
+            }
             else
                 applyExpressionAndTension(rendered, reader->sampleRate, request.framePeriodMs,
                                           request.targetMidi, request.noteGain, request.tension,
@@ -748,24 +759,13 @@ public:
         }
         else if (request.pitchBackend == PitchRenderBackend::mld3)
         {
-            // Melodyne 3 algorithm path: independent PSOLA period-transition
-            // renderer with separate pitch / formant ratios, fully
-            // independent from the M5 MULSS spectral path.
-            Mld3RenderRequest mld3Request;
-            mld3Request.input = &source;
-            mld3Request.sampleRate = reader->sampleRate;
-            mld3Request.framePeriodMs = request.framePeriodMs;
-            mld3Request.sourceMidi = request.sourceMidi;
-            mld3Request.targetMidi = request.targetMidi;
-            mld3Request.formantSemitones = request.formantSemitones;
-            mld3Request.noteGain = request.noteGain;
-            for (const auto& point : request.timeMap)
-                mld3Request.timeMap.push_back({ point.targetSeconds, point.sourceSeconds });
-            mld3Request.targetSamples = targetSamples;
-            Mld3Renderer mld3;
-            rendered = mld3.render(mld3Request);
-            applyExpressionAndTension(rendered, reader->sampleRate, request.framePeriodMs,
-                request.targetMidi, {}, request.tension, request.breath);
+            // The independent Melodyne algorithms are intentionally disabled
+            // until their quality is validated. Never silently route mld3 to a
+            // different backend.
+            RenderedAudio disabled;
+            disabled.warning = "mld3 backend is disabled";
+            if (completion) completion(std::move(disabled));
+            return jobHasFinished;
         }
         else if (request.pitchBackend == PitchRenderBackend::llsm2)
         {
@@ -797,10 +797,10 @@ public:
             else
                 try
                 {
-                    rendered = renderFormantPreserved(source, targetSamples, reader->sampleRate,
-                        request.framePeriodMs, request.sourceMidi, request.targetMidi,
-                        request.formantSemitones, request.noteGain, request.tension, request.breath,
-                        request.timeMap, request.pitchBackend, request.stretchAlgorithm);
+                    RenderedAudio failure;
+                    failure.warning = "LLSM2 render failed; backend substitution is prohibited";
+                    if (completion) completion(std::move(failure));
+                    return jobHasFinished;
                 }
                 catch (const std::bad_alloc&)
                 {
@@ -809,6 +809,13 @@ public:
         }
         else if (request.pitchBackend == PitchRenderBackend::nsfHifigan)
         {
+            if (!NsfHifiganRenderer::modelAvailable(request.hifiganModelDirectory))
+            {
+                RenderedAudio disabled;
+                disabled.warning = "NSF-HiFiGAN is selected but its model pack is unavailable";
+                if (completion) completion(std::move(disabled));
+                return jobHasFinished;
+            }
             // Both neural routes extract the spectral envelope directly from
             // original PCM.  This avoids a preliminary time-domain stretch
             // changing the vocal tract before the vocoder sees it.  Standard
@@ -850,17 +857,38 @@ public:
                     request.tension, request.breath);
             }
             else
-                rendered = renderFormantPreserved(source, targetSamples, reader->sampleRate,
-                    request.framePeriodMs, request.sourceMidi, request.targetMidi,
-                    request.formantSemitones, request.noteGain, request.tension, request.breath,
-                    request.timeMap, request.pitchBackend, request.stretchAlgorithm);
+            {
+                RenderedAudio disabled;
+                disabled.warning = neural.error.isNotEmpty() ? neural.error
+                    : "NSF-HiFiGAN render failed";
+                if (completion) completion(std::move(disabled));
+                return jobHasFinished;
+            }
         }
-        else
+        else if (request.pitchBackend == PitchRenderBackend::vslib)
+        {
+            // vslib is not available to the Linux build. Do not silently
+            // substitute another backend there. Windows keeps its native
+            // implementation path.
+#if !JUCE_WINDOWS
+            RenderedAudio disabled;
+            disabled.warning = "vslib backend is unavailable on this platform";
+            if (completion) completion(std::move(disabled));
+            return jobHasFinished;
+#else
             rendered = renderFormantPreserved(source, targetSamples, reader->sampleRate,
                 request.framePeriodMs, request.sourceMidi, request.targetMidi,
                 request.formantSemitones, request.noteGain, request.tension, request.breath,
-                request.timeMap,
-                request.pitchBackend, request.stretchAlgorithm);
+                request.timeMap, request.pitchBackend, request.stretchAlgorithm);
+#endif
+        }
+        else
+        {
+            RenderedAudio disabled;
+            disabled.warning = "requested pitch backend is disabled";
+            if (completion) completion(std::move(disabled));
+            return jobHasFinished;
+        }
         if (request.normalizeVolume && !usedNsfModel)
             matchActiveRms(rendered, source);
         auto backend = request.pitchBackend == PitchRenderBackend::mld5

@@ -14,6 +14,48 @@ inline constexpr int inheritedUtauConsonantVelocity =
     std::numeric_limits<int>::min();
 
 struct SampleRegionSetting;
+
+// Native annotation vocabulary shared by every import path.  Input formats
+// may retain provenance, but downstream editing does not branch on it.
+enum class NativeSegmentRole
+{
+    unknown,
+    consonant,
+    vowel,
+    transition,
+    silence,
+    breath,
+    noise,
+    ending
+};
+[[nodiscard]] juce::String nativeSegmentRoleName(NativeSegmentRole role);
+[[nodiscard]] NativeSegmentRole parseNativeSegmentRole(const juce::String& value);
+
+struct NativeSegment
+{
+    juce::String id;
+    juce::String alias = "-";
+    NativeSegmentRole role = NativeSegmentRole::unknown;
+    double sourceStartSeconds = 0.0;
+    double sourceEndSeconds = 0.0;
+    // Native data only: imported/estimated/user.  This is provenance, not an
+    // execution mode, and does not select a renderer or an editor layout.
+    juce::String provenance = "estimated";
+    float confidence = 0.0f;
+    double alignmentSeconds = 0.0;
+    double overlapSeconds = 0.0;
+    bool stretchable = true;
+    double stretchWeight = 1.0;
+};
+
+struct NativeMaterialAnnotation
+{
+    int version = 2;
+    juce::String materialId;
+    juce::File sourceFile;
+    juce::File annotationFile;
+    std::vector<NativeSegment> segments;
+};
 // The UTAU synthesis modes.  A track in any of them is PitchAlgorithm::utau,
 // so every UTAU affordance is inherited rather than reimplemented; the mode
 // only says how a sample is carved up and how a syllable reaches the engine.
@@ -61,6 +103,8 @@ enum class PitchAlgorithm
 // Catmull-Rom stretch/splice (pitch first, then splice), so the shift-first
 // path matches the original algorithm; the splice-first path is the HachiShifter
 // variable-mel-hop default and keeps the join blended before formant shifting.
+[[nodiscard]] PitchAlgorithm defaultPitchAlgorithm(const juce::File& modelDirectory = {});
+
 enum class StretchAlgorithm
 {
     melodyneHybrid,
@@ -215,6 +259,15 @@ struct NoteData
 {
     juce::String id;
     juce::String label;
+    // The native editor consumes these fields for every note, regardless of
+    // whether the note came from UST, MPD, MIDI or a hand-created placement.
+    // Segment times are note-local after an HJM region is bound to a note.
+    NativeSegmentRole nativeRole = NativeSegmentRole::unknown;
+    juce::String nativeProvenance = "estimated";
+    float nativeConfidence = 0.0f;
+    double nativeSourceStartSeconds = -1.0;
+    double nativeSourceEndSeconds = -1.0;
+    std::vector<NativeSegment> nativeSegments;
     // Passed verbatim as the UTAU resampler's flags argument.  Interpretation
     // belongs to the selected resampler because flag dialects are not uniform.
     juce::String utauFlags;
@@ -366,12 +419,30 @@ struct TrackData
     // have to be added to every one of them, and any missed site would
     // silently drop an affordance from the new mode.
     UtauMode utauMode = UtauMode::classic;
-    PitchAlgorithm pitchAlgorithm = PitchAlgorithm::mld5;
+    // MLD5/MLD3 are retained only for loading old projects.  New native
+    // projects default to LLSM2; the UI promotes NSF-HiFiGAN when its model
+    // pack is actually available.
+    PitchAlgorithm pitchAlgorithm = defaultPitchAlgorithm();
     StretchAlgorithm stretchAlgorithm = StretchAlgorithm::melodyneHybrid;
     // Kept at processThenSplice so an existing project, and every track that
     // predates this field, renders exactly as it did before.
     RenderOrder renderOrder = RenderOrder::processThenSplice;
     std::vector<ClipData> clips;
+};
+
+// A native connection is explicit and can cross source files or HJM regions.
+// The legacy note booleans remain as a compatibility projection for existing
+// renderers; new editing code can identify both endpoints without guessing
+// from their order on a track.
+struct NativeConnection
+{
+    juce::String id;
+    juce::String leftNoteId;
+    juce::String rightNoteId;
+    juce::String type = "pitch-and-amplitude";
+    double boundarySeconds = 0.0;
+    std::vector<PitchCurveEditPoint> pitchCurve;
+    std::vector<AmplitudeEnvelopePoint> amplitudeCurve;
 };
 
 // Vibrato offset in cents at a time inside the note.  Shared by the piano roll
@@ -397,6 +468,7 @@ struct ProjectData
     int noteEditDivision = 64;
     juce::String baseScale = "C";
     std::vector<TempoChange> tempoChanges;
+    std::vector<NativeConnection> nativeConnections;
     std::vector<TrackData> tracks;
 
     [[nodiscard]] double durationSeconds() const;

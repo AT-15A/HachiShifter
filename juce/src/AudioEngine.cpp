@@ -189,11 +189,10 @@ backend::Mld5FileRenderRequest makeRenderRequest(const ClipData& clip, const Tra
             request.robustPitchCurve[static_cast<std::size_t>(frame)] =
                 note.robustPitchCurve ? static_cast<float>(noteIndex + 1) : 0.0f;
             const auto cents = contourAt(note, juce::jlimit(0.0, note.durationSeconds, local));
-            if (!cents) break;
+            if (!cents) break; // Preserve the analysed unvoiced mask.
             const auto sourceCenter = note.sourceMidiCenter >= 0.0f ? note.sourceMidiCenter : note.midiNote;
             request.sourceMidi[static_cast<std::size_t>(frame)] = sourceCenter + cents->first / 100.0f;
-            request.targetMidi[static_cast<std::size_t>(frame)] = note.midiNote
-                + cents->second / 100.0f;
+            request.targetMidi[static_cast<std::size_t>(frame)] = note.midiNote + cents->second / 100.0f;
             break;
         }
     }
@@ -1394,8 +1393,7 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
         };
         std::vector<PendingGroup> pendingGroups;
         std::vector<bool> inGlideGroup(count, false);
-        const auto mergedMode = backend::MelodyneProvider::experimentalMergedRenderEnabled()
-            && track.compose
+        const auto mergedMode = track.compose
             && track.renderOrder == RenderOrder::stretchSpliceThenPitch
             && track.pitchAlgorithm == PitchAlgorithm::nsfHifigan;
         if (mergedMode)
@@ -1479,7 +1477,9 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
             loaded->reader = reader;
             if (const auto fallback = playbackFallbackByClip.find(clip.id.toStdString());
                 fallback != playbackFallbackByClip.end())
-                loaded->fallbackRendered = fallback->second;
+                // Do not audition an earlier backend's cached output while a
+                // newly selected backend is pending or unavailable.
+                loaded->fallbackRendered.reset();
             auto renderClip = clip;
             const auto hasUtauSelection = utauTrack && !utauRenderNoteSelection.empty();
             // UTAU rendering is explicitly selection-driven.  Rendering every
@@ -1583,8 +1583,11 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                 {
                     const auto publish = [state](backend::RenderedAudio result) mutable
                     {
-                        if (result.buffer.getNumSamples() <= 0 || result.sampleRate <= 0.0)
-                        {
+                         if (result.buffer.getNumSamples() <= 0 || result.sampleRate <= 0.0)
+                         {
+                             state->warning = result.warning.isNotEmpty() ? result.warning
+                                 : "Selected backend returned no audio";
+                             state->backend = result.backend;
                             state->progress.store(1.0f, std::memory_order_release);
                             state->finished.store(true, std::memory_order_release);
                             return;
@@ -1753,6 +1756,16 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                     {
                         if (result.buffer.getNumSamples() <= 0 || result.sampleRate <= 0.0)
                         {
+                            const juce::ScopedLock sliceGuard(phrase->sliceLock);
+                            phrase->warning = result.warning.isNotEmpty() ? result.warning
+                                : "NSF merged render returned no audio";
+                            for (const auto& target : phrase->pendingSlices)
+                            {
+                                target.clip->warning = phrase->warning;
+                                target.clip->progress.store(1.0f, std::memory_order_release);
+                                target.clip->finished.store(true, std::memory_order_release);
+                            }
+                            phrase->pendingSlices.clear();
                             phrase->finished.store(true, std::memory_order_release);
                             return;
                         }
@@ -2239,7 +2252,7 @@ juce::String AudioEngine::activeRenderWarnings() const
     juce::StringArray warnings;
     for (const auto& loaded : loadedClips)
         if (loaded->rendered != nullptr
-            && loaded->rendered->ready.load(std::memory_order_acquire)
+            && loaded->rendered->finished.load(std::memory_order_acquire)
             && loaded->rendered->warning.isNotEmpty())
             warnings.addIfNotAlreadyThere(loaded->rendered->warning);
     return warnings.joinIntoString("; ");
@@ -2249,6 +2262,12 @@ bool AudioEngine::exportWav(const juce::File& file, juce::String& error,
                             const juce::String& trackId,
                             double fromSeconds, double toSeconds)
 {
+    const auto failure = activeRenderWarnings();
+    if (failure.isNotEmpty())
+    {
+        error = failure;
+        return false;
+    }
     {
         const juce::ScopedReadLock guard(renderLock);
         for (const auto& loaded : loadedClips)

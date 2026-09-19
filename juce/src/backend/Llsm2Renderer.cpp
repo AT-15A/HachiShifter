@@ -226,8 +226,8 @@ juce::AudioBuffer<float> Llsm2Renderer::render(
     // past six seconds, and a held note or a sung phrase goes past that often.
     // 24000 frames is two minutes at that hop for about half a gigabyte, which
     // covers the material this renders and still bounds a nonsense request.
-    // Past it the render returns nothing and RenderService falls back to mld5,
-    // which is audible but not this algorithm -- see --smoke-llsm2-length.
+    // Past it the render returns nothing and RenderService reports failure.
+    // No other backend may be substituted for the user's selection.
     constexpr auto maxLlsmFrames = 24'000;
     if (!std::isfinite(sourceFrameEstimate) || !std::isfinite(targetFrameEstimate)
         || sourceFrameEstimate > maxLlsmFrames || targetFrameEstimate > maxLlsmFrames) return empty;

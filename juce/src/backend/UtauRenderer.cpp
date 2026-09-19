@@ -46,10 +46,35 @@ struct VoiceSample
     float sourceMidi = 60.0f;
     bool hasRegions = false;
     std::array<double, 4> regionSeconds {};
+    // HJM is the native annotation after import.  Keep every segment here;
+    // the legacy four-region array above is only a compatibility projection
+    // for resamplers that still accept that protocol.
+    std::vector<NativeSegment> nativeSegments;
     // One letter per region from 谋•OTO; empty unless this voicebank has been
     // annotated and the track is in 谋•UTAU mode.
     juce::String mouClasses;
 };
+
+void projectNativeSegmentsToLegacyRegions(VoiceSample& sample)
+{
+    if (sample.nativeSegments.empty()) return;
+    const auto span = std::max(1.0e-6, sample.end - sample.offset);
+    std::vector<double> boundaries { 0.0 };
+    for (const auto& segment : sample.nativeSegments)
+        boundaries.push_back(juce::jlimit(0.0, span,
+            segment.sourceEndSeconds - segment.sourceStartSeconds));
+    boundaries.push_back(span);
+    std::stable_sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end(),
+        [](double left, double right) { return std::abs(left - right) < 1.0e-6; }),
+        boundaries.end());
+    if (boundaries.size() < 2) return;
+    sample.hasRegions = boundaries.size() <= 5;
+    if (!sample.hasRegions) return;
+    sample.regionSeconds.fill(0.0);
+    for (std::size_t index = 1; index < boundaries.size() && index <= 4; ++index)
+        sample.regionSeconds[index - 1] = boundaries[index] - boundaries[index - 1];
+}
 
 struct RenderedNote
 {
@@ -273,21 +298,72 @@ void inferSourceMidi(VoiceSample& sample)
         sample.sourceMidi = *directoryPitch;
 }
 
+std::vector<VoiceSample> loadHjmVoicebank(const juce::File& root,
+                                          juce::AudioFormatManager& formats)
+{
+    std::vector<VoiceSample> result;
+    if (!root.isDirectory()) return result;
+    juce::Array<juce::File> files;
+    root.findChildFiles(files, juce::File::findFiles, true, "*");
+    files.sort();
+    for (const auto& file : files)
+    {
+        if (!file.hasFileExtension("wav;flac;aif;aiff;mp3;ogg")) continue;
+        const auto sidecar = SampleSettings::sidecarFor(file);
+        const juce::File legacy(file.getFullPathName() + ".hachi.csv");
+        if (!sidecar.existsAsFile() && !legacy.existsAsFile()) continue;
+        auto reader = std::unique_ptr<juce::AudioFormatReader>(formats.createReaderFor(file));
+        if (reader == nullptr || reader->sampleRate <= 0.0) continue;
+        const auto duration = static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
+        const auto rows = SampleSettings::loadOrDerive(file, ProjectData{});
+        for (const auto& row : rows)
+        {
+            VoiceSample sample;
+            sample.file = file;
+            sample.alias = row.name.trim().isNotEmpty()
+                ? row.name.trim() : file.getFileNameWithoutExtension();
+            sample.fileSeconds = duration;
+            sample.offset = juce::jlimit(0.0, duration, row.regionStartSeconds);
+            sample.end = juce::jlimit(sample.offset + 0.001,
+                std::max(sample.offset + 0.001, duration), row.regionEndSeconds);
+            sample.preutterance = juce::jlimit(0.0, sample.end - sample.offset,
+                row.alignmentSeconds - row.regionStartSeconds);
+            sample.consonant = juce::jlimit(0.0, sample.end - sample.offset,
+                row.fixedDurationSeconds);
+            sample.overlap = row.overlapSeconds;
+            sample.nativeSegments = SampleSettings::nativeSegmentsFor(row);
+            projectNativeSegmentsToLegacyRegions(sample);
+            if (row.melodyneOriginalPitchCenterCents > 0.0)
+                sample.sourceMidi = static_cast<float>(
+                    row.melodyneOriginalPitchCenterCents / 100.0);
+            else if (row.melodynePitchCenterCents > 0.0)
+                sample.sourceMidi = static_cast<float>(
+                    row.melodynePitchCenterCents / 100.0);
+            else
+                inferSourceMidi(sample);
+            result.push_back(std::move(sample));
+        }
+    }
+    return result;
+}
+
 std::vector<VoiceSample> loadVoicebank(const juce::File& root, bool fourRegion,
                                       bool consonantClasses)
 {
     std::vector<VoiceSample> result;
     if (!root.isDirectory()) return result;
 
-    // OTO is authoritative for UTAU playback.  The classic mode reads
-    // oto.ini; Jie mode reads the independent oto.jie.ini (falling back to an
-    // in-memory view of oto.ini until its first save).  This prevents either
-    // mode from inheriting timing or aliases through the other's HJM sidecar.
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    // HJM is the native annotation after voicebank import.  Once present, it
+    // is authoritative and OTO is not consulted for playback.  The OTO path
+    // remains a migration fallback for an unconverted legacy bank.
+    if (auto native = loadHjmVoicebank(root, formats); !native.empty())
+        return native;
+
     juce::StringArray warnings;
     const auto otoEntries = SampleSettings::loadVoicebankOto(root, warnings, fourRegion,
                                                              consonantClasses);
-    juce::AudioFormatManager formats;
-    formats.registerBasicFormats();
     for (const auto& entry : otoEntries)
     {
         auto reader = std::unique_ptr<juce::AudioFormatReader>(

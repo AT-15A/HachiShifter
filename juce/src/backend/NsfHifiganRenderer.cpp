@@ -944,6 +944,16 @@ std::vector<float> infer(Ort::Session& model, const Config& config,
 }
 #endif
 
+bool NsfHifiganRenderer::modelAvailable(const juce::File& configuredModelDirectory)
+{
+#if defined(HACHI_HAS_ONNX_ANALYSIS) && HACHI_HAS_ONNX_ANALYSIS
+    return modelFiles(configuredModelDirectory).has_value();
+#else
+    juce::ignoreUnused(configuredModelDirectory);
+    return false;
+#endif
+}
+
 NsfHifiganRenderResult NsfHifiganRenderer::render(
     const juce::AudioBuffer<float>& source, double sampleRate, int targetSamples,
     double framePeriodMs, const std::vector<float>& targetMidi,

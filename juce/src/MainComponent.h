@@ -290,6 +290,7 @@ public:
     void diagnosticPressTool(PianoRollComponent::Tool wanted);
     [[nodiscard]] PianoRollComponent::Tool diagnosticTool() const;
     void diagnosticRefreshControls();
+    [[nodiscard]] bool diagnosticRenderOrderPicker();
 
 private:
     void changeListenerCallback(juce::ChangeBroadcaster* source) override;

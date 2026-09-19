@@ -6303,8 +6303,12 @@ public:
 
             // A fresh install: the box on, the envelope off, as before.
             juce::PropertySet fresh;
+            const auto nativeEnvelopeDefault = MainComponent::viewOptionsFrom(fresh).envelope;
+            // Test toggling from an explicitly hidden envelope as well as the
+            // new first-run default, which shows the imported fade shape.
+            fresh.setValue("ui.nativeEnvelope", false);
             const auto defaults = MainComponent::viewOptionsFrom(fresh);
-            const auto defaultsKept = defaults.noteRange && !defaults.envelope
+            const auto defaultsKept = nativeEnvelopeDefault && defaults.noteRange && !defaults.envelope
                 && !defaults.utauWaveform && defaults.pitchLine;
 
             // Each item flips its own switch and leaves the other alone.
@@ -6375,6 +6379,17 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 2 && arguments[0] == "--inspect-melodyne-tracks")
+        {
+            juce::String error;
+            const auto tracks = backend::MelodyneImporter::inspectTracks(
+                juce::File(arguments[1]), error);
+            std::cout << juce::JSON::toString(tracks) << std::endl;
+            if (error.isNotEmpty()) std::cerr << error << std::endl;
+            setApplicationReturnValue(error.isEmpty() ? 0 : 2);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 1 && arguments[0] == "--smoke-melodyne-provider")
         {
             const auto installation = backend::MelodyneProvider::detect();
@@ -6383,13 +6398,13 @@ public:
             const auto candidate = detected && installation->isUsableCandidate();
             const auto disabled = !backend::MelodyneProvider::nativeImportAvailable()
                 && !backend::MelodyneProvider::nativeRenderAvailable()
-                && !backend::MelodyneProvider::experimentalSelfImportEnabled()
+                && backend::MelodyneProvider::experimentalSelfImportEnabled()
                 && !backend::MelodyneProvider::experimentalMergedRenderEnabled();
             std::cout << "detected=" << (detected ? 1 : 0)
                       << "|candidate=" << (candidate ? 1 : 0)
                       << "|native_import=" << (backend::MelodyneProvider::nativeImportAvailable() ? 1 : 0)
                       << "|native_render=" << (backend::MelodyneProvider::nativeRenderAvailable() ? 1 : 0)
-                      << "|experimental_disabled=" << (disabled ? 1 : 0)
+                      << "|ui_test_import_policy=" << (disabled ? 1 : 0)
                       << "|vst3_candidate=" << (vst3.candidateFound ? 1 : 0)
                       << "|vst3_host_supported=" << (vst3.hostPlatformSupported ? 1 : 0)
                       << "|vst3_described=" << (vst3.pluginDescribed ? 1 : 0)
@@ -6410,6 +6425,130 @@ public:
                     setApplicationReturnValue(instance ? 0 : 4);
                     juce::MessageManager::callAsync([this] { quit(); });
                 });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-native-timing")
+        {
+            const auto file = juce::File::createTempFile(".wav");
+            file.create();
+            ProjectData data;
+            TrackData track;
+            track.id = "timing-track";
+            track.pitchAlgorithm = PitchAlgorithm::world;
+            ClipData clip;
+            clip.id = "timing-clip";
+            clip.sourceFile = file;
+            clip.sourceOffsetSeconds = 10.0;
+            clip.sourceDurationSeconds = 2.0;
+            clip.durationSeconds = 1.0;
+            clip.sourceTimeMap = { { 0.0, 0.0 }, { 0.2, 0.4 }, { 1.0, 2.0 } };
+            NoteData note;
+            note.id = "timing-note";
+            note.durationSeconds = 1.0;
+            note.consonantSeconds = 0.2;
+            note.attackSpeed = 1.0f;
+            note.contour = { { 0.0, 0.0f, 0.0f, false },
+                { 0.4, 10.0f, 10.0f, true }, { 0.6, 20.0f, 20.0f, true } };
+            note.amplitudeEnvelope = { { 0.0, -60.0f }, { 0.2, 0.0f }, { 1.0, -60.0f } };
+            clip.notes.push_back(note);
+            track.clips.push_back(clip);
+            data.tracks.push_back(track);
+            juce::StringArray warnings;
+            const auto converted = SampleSettings::convertMelodyneProject(data, warnings);
+            const auto rows = SampleSettings::loadOrDerive(file, {});
+            const auto boundaries = rows.size() == 1 && rows[0].segments.size() == 3
+                && std::abs(rows[0].alignmentSeconds - 10.4) < 1.0e-6
+                && rows[0].fixedDurationSeconds > 0.4
+                && rows[0].segments[0].role == NativeSegmentRole::consonant
+                && rows[0].segments[1].role == NativeSegmentRole::vowel;
+            ProjectModel model;
+            model.replace(data);
+            model.setNotesUtauConsonantVelocity({ note.id }, 200);
+            const auto updated = model.snapshot().tracks.front().clips.front();
+            const auto& moved = updated.notes.front();
+            const auto timing = std::abs(moved.consonantSeconds - 0.1) < 1.0e-6
+                && std::abs(moved.durationSeconds - 1.0) < 1.0e-6
+                && std::abs(updated.sourceOffsetSeconds - 10.0) < 1.0e-6
+                && std::abs(updated.sourceTimeMap[1].targetSeconds - 0.1) < 1.0e-6
+                && std::abs(updated.sourceTimeMap[1].sourceSeconds - 0.4) < 1.0e-6
+                && std::abs(moved.contour[1].relativeCents - 10.0f) < 1.0e-6f
+                && std::abs(moved.amplitudeEnvelope[1].timeSeconds - 0.1) < 1.0e-6;
+            model.undo();
+            const auto restored = std::abs(model.snapshot().tracks.front().clips.front()
+                .notes.front().consonantSeconds - 0.2) < 1.0e-6;
+            file.deleteFile();
+            SampleSettings::sidecarFor(file).deleteFile();
+            std::cout << "converted=" << converted << "|separate_boundaries=" << boundaries
+                      << "|velocity_remaps_time=" << timing << "|undo=" << restored << std::endl;
+            setApplicationReturnValue(converted && boundaries && timing && restored ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-native-hjm")
+        {
+            const auto audio = juce::File::createTempFile("hachi-native-hjm");
+            const auto projectFile = juce::File::createTempFile("hachi-native-project")
+                .withFileExtension("hjpx");
+            SampleRegionSetting row;
+            row.name = "-";
+            row.role = NativeSegmentRole::unknown;
+            row.provenance = "melodyne";
+            row.confidence = 0.0f;
+            row.regionStartSeconds = 0.0;
+            row.regionEndSeconds = 0.6;
+            row.alignmentSeconds = 0.1;
+            row.overlapSeconds = 0.025;
+            row.amplitudeEnvelope = { { 0.0, -60.0f }, { 0.08, -2.0f },
+                { 0.5, -2.0f }, { 0.6, -18.0f } };
+            row.segments = {
+                { "s1", "_", NativeSegmentRole::transition, 0.0, 0.1,
+                  "estimated", 0.5f, 0.1, 0.025, false, 0.5 },
+                { "s2", "-", NativeSegmentRole::unknown, 0.1, 0.3,
+                  "melodyne", 0.0f, 0.1, 0.025, true, 1.0 },
+                { "s3", "-", NativeSegmentRole::unknown, 0.3, 0.6,
+                  "melodyne", 0.0f, 0.1, 0.025, true, 1.0 }
+            };
+            juce::String annotationError;
+            const auto saved = SampleSettings::save(audio, { row }, annotationError);
+            const auto loaded = SampleSettings::loadOrDerive(audio, ProjectData{});
+            const auto parsed = loaded.size() == 1 && loaded.front().hjmVersion >= 2
+                && loaded.front().segments.size() == 3
+                && loaded.front().segments[0].alias == "_"
+                && loaded.front().segments[2].role == NativeSegmentRole::unknown
+                && loaded.front().amplitudeEnvelope.size() == 4;
+            ProjectModel model;
+            const auto clipId = model.addAudioFile(audio, 0.6, 0.0, {});
+            const auto native = model.snapshot().tracks.front().clips.front().notes.front();
+            const auto bound = clipId.isNotEmpty() && native.label == "-"
+                && native.nativeSegments.size() == 3
+                && native.utauOverlapOverrideEnabled
+                && native.amplitudeEnvelope.size() == 4;
+            const auto projectSaved = model.save(projectFile, annotationError);
+            ProjectModel reopened;
+            const auto projectLoaded = reopened.load(projectFile, annotationError);
+            auto roundTrip = false;
+            if (projectLoaded)
+            {
+                const auto data = reopened.snapshot();
+                roundTrip = !data.tracks.empty() && !data.tracks.front().clips.empty()
+                    && !data.tracks.front().clips.front().notes.empty()
+                    && data.tracks.front().clips.front().notes.front().nativeSegments.size() == 3;
+            }
+            audio.deleteFile();
+            SampleSettings::sidecarFor(audio).deleteFile();
+            projectFile.deleteFile();
+            std::cout << "saved=" << (saved ? 1 : 0)
+                      << "|parsed_v2=" << (parsed ? 1 : 0)
+                      << "|bound_to_native_note=" << (bound ? 1 : 0)
+                      << "|native_label=" << native.label
+                      << "|native_segments=" << native.nativeSegments.size()
+                      << "|native_overlap=" << (native.utauOverlapOverrideEnabled ? 1 : 0)
+                      << "|native_amplitude=" << native.amplitudeEnvelope.size()
+                      << "|project_saved=" << (projectSaved ? 1 : 0)
+                      << "|project_round_trip=" << (roundTrip ? 1 : 0)
+                      << "|error=" << annotationError << std::endl;
+            setApplicationReturnValue(saved && parsed && bound && projectSaved && roundTrip ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
         if (arguments.size() >= 1 && arguments[0] == "--smoke-batch-lyrics")
@@ -8205,10 +8344,11 @@ public:
             //                   4 vslib, 5 mld3, 6 llsm2.
             const auto neural = items(2) == std::vector<int> { 1, 2, 5 };
             const auto signalsmith = items(4) == std::vector<int> { 1, 3, 4 };
-            const auto ownStretchers = items(1).empty() && items(3).empty()
-                && items(5).empty() && items(6).empty();
+            const auto ownStretchers = items(1) == std::vector<int>{1}
+                && items(3) == std::vector<int>{1}
+                && items(5) == std::vector<int>{1} && items(6) == std::vector<int>{1};
             // A UTAU item id, which is none of the above.
-            const auto utau = items(7).empty() && items(0).empty();
+            const auto utau = items(7) == std::vector<int>{1} && items(0) == std::vector<int>{1};
 
             // The two orders NSF names are its own; the three Signalsmith
             // clocks are vslib's.  Neither list may carry the other's, or the
@@ -8229,9 +8369,9 @@ public:
                 && keepsThemApart && sharedDefault;
             std::cout << "nsf_offers_its_two_orders=" << (neural ? 1 : 0)
                       << "|vslib_offers_its_three_clocks=" << (signalsmith ? 1 : 0)
-                      << "|backends_that_stretch_themselves_offer_none="
+                      << "|other_backends_offer_native_stretch="
                       << (ownStretchers ? 1 : 0)
-                      << "|utau_offers_none=" << (utau ? 1 : 0)
+                      << "|utau_offers_native_stretch=" << (utau ? 1 : 0)
                       << "|the_two_lists_stay_apart=" << (keepsThemApart ? 1 : 0)
                       << "|melodyne_hybrid_heads_both=" << (sharedDefault ? 1 : 0)
                       << std::endl;
@@ -8241,6 +8381,8 @@ public:
         }
         if (arguments.size() >= 1 && arguments[0] == "--smoke-render-order")
         {
+            MainComponent window;
+            const auto pickerWorks = window.diagnosticRenderOrderPicker();
             // stretchSpliceThenPitch: clips joined by a Melodyne pitch join are
             // decoded as one phrase and cut up afterwards, instead of being
             // decoded apart and spliced.  Two things carry that -- which clips
@@ -8351,10 +8493,11 @@ public:
             const auto splicedPhrases = engine.diagnosticMergedPhraseCount();
             recording.deleteFile();
 
-            const auto ok = groupsThePair && leavesADifferentTake && leavesALoneClip
+            const auto ok = pickerWorks && groupsThePair && leavesADifferentTake && leavesALoneClip
                 && leavesUnmarkedClips && coversBoth && monotonic && glidesTheSeam
                 && mergedPhrases == 1 && splicedPhrases == 0;
-            std::cout << "groups_a_joined_pair=" << (groupsThePair ? 1 : 0)
+            std::cout << "ui_picker_visible_and_wired=" << (pickerWorks ? 1 : 0)
+                      << "|groups_a_joined_pair=" << (groupsThePair ? 1 : 0)
                       << "|leaves_a_different_take=" << (leavesADifferentTake ? 1 : 0)
                       << "|leaves_a_lone_clip=" << (leavesALoneClip ? 1 : 0)
                       << "|leaves_unmarked_clips=" << (leavesUnmarkedClips ? 1 : 0)
@@ -10491,9 +10634,10 @@ public:
                     ? backend::PitchRenderBackend::nsfHifigan
                     : backendName == "world" ? backend::PitchRenderBackend::world
                     : backendName.contains("vslib") ? backend::PitchRenderBackend::vslib
-                    : backendName == "mld3" ? backend::PitchRenderBackend::mld3
-                    : backendName == "llsm2" ? backend::PitchRenderBackend::llsm2
-                    : backend::PitchRenderBackend::mld5;
+                     : backendName == "mld3" ? backend::PitchRenderBackend::mld3
+                     : backendName == "mld5" ? backend::PitchRenderBackend::mld5
+                     : backendName == "llsm2" ? backend::PitchRenderBackend::llsm2
+                     : backend::PitchRenderBackend::llsm2;
             }
             const auto tension = arguments.size() >= 10 ? arguments[9].getFloatValue() : 0.0f;
             request.tension.assign(static_cast<std::size_t>(frames), tension);

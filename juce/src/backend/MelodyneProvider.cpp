@@ -134,7 +134,8 @@ bool MelodyneProvider::nativeRenderAvailable()
 
 bool MelodyneProvider::experimentalSelfImportEnabled()
 {
-    return false;
+    // UI testing uses the independent MPD reader until native import is ready.
+    return true;
 }
 
 bool MelodyneProvider::experimentalMergedRenderEnabled()

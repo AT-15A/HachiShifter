@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include "backend/NsfHifiganRenderer.h"
 #include "OtoWaveformEditorComponent.h"
 #include <algorithm>
 #include <array>
@@ -397,21 +398,36 @@ MainComponent::MainComponent()
     timelineViewport.onWheel = wheelFor(timelineViewport);
     pianoViewport.onWheel = wheelFor(pianoViewport);
 
-    pitchAlgorithm.addItem("mld5", 1);
     pitchAlgorithm.addItem("nsf-hifigan", 2);
     pitchAlgorithm.addItem("WORLD", 3);
-    pitchAlgorithm.addItem("vslib", 4);
     pitchAlgorithm.addItem("llsm2", 6);
     pitchAlgorithm.addItem("UTAU", 7);
     // The other UTAU modes.  Same algorithm as item 7 plus TrackData::utauMode,
     // so every UTAU affordance is inherited rather than reimplemented.
     pitchAlgorithm.addItem(utf8("界•UTAU"), 8);
     pitchAlgorithm.addItem(utf8("谋•UTAU"), 9);
-    pitchAlgorithm.setSelectedId(1);
-    refreshStretchAlgorithmItems(1);
+    const auto configuredHifigan = preferences != nullptr
+        ? juce::File(preferences->getValue("algorithm.hifiganPath")) : juce::File{};
+    const auto defaultPitchId = backend::NsfHifiganRenderer::modelAvailable(configuredHifigan)
+        ? 2 : 6;
+    pitchAlgorithm.setSelectedId(defaultPitchId);
+    refreshStretchAlgorithmItems(defaultPitchId);
     pitchAlgorithm.onChange = [this]
     {
-        const auto id = pitchAlgorithm.getSelectedId();
+        auto id = pitchAlgorithm.getSelectedId();
+        if (id == 2)
+        {
+            const auto configured = preferences != nullptr
+                ? juce::File(preferences->getValue("algorithm.hifiganPath"))
+                : juce::File{};
+            if (!backend::NsfHifiganRenderer::modelAvailable(configured))
+            {
+                showError("NSF-HiFiGAN 模型不可用，未更改当前算法。\n"
+                          "请在算法设置中配置 pc_nsf_hifigan.onnx 和 config.json。 ");
+                refreshProjectControls();
+                return;
+            }
+        }
         const auto chosenUtau = utauModeForPickerItem(id);
         const auto utauItem = chosenUtau.has_value();
         if (!utauItem && utauAmplitudeEnvelopeActive)
@@ -431,9 +447,8 @@ MainComponent::MainComponent()
         const auto algorithm = id == 2 ? PitchAlgorithm::nsfHifigan
             : id == 3 ? PitchAlgorithm::world
             : id == 4 ? PitchAlgorithm::vocalShifter
-            : id == 5 ? PitchAlgorithm::mld3
             : id == 6 ? PitchAlgorithm::llsm2
-            : utauItem ? PitchAlgorithm::utau : PitchAlgorithm::mld5;
+            : utauItem ? PitchAlgorithm::utau : PitchAlgorithm::llsm2;
         const auto utauMode = chosenUtau.value_or(UtauMode::classic);
         const auto data = project.snapshot();
         const auto selectedTrack = std::find_if(data.tracks.begin(), data.tracks.end(),
@@ -769,7 +784,7 @@ void MainComponent::applyPreferences()
     const auto analysisConfig = backend::AnalysisService::configFromProperties(preferences.get());
     audio.setInferenceConfiguration(analysisConfig.inference, analysisConfig.deviceIndex);
     pianoRoll.setShowNoteLabels(preferences->getBoolValue("ui.showNoteLabels", false));
-    showWaveforms = preferences->getBoolValue("ui.showWaveforms", true);
+    showWaveforms = preferences->getBoolValue("ui.showWaveforms", false);
     pianoRoll.setShowWaveforms(showWaveforms);
     pianoRoll.setDrawLengthDivision(
         preferences->getIntValue("ui.drawLengthDivision", 64));
@@ -883,7 +898,7 @@ void MainComponent::refreshTexts()
     // A dropdown rather than dialog settings: these are reached while tuning,
     // so they stay in the tool row where a click finds them, but folded into
     // one button because the row is the scarcest space in the window.
-    showViewMenuButton.setButtonText(utf8("显示"));
+    showViewMenuButton.setButtonText(strings.text("native.display"));
     showViewMenuButton.setTooltip(utf8(
         "范围：每个音符实际发声范围的橙色框\n"
         "包络：在音符上画出它自己的振幅包络"));
@@ -962,8 +977,8 @@ void MainComponent::refreshTexts()
     voicebankSettingsButton.setButtonText(utf8("音源库设置"));
     voicebankSettingsButton.setTooltip(utf8("读取并查看当前 UTAU 音源库中的 oto.ini"));
     noteAliasLabel.setText(utf8("音符发音/别名"), juce::dontSendNotification);
-    noteConsonantVelocityLabel.setText(utf8("辅音速度"), juce::dontSendNotification);
-    const auto noteVelocityHelp = utf8("显示轨道的全局辅音速度；修改后保存为所选音符的单独辅音速度（支持任意正负整数），合成时单音值优先");
+    noteConsonantVelocityLabel.setText(strings.text("editor.attackSpeed"), juce::dontSendNotification);
+    const auto noteVelocityHelp = strings.text("native.velocityHelp");
     noteConsonantVelocityLabel.setTooltip(noteVelocityHelp);
     noteConsonantVelocityEditor.setTooltip(noteVelocityHelp);
     noteConsonantVelocityEditor.setTextToShowWhenEmpty({}, Palette::textMuted);
@@ -1001,15 +1016,14 @@ void MainComponent::refreshProjectControls()
         const auto pitchId = selected->pitchAlgorithm == PitchAlgorithm::nsfHifigan ? 2
             : selected->pitchAlgorithm == PitchAlgorithm::world ? 3
             : selected->pitchAlgorithm == PitchAlgorithm::vocalShifter ? 4
-            : selected->pitchAlgorithm == PitchAlgorithm::mld3 ? 5
             : selected->pitchAlgorithm == PitchAlgorithm::llsm2 ? 6
             : selected->pitchAlgorithm == PitchAlgorithm::utau
-                ? utauModePickerItem(selected->utauMode) : 1;
+                ? utauModePickerItem(selected->utauMode) : 6;
         const auto stretchId = selected->stretchAlgorithm == StretchAlgorithm::variableMelHop ? 2
             : selected->stretchAlgorithm == StretchAlgorithm::loop ? 3
             : selected->stretchAlgorithm == StretchAlgorithm::soundTouch ? 4
             : selected->stretchAlgorithm == StretchAlgorithm::nsfShiftThenSplice ? 5 : 1;
-        pitchAlgorithm.setSelectedId(pitchAlgorithm.indexOfItemId(pitchId) >= 0 ? pitchId : 1,
+        pitchAlgorithm.setSelectedId(pitchAlgorithm.indexOfItemId(pitchId) >= 0 ? pitchId : 0,
                                      juce::dontSendNotification);
         const auto utauItem = utauModeForPickerItem(pitchId).has_value();
         if (!utauItem && utauAmplitudeEnvelopeActive)
@@ -1570,7 +1584,7 @@ std::vector<int> MainComponent::stretchAlgorithmItemsFor(int pitchAlgorithmItemI
     // vslib is the Signalsmith stretcher itself, so all three of its analysis
     // clocks are real -- and the two NSF orders mean nothing to it.
     if (pitchAlgorithmItemId == 4) return { 1, 3, 4 };
-    return {};
+    return { 1 }; // Backend-native time mapping; no NSF-only Mel choices.
 }
 
 void MainComponent::addTrackFromMenu(bool compose)
@@ -1639,13 +1653,13 @@ struct ViewMenuEntry
     bool utauOnly;   // there is nothing for it to draw in the other modes
 };
 const std::array<ViewMenuEntry, 4> viewMenuEntries {{
-    { "范围", &MainComponent::ViewOptions::noteRange, false },
-    { "包络", &MainComponent::ViewOptions::envelope, false },
+    { "native.range", &MainComponent::ViewOptions::noteRange, false },
+    { "native.envelope", &MainComponent::ViewOptions::envelope, false },
     // Named for what it draws rather than kept as the button's 波形显示: the
     // View menu already offers 显示波形 for the clip's own waveform, and two
     // near identical names for two different pictures is a trap.
-    { "合成波形", &MainComponent::ViewOptions::utauWaveform, true },
-    { "音高线", &MainComponent::ViewOptions::pitchLine, false },
+    { "native.renderedWave", &MainComponent::ViewOptions::utauWaveform, true },
+    { "native.pitchLine", &MainComponent::ViewOptions::pitchLine, false },
 }};
 }
 
@@ -1653,7 +1667,7 @@ MainComponent::ViewOptions MainComponent::viewOptionsFrom(const juce::PropertySe
 {
     ViewOptions options;
     options.noteRange = properties.getBoolValue("ui.showNoteRange", true);
-    options.envelope = properties.getBoolValue("ui.showEnvelope", false);
+    options.envelope = properties.getBoolValue("ui.nativeEnvelope", true);
     options.utauWaveform = properties.getBoolValue("ui.showUtauWaveforms", false);
     options.pitchLine = properties.getBoolValue("ui.showPitchLine", true);
     return options;
@@ -1664,6 +1678,7 @@ void MainComponent::storeViewOptions(juce::PropertySet& properties,
 {
     properties.setValue("ui.showNoteRange", options.noteRange);
     properties.setValue("ui.showEnvelope", options.envelope);
+    properties.setValue("ui.nativeEnvelope", options.envelope);
     properties.setValue("ui.showUtauWaveforms", options.utauWaveform);
     properties.setValue("ui.showPitchLine", options.pitchLine);
 }
@@ -1706,7 +1721,7 @@ void MainComponent::showViewMenu()
     for (std::size_t index = 0; index < viewMenuEntries.size(); ++index)
     {
         const auto id = static_cast<int>(index) + 1;
-        menu.addItem(id, juce::String::fromUTF8(viewMenuEntries[index].text),
+        menu.addItem(id, strings.text(viewMenuEntries[index].text),
                      viewMenuItemEnabled(id, utauEditorActive),
                      viewOptions.*(viewMenuEntries[index].flag));
     }
@@ -1840,6 +1855,29 @@ PianoRollComponent::Tool MainComponent::diagnosticTool() const
 void MainComponent::diagnosticRefreshControls()
 {
     refreshProjectControls();
+}
+
+bool MainComponent::diagnosticRenderOrderPicker()
+{
+    selectedTrackId = project.addTrack("NSF order UI test", true);
+    project.setTrackPitchAlgorithm(selectedTrackId, PitchAlgorithm::nsfHifigan);
+    setSize(1280, 760);
+    refreshProjectControls();
+    const auto visible = renderOrder.isVisible() && renderOrderLabel.isVisible()
+        && renderOrder.getWidth() > 0 && renderOrder.getNumItems() == 2;
+    auto works = visible;
+    for (const auto id : { 1, 2 })
+    {
+        renderOrder.setSelectedId(id, juce::dontSendNotification);
+        if (renderOrder.onChange) renderOrder.onChange();
+        const auto data = project.snapshot();
+        const auto expected = id == 1 ? RenderOrder::processThenSplice
+                                     : RenderOrder::stretchSpliceThenPitch;
+        works = works && data.tracks.back().renderOrder == expected;
+        refreshProjectControls();
+        works = works && renderOrder.getSelectedId() == id;
+    }
+    return works;
 }
 
 void MainComponent::setToolButton(juce::Button& selected)
@@ -2224,8 +2262,7 @@ void MainComponent::resized()
     // the four backends that stretch inside their own renderers, where every
     // item rendered byte-identical audio and only the diagnostic label moved.
     // Hidden rather than disabled, and its space given back to the row.
-    const auto showStretch = !utauEditorActive
-        && !stretchAlgorithmItemsFor(pitchAlgorithm.getSelectedId()).empty();
+    const auto showStretch = true;
     stretchAlgorithm.setVisible(showStretch);
     stretchLabel.setVisible(showStretch);
     if (showStretch)
@@ -2265,6 +2302,16 @@ void MainComponent::resized()
     takeParameter(pointButton, 27);
     takeParameter(wrenchButton, 27);
     takeParameter(connectButton, 27);
+    parameterHeader.removeFromLeft(8);
+    horizontalZoomOutButton.setButtonText("H−");
+    horizontalZoomInButton.setButtonText("H+");
+    verticalZoomOutButton.setButtonText("V−");
+    verticalZoomInButton.setButtonText("V+");
+    takeParameter(horizontalZoomOutButton, 30);
+    takeParameter(horizontalZoomInButton, 30);
+    parameterHeader.removeFromLeft(5);
+    takeParameter(verticalZoomOutButton, 30);
+    takeParameter(verticalZoomInButton, 30);
     // The common row ends with the view menu and optional robust-pitch toggle.
     // Parameter controls are placed in the mode row below, not mixed into the
     // tool row, so both modes retain the same tool geometry.
@@ -2365,7 +2412,9 @@ void MainComponent::resized()
         takeCommon(smoothSlider, 118);
         takeCommon(pitchParamButton, 50);
         takeCommon(driftParamButton, 50);
-        takeCommon(attackParamButton, 50);
+        attackParamButton.setVisible(false);
+        takeCommon(noteConsonantVelocityLabel, 72);
+        takeCommon(noteConsonantVelocityEditor, 52);
         takeCommon(breathParamButton, 50);
         takeCommon(tensionParamButton, 50);
         takeCommon(formantParamButton, 50);
@@ -2373,27 +2422,8 @@ void MainComponent::resized()
         robustPitchCurveButton.setVisible(pitchAlgorithm.getSelectedId() == 1);
         if (robustPitchCurveButton.isVisible()) takeCommon(robustPitchCurveButton, 104);
     }
-    constexpr auto zoomButtonSize = 24;
-    constexpr auto zoomButtonGap = 2;
-    constexpr auto zoomControlRail = zoomButtonSize + 4;
     const auto pianoArea = area;
-    pianoViewport.setBounds(pianoArea.withTrimmedRight(zoomControlRail)
-                                     .withTrimmedBottom(zoomControlRail));
-
-    const auto horizontalY = pianoArea.getBottom() - zoomButtonSize - 2;
-    const auto horizontalRight = pianoArea.getRight() - zoomControlRail;
-    horizontalZoomInButton.setBounds(horizontalRight - zoomButtonSize,
-                                     horizontalY, zoomButtonSize, zoomButtonSize);
-    horizontalZoomOutButton.setBounds(horizontalRight - zoomButtonSize * 2 - zoomButtonGap,
-                                      horizontalY, zoomButtonSize, zoomButtonSize);
-
-    const auto verticalX = pianoArea.getRight() - zoomButtonSize - 2;
-    const auto verticalBottom = pianoArea.getBottom() - zoomControlRail;
-    verticalZoomInButton.setBounds(verticalX, verticalBottom - zoomButtonSize,
-                                   zoomButtonSize, zoomButtonSize);
-    verticalZoomOutButton.setBounds(verticalX,
-                                    verticalBottom - zoomButtonSize * 2 - zoomButtonGap,
-                                    zoomButtonSize, zoomButtonSize);
+    pianoViewport.setBounds(pianoArea);
     if (!pianoInitialScrollSet && pianoViewport.getHeight() > 0)
     {
         pianoViewport.setViewPosition(0, std::max(0, (pianoRoll.getHeight() - pianoViewport.getHeight()) / 2));
@@ -4171,130 +4201,21 @@ void MainComponent::loadMelodyneFile(const juce::File& file)
 
 void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResult imported)
 {
-    // Material annotations belong beside the audio in the project's existing
-    // HJM sidecar format.  Seed them during the first MPD import so later
-    // audio/UTAU workflows read the same timing data through SampleSettings.
-    for (const auto& track : imported.project.tracks)
-        for (const auto& clip : track.clips)
-        {
-            if (!clip.sourceFile.existsAsFile() || clip.notes.empty()) continue;
-            std::vector<SampleRegionSetting> rows;
-            rows.reserve(clip.notes.size());
-            const auto sourceAtTarget = [&clip](double target) {
-                if (clip.sourceTimeMap.empty())
-                    return clip.sourceOffsetSeconds + target;
-                const auto& map = clip.sourceTimeMap;
-                if (target <= map.front().targetSeconds) return map.front().sourceSeconds;
-                for (std::size_t index = 1; index < map.size(); ++index)
-                {
-                    if (target > map[index].targetSeconds) continue;
-                    const auto width = map[index].targetSeconds - map[index - 1].targetSeconds;
-                    const auto u = width > 1.0e-9
-                        ? (target - map[index - 1].targetSeconds) / width : 0.0;
-                    return map[index - 1].sourceSeconds
-                        + (map[index].sourceSeconds - map[index - 1].sourceSeconds) * u;
-                }
-                return map.back().sourceSeconds;
-            };
-            for (const auto& note : clip.notes)
-            {
-                SampleRegionSetting row;
-                row.name = note.label;
-                row.regionStartSeconds = std::max(0.0,
-                    sourceAtTarget(note.startSeconds));
-                row.regionEndSeconds = std::min(clip.sourceDurationSeconds,
-                    sourceAtTarget(note.startSeconds + note.durationSeconds));
-                row.alignmentSeconds = std::clamp(
-                    sourceAtTarget(note.startSeconds + note.consonantSeconds),
-                    row.regionStartSeconds, row.regionEndSeconds);
-                row.fixedDurationSeconds = row.alignmentSeconds - row.regionStartSeconds;
-                row.melodyneData = true;
-                row.melodynePitchCenterCents = note.midiNote * 100.0;
-                row.melodyneOriginalPitchCenterCents = note.sourceMidiCenter * 100.0;
-                row.melodynePitchDrift = note.drift;
-                row.melodynePitchModulation = note.modulation;
-                row.melodyneFormantCents = note.formantSemitones * 100.0;
-                row.melodyneAmplitude = note.gain;
-                row.melodyneSibilantBalance = note.breath;
-                row.melodyneAttackSeconds = note.consonantSeconds;
-                rows.push_back(std::move(row));
-            }
-            // A pitchless leading element is an onset of the following vowel.
-            // Collapse only adjacent source rows and preserve the vowel row's
-            // identity, so reopening the project creates one UTAU-compatible
-            // sample region with a longer preutterance.
-            for (std::size_t index = 0; index + 1 < clip.notes.size(); ++index)
-            {
-                const auto& consonant = clip.notes[index];
-                const auto& vowel = clip.notes[index + 1];
-                const auto pitchless = std::none_of(consonant.contour.begin(),
-                    consonant.contour.end(), [](const auto& point) { return point.voiced; });
-                const auto vowelHasPitch = std::any_of(vowel.contour.begin(),
-                    vowel.contour.end(), [](const auto& point) { return point.voiced; });
-                const auto adjacent = std::abs(consonant.startSeconds + consonant.durationSeconds
-                    - vowel.startSeconds) <= 0.002;
-                if (!pitchless || !vowelHasPitch || !adjacent || index >= rows.size() - 1) continue;
-                auto& onset = rows[index];
-                auto& nucleus = rows[index + 1];
-                nucleus.regionStartSeconds = onset.regionStartSeconds;
-                nucleus.fixedDurationSeconds = std::max(0.0,
-                    onset.fixedDurationSeconds + (nucleus.alignmentSeconds - nucleus.regionStartSeconds));
-                nucleus.alignmentSeconds = std::clamp(
-                    onset.regionStartSeconds + nucleus.fixedDurationSeconds,
-                    nucleus.regionStartSeconds, nucleus.regionEndSeconds);
-                nucleus.overlapSeconds = std::max(nucleus.overlapSeconds,
-                    onset.regionEndSeconds - nucleus.regionStartSeconds);
-                onset.regionEndSeconds = onset.regionStartSeconds;
-            }
-            rows.erase(std::remove_if(rows.begin(), rows.end(),
-                [](const auto& row) { return row.regionEndSeconds <= row.regionStartSeconds + 0.001; }),
-                rows.end());
-            const auto sidecar = SampleSettings::sidecarFor(clip.sourceFile);
-            const auto existing = SampleSettings::loadOrDerive(clip.sourceFile, ProjectData{});
-            const auto sameRow = [](const auto& left, const auto& right)
-            {
-                return left.name == right.name
-                    && std::abs(left.regionStartSeconds - right.regionStartSeconds) < 1.0e-6
-                    && std::abs(left.regionEndSeconds - right.regionEndSeconds) < 1.0e-6
-                    && std::abs(left.alignmentSeconds - right.alignmentSeconds) < 1.0e-6
-                    && std::abs(left.fixedDurationSeconds - right.fixedDurationSeconds) < 1.0e-6
-                    && std::abs(left.overlapSeconds - right.overlapSeconds) < 1.0e-6
-                    && std::abs(left.melodynePitchCenterCents - right.melodynePitchCenterCents) < 1.0e-6
-                    && std::abs(left.melodyneOriginalPitchCenterCents - right.melodyneOriginalPitchCenterCents) < 1.0e-6;
-            };
-            const auto differs = sidecar.existsAsFile()
-                && (existing.size() != rows.size()
-                    || !std::equal(existing.begin(), existing.end(), rows.begin(), sameRow));
-            if (differs)
-            {
-                const auto sourceAudio = clip.sourceFile;
-                const auto candidate = std::make_shared<std::vector<SampleRegionSetting>>(std::move(rows));
-                juce::AlertWindow::showYesNoCancelBox(
-                    juce::MessageBoxIconType::WarningIcon,
-                    "素材标注不一致",
-                    "已存在 .hjm.csv 标注文件。选择“是”使用 Melodyne 新标注，选择“否”保留原标注。",
-                    "使用新标注", "保留原标注", "取消", this,
-                    juce::ModalCallbackFunction::create([sourceAudio, candidate](int result)
-                    {
-                        if (result != 1) return;
-                        juce::String error;
-                        if (!SampleSettings::save(sourceAudio, *candidate, error))
-                            DBG("Could not update Melodyne sidecar: " + error);
-                    }));
-            }
-            else if (!sidecar.existsAsFile())
-            {
-                juce::String annotationError;
-                if (!SampleSettings::save(clip.sourceFile, rows, annotationError))
-                    DBG("Could not seed Melodyne sidecar: " + annotationError);
-            }
-        }
+    juce::StringArray annotationWarnings;
+    SampleSettings::convertMelodyneProject(imported.project, annotationWarnings);
+    for (const auto& warning : annotationWarnings)
+        DBG("Could not convert Melodyne annotation: " + warning);
+
+    const auto defaultAlgorithmId = defaultPitchAlgorithm(preferences != nullptr
+        ? juce::File(preferences->getValue("algorithm.hifiganPath")) : juce::File{})
+        == PitchAlgorithm::nsfHifigan ? 2 : 6;
     const auto algorithmId = preferences != nullptr
-        ? preferences->getIntValue("import.algorithm", 1) : 1;
+        ? preferences->getIntValue("import.algorithm", defaultAlgorithmId) : defaultAlgorithmId;
     const auto importedPitch = algorithmId == 2 ? PitchAlgorithm::nsfHifigan
         : algorithmId == 3 ? PitchAlgorithm::world
         : algorithmId == 4 ? PitchAlgorithm::vocalShifter
-        : algorithmId == 6 ? PitchAlgorithm::llsm2 : PitchAlgorithm::mld5;
+        : algorithmId == 1 ? PitchAlgorithm::mld5
+        : algorithmId == 5 ? PitchAlgorithm::mld3 : PitchAlgorithm::llsm2;
     const auto stretchAlgorithmId = preferences != nullptr
         ? preferences->getIntValue("import.stretchAlgorithm", 1) : 1;
     auto importedStretch = stretchAlgorithmId == 2 ? StretchAlgorithm::variableMelHop

@@ -21,6 +21,74 @@ namespace hachi
 {
 namespace
 {
+juce::String csvEscape(const juce::String& value);
+
+juce::String encodeSegments(const std::vector<NativeSegment>& segments)
+{
+    juce::String result;
+    for (const auto& segment : segments)
+    {
+        if (result.isNotEmpty()) result += ";";
+        result += csvEscape(segment.id) + "|" + csvEscape(segment.alias) + "|"
+            + nativeSegmentRoleName(segment.role) + "|" + juce::String(segment.sourceStartSeconds, 9)
+            + "|" + juce::String(segment.sourceEndSeconds, 9) + "|"
+            + csvEscape(segment.provenance) + "|" + juce::String(segment.confidence, 6)
+            + "|" + juce::String(segment.alignmentSeconds, 9) + "|"
+            + juce::String(segment.overlapSeconds, 9) + "|"
+            + (segment.stretchable ? "1" : "0") + "|" + juce::String(segment.stretchWeight, 6);
+    }
+    return result;
+}
+
+std::vector<NativeSegment> decodeSegments(const juce::String& text)
+{
+    std::vector<NativeSegment> result;
+    for (const auto& encoded : juce::StringArray::fromTokens(text, ";", ""))
+    {
+        const auto values = juce::StringArray::fromTokens(encoded, "|", "");
+        if (values.size() < 11) continue;
+        NativeSegment segment;
+        segment.id = values[0]; segment.alias = values[1];
+        segment.role = parseNativeSegmentRole(values[2]);
+        segment.sourceStartSeconds = values[3].getDoubleValue();
+        segment.sourceEndSeconds = values[4].getDoubleValue();
+        segment.provenance = values[5]; segment.confidence = values[6].getFloatValue();
+        segment.alignmentSeconds = values[7].getDoubleValue();
+        segment.overlapSeconds = values[8].getDoubleValue();
+        segment.stretchable = values[9] != "0";
+        segment.stretchWeight = values[10].getDoubleValue();
+        result.push_back(std::move(segment));
+    }
+    return result;
+}
+
+juce::String encodeAmplitudeEnvelope(const std::vector<AmplitudeEnvelopePoint>& points)
+{
+    juce::String result;
+    for (const auto& point : points)
+    {
+        if (result.isNotEmpty()) result += ";";
+        result += juce::String(point.timeSeconds, 9) + "|"
+            + juce::String(point.gainDb, 6);
+    }
+    return result;
+}
+
+std::vector<AmplitudeEnvelopePoint> decodeAmplitudeEnvelope(const juce::String& text)
+{
+    std::vector<AmplitudeEnvelopePoint> result;
+    for (const auto& encoded : juce::StringArray::fromTokens(text, ";", ""))
+    {
+        const auto values = juce::StringArray::fromTokens(encoded, "|", "");
+        if (values.size() < 2) continue;
+        result.push_back({ values[0].getDoubleValue(),
+            juce::jlimit(-60.0f, 12.0f, values[1].getFloatValue()) });
+    }
+    return result;
+}
+}
+namespace
+{
 juce::String csvEscape(const juce::String& value)
 {
     if (!value.containsAnyOf(",\"\r\n")) return value;
@@ -196,6 +264,251 @@ juce::File SampleSettings::sidecarFor(const juce::File& audio)
     return juce::File(audio.getFullPathName() + ".hjm.csv");
 }
 
+std::vector<NativeSegment> SampleSettings::nativeSegmentsFor(
+    const SampleRegionSetting& row)
+{
+    auto segments = row.segments;
+    if (segments.empty())
+    {
+        const auto start = row.regionStartSeconds;
+        const auto end = std::max(start + 0.001, row.regionEndSeconds);
+        const auto alignment = juce::jlimit(start, end, row.alignmentSeconds);
+        auto role = row.role;
+        const auto alias = row.name.trim();
+        if (role == NativeSegmentRole::unknown)
+            role = alias == "_" || alias.containsChar('_') ? NativeSegmentRole::transition
+                : alias == "-" ? NativeSegmentRole::unknown
+                : alignment > start + 1.0e-6 ? NativeSegmentRole::consonant
+                                             : NativeSegmentRole::vowel;
+        const auto segmentAlias = alias.isEmpty() ? juce::String("-") : alias;
+        segments.push_back({ "segment_1", segmentAlias, role, start, alignment,
+            row.provenance.isEmpty() ? juce::String("estimated") : row.provenance,
+            row.confidence, alignment, row.overlapSeconds,
+            role != NativeSegmentRole::consonant, 1.0 });
+        if (alignment < end - 1.0e-6)
+            segments.push_back({ "segment_2", segmentAlias, NativeSegmentRole::vowel,
+                alignment, end, row.provenance.isEmpty() ? juce::String("estimated")
+                                                          : row.provenance,
+                row.confidence, alignment, row.overlapSeconds, true, 1.0 });
+    }
+    for (auto& segment : segments)
+    {
+        segment.sourceStartSeconds -= row.regionStartSeconds;
+        segment.sourceEndSeconds -= row.regionStartSeconds;
+        segment.alignmentSeconds -= row.regionStartSeconds;
+    }
+    return segments;
+}
+
+bool SampleSettings::convertMelodyneProject(ProjectData& project,
+                                            juce::StringArray& warnings)
+{
+    auto converted = false;
+    std::map<juce::String, std::vector<SampleRegionSetting>> materialRows;
+    for (auto& track : project.tracks)
+        for (auto& clip : track.clips)
+        {
+            if (!clip.sourceFile.existsAsFile() || clip.notes.empty()) continue;
+            std::vector<SampleRegionSetting> rows;
+            rows.reserve(clip.notes.size());
+            const auto sourceAtTarget = [&clip](double target)
+            {
+                if (clip.sourceTimeMap.empty())
+                    return clip.sourceOffsetSeconds + target * clip.sourceDurationSeconds
+                        / std::max(1.0e-9, clip.durationSeconds);
+                const auto& map = clip.sourceTimeMap;
+                if (target <= map.front().targetSeconds)
+                    return clip.sourceOffsetSeconds + map.front().sourceSeconds;
+                for (std::size_t index = 1; index < map.size(); ++index)
+                {
+                    if (target > map[index].targetSeconds) continue;
+                    const auto width = map[index].targetSeconds
+                        - map[index - 1].targetSeconds;
+                    const auto amount = width > 1.0e-9
+                        ? (target - map[index - 1].targetSeconds) / width : 0.0;
+                    return clip.sourceOffsetSeconds + map[index - 1].sourceSeconds
+                        + (map[index].sourceSeconds - map[index - 1].sourceSeconds) * amount;
+                }
+                return clip.sourceOffsetSeconds + map.back().sourceSeconds;
+            };
+
+            for (auto& note : clip.notes)
+            {
+                SampleRegionSetting row;
+                row.name = "-"; // MPD has no reusable phoneme annotation.
+                row.hjmVersion = 2;
+                row.role = NativeSegmentRole::unknown;
+                row.provenance = "melodyne";
+                row.confidence = 0.0f;
+                row.regionStartSeconds = std::max(0.0,
+                    sourceAtTarget(note.startSeconds));
+                row.regionEndSeconds = std::min(clip.sourceOffsetSeconds + clip.sourceDurationSeconds,
+                    sourceAtTarget(note.startSeconds + note.durationSeconds));
+                if (row.regionEndSeconds <= row.regionStartSeconds) continue;
+                row.alignmentSeconds = std::clamp(
+                    sourceAtTarget(note.startSeconds + note.consonantSeconds),
+                    row.regionStartSeconds, row.regionEndSeconds);
+                // The internal boundary is alignment/preutterance, not OTO's
+                // fixed-region end. Estimate a separate vowel centre from the
+                // voiced source positions; mark this stretch plan as estimated.
+                double weightedTime = 0.0, weight = 0.0;
+                for (const auto& point : note.contour)
+                    if (point.voiced && point.timeSeconds > note.consonantSeconds
+                        && point.timeSeconds < note.durationSeconds)
+                    {
+                        weightedTime += sourceAtTarget(note.startSeconds + point.timeSeconds);
+                        weight += 1.0;
+                    }
+                const auto centre = juce::jlimit(row.alignmentSeconds, row.regionEndSeconds,
+                    weight > 0.0 ? weightedTime / weight
+                        : (row.alignmentSeconds + row.regionEndSeconds) * 0.5);
+                row.fixedDurationSeconds = centre - row.regionStartSeconds;
+                row.melodyneData = true;
+                row.melodynePitchCenterCents = note.midiNote * 100.0;
+                row.melodyneOriginalPitchCenterCents = note.sourceMidiCenter * 100.0;
+                row.melodynePitchDrift = note.drift;
+                row.melodynePitchModulation = note.modulation;
+                row.melodyneFormantCents = note.formantSemitones * 100.0;
+                row.melodyneAmplitude = note.gain;
+                row.melodyneSibilantBalance = note.breath;
+                row.melodyneAttackSeconds = note.consonantSeconds;
+                row.amplitudeEnvelope = note.amplitudeEnvelope;
+                const auto appendSegment = [&](double start, double end,
+                                                NativeSegmentRole role, bool stretchable)
+                {
+                    if (end - start <= 1.0e-9) return;
+                    row.segments.push_back({ "segment_" + juce::String(
+                        static_cast<int>(row.segments.size() + 1)), "-", role,
+                        start, end, "estimated", weight > 0.0 ? 0.5f : 0.0f,
+                        row.alignmentSeconds, row.overlapSeconds, stretchable, 1.0 });
+                };
+                appendSegment(row.regionStartSeconds, row.alignmentSeconds,
+                    NativeSegmentRole::consonant, false);
+                appendSegment(row.alignmentSeconds, centre, NativeSegmentRole::vowel, false);
+                appendSegment(centre, row.regionEndSeconds, NativeSegmentRole::vowel, true);
+                rows.push_back(std::move(row));
+
+                note.label = "-";
+                note.nativeRole = NativeSegmentRole::unknown;
+                note.nativeProvenance = "melodyne";
+                note.nativeConfidence = 0.0f;
+                note.nativeSourceStartSeconds = row.regionStartSeconds;
+                note.nativeSourceEndSeconds = row.regionEndSeconds;
+                note.nativeSegments = nativeSegmentsFor(rows.back());
+                // Convert the imported source/target attack slope into the
+                // common velocity scale (100 = neutral) without changing audio.
+                note.utauConsonantVelocity = static_cast<int>(std::lround(100.0
+                    + 100.0 * std::log2(std::max(1.0e-6f, note.attackSpeed))));
+                note.utauPreutteranceOverrideEnabled = true;
+                note.utauPreutteranceSeconds = note.consonantSeconds;
+                note.utauOverlapOverrideEnabled = false;
+                note.utauOverlapSeconds = 0.0;
+            }
+
+            // Cross-note consonant attachment is separate from the internal
+            // alignment line. Only an explicitly classified candidate may
+            // extend another region; missing F0 alone is not that evidence.
+            for (std::size_t index = 0; rows.size() == clip.notes.size()
+                 && index + 1 < clip.notes.size(); ++index)
+            {
+                const auto& consonant = clip.notes[index];
+                const auto& vowel = clip.notes[index + 1];
+                const auto pitchless = std::none_of(consonant.contour.begin(),
+                    consonant.contour.end(), [](const auto& point) { return point.voiced; });
+                const auto vowelHasPitch = std::any_of(vowel.contour.begin(),
+                    vowel.contour.end(), [](const auto& point) { return point.voiced; });
+                const auto adjacent = std::abs(consonant.startSeconds
+                    + consonant.durationSeconds - vowel.startSeconds) <= 0.002;
+                if (!consonant.melodyneConsonantCandidate
+                    || consonant.melodyneVowelNoteId != vowel.id
+                    || !pitchless || !vowelHasPitch || !adjacent) continue;
+
+                auto& onset = rows[index];
+                auto& nucleus = rows[index + 1];
+                nucleus.regionStartSeconds = onset.regionStartSeconds;
+                nucleus.fixedDurationSeconds = std::max(0.0,
+                    onset.fixedDurationSeconds
+                    + (nucleus.alignmentSeconds - nucleus.regionStartSeconds));
+                nucleus.alignmentSeconds = std::clamp(
+                    onset.regionStartSeconds + nucleus.fixedDurationSeconds,
+                    nucleus.regionStartSeconds, nucleus.regionEndSeconds);
+                nucleus.overlapSeconds = std::max(nucleus.overlapSeconds,
+                    onset.regionEndSeconds - nucleus.regionStartSeconds);
+                nucleus.provenance = "estimated";
+                nucleus.confidence = 0.5f;
+                nucleus.segments = {
+                    { "segment_1", "_", NativeSegmentRole::transition,
+                      onset.regionStartSeconds, onset.regionEndSeconds,
+                      "estimated", 0.5f, onset.regionEndSeconds,
+                      nucleus.overlapSeconds, false, 0.5 },
+                    { "segment_2", "-", NativeSegmentRole::unknown,
+                      onset.regionEndSeconds, nucleus.regionEndSeconds,
+                      "melodyne", 0.0f, nucleus.alignmentSeconds,
+                      nucleus.overlapSeconds, true, 1.0 }
+                };
+                onset.regionEndSeconds = onset.regionStartSeconds;
+                auto& consonantNote = clip.notes[index];
+                consonantNote.melodyneConsonantCandidate = true;
+                consonantNote.melodyneVowelNoteId = vowel.id;
+                consonantNote.nativeSourceStartSeconds = onset.regionStartSeconds;
+                consonantNote.nativeSourceEndSeconds = onset.regionEndSeconds;
+                auto& vowelNote = clip.notes[index + 1];
+                vowelNote.label = "-";
+                vowelNote.nativeRole = NativeSegmentRole::unknown;
+                vowelNote.nativeProvenance = "estimated";
+                vowelNote.nativeConfidence = 0.5f;
+                vowelNote.nativeSourceStartSeconds = nucleus.regionStartSeconds;
+                vowelNote.nativeSourceEndSeconds = nucleus.regionEndSeconds;
+                vowelNote.nativeSegments = nativeSegmentsFor(nucleus);
+                vowelNote.utauPreutteranceOverrideEnabled = true;
+                vowelNote.utauPreutteranceSeconds = std::max(0.0,
+                    nucleus.alignmentSeconds - nucleus.regionStartSeconds);
+                vowelNote.utauOverlapOverrideEnabled =
+                    std::abs(nucleus.overlapSeconds) > 1.0e-9;
+                vowelNote.utauOverlapSeconds = nucleus.overlapSeconds;
+            }
+            rows.erase(std::remove_if(rows.begin(), rows.end(),
+                [](const auto& row)
+                {
+                    return row.regionEndSeconds <= row.regionStartSeconds + 0.001;
+                }), rows.end());
+            auto& allRows = materialRows[clip.sourceFile.getFullPathName()];
+            allRows.insert(allRows.end(), rows.begin(), rows.end());
+
+            for (std::size_t index = 0; index + 1 < clip.notes.size(); ++index)
+            {
+                const auto& left = clip.notes[index];
+                const auto& right = clip.notes[index + 1];
+                if (!left.connectedToNext && !right.connectedToPrevious) continue;
+                const auto exists = std::any_of(project.nativeConnections.begin(),
+                    project.nativeConnections.end(), [&](const auto& connection)
+                    {
+                        return connection.leftNoteId == left.id
+                            && connection.rightNoteId == right.id;
+                    });
+                if (exists) continue;
+                NativeConnection connection;
+                connection.id = "connection_" + juce::Uuid().toString().removeCharacters("-");
+                connection.leftNoteId = left.id;
+                connection.rightNoteId = right.id;
+                connection.type = "melodyne-pitch-join";
+                connection.boundarySeconds = clip.startSeconds + right.startSeconds;
+                if (clip.crossfadeInSeconds > 1.0e-9)
+                    connection.amplitudeCurve = {
+                        { connection.boundarySeconds - clip.crossfadeInSeconds, -60.0f },
+                        { connection.boundarySeconds, 0.0f } };
+                project.nativeConnections.push_back(std::move(connection));
+            }
+        }
+    for (const auto& [path, rows] : materialRows)
+    {
+        juce::String error;
+        if (!save(juce::File(path), rows, error)) warnings.add(error);
+        else converted = true;
+    }
+    return converted;
+}
+
 std::vector<SampleRegionSetting> SampleSettings::loadOrDerive(const juce::File& audio,
                                                               const ProjectData& project)
 {
@@ -234,6 +547,12 @@ std::vector<SampleRegionSetting> SampleSettings::loadOrDerive(const juce::File& 
             row.melodyneAttackSeconds = number(values, 15, 0.0);
             row.melodyneDecayElongation = number(values, 16, 0.0);
             row.overlapSeconds = number(values, 17, 0.0);
+            row.hjmVersion = static_cast<int>(number(values, 18, 1.0));
+            row.role = parseNativeSegmentRole(values.size() > 19 ? values[19] : "unknown");
+            row.provenance = values.size() > 20 ? values[20].trim() : "estimated";
+            row.confidence = static_cast<float>(number(values, 21, 0.0));
+            if (values.size() > 22) row.segments = decodeSegments(values[22]);
+            if (values.size() > 23) row.amplitudeEnvelope = decodeAmplitudeEnvelope(values[23]);
             if (row.regionEndSeconds > row.regionStartSeconds) rows.push_back(std::move(row));
         }
     }
@@ -318,10 +637,24 @@ bool SampleSettings::save(const juce::File& audio,
     {
         return left.regionStartSeconds < right.regionStartSeconds;
     });
-    juce::String csv = "name,region_start_sec,region_end_sec,note_alignment_sec,fixed_duration_sec,relative_pitch_cents,melodyne_project_data,melodyne_pitch_center_cents,melodyne_original_pitch_center_cents,melodyne_pitch_drift_factor,melodyne_pitch_modulation_factor,melodyne_transition_sec,melodyne_formant_offset_cents,melodyne_amplitude_factor,melodyne_sibilant_balance,melodyne_attack_duration_sec,melodyne_decay_elongation,utau_overlap_sec\n";
+    juce::String csv = "name,region_start_sec,region_end_sec,note_alignment_sec,fixed_duration_sec,relative_pitch_cents,melodyne_project_data,melodyne_pitch_center_cents,melodyne_original_pitch_center_cents,melodyne_pitch_drift_factor,melodyne_pitch_modulation_factor,melodyne_transition_sec,melodyne_formant_offset_cents,melodyne_amplitude_factor,melodyne_sibilant_balance,melodyne_attack_duration_sec,melodyne_decay_elongation,utau_overlap_sec,hjm_version,native_role,native_provenance,native_confidence,native_segments,native_amplitude_envelope\n";
     for (std::size_t index = 0; index < rows.size(); ++index)
     {
         auto row = rows[index];
+        row.hjmVersion = std::max(2, row.hjmVersion);
+        if (row.provenance.isEmpty()) row.provenance = "estimated";
+        if (row.segments.empty())
+        {
+            row.segments = nativeSegmentsFor(row);
+            for (auto& segment : row.segments)
+            {
+                segment.sourceStartSeconds += row.regionStartSeconds;
+                segment.sourceEndSeconds += row.regionStartSeconds;
+                segment.alignmentSeconds += row.regionStartSeconds;
+            }
+        }
+        if (row.role == NativeSegmentRole::unknown && !row.segments.empty())
+            row.role = row.segments.front().role;
         row.regionStartSeconds = std::max(0.0, row.regionStartSeconds);
         row.regionEndSeconds = std::max(row.regionStartSeconds + 0.001, row.regionEndSeconds);
         row.alignmentSeconds = juce::jlimit(row.regionStartSeconds, row.regionEndSeconds,
@@ -340,6 +673,10 @@ bool SampleSettings::save(const juce::File& audio,
         };
         csv += csvEscape(row.name.isEmpty() ? "region " + juce::String(index + 1) : row.name);
         for (const auto value : values) csv += "," + juce::String(value, 9).trimCharactersAtEnd("0").trimCharactersAtEnd(".");
+        csv += "," + juce::String(row.hjmVersion) + "," + nativeSegmentRoleName(row.role)
+            + "," + csvEscape(row.provenance) + "," + juce::String(row.confidence, 6)
+            + "," + csvEscape(encodeSegments(row.segments))
+            + "," + csvEscape(encodeAmplitudeEnvelope(row.amplitudeEnvelope));
         csv += "\n";
     }
     const auto sidecar = sidecarFor(audio);
@@ -399,6 +736,24 @@ bool SampleSettings::importOto(const juce::File& oto, const juce::File& audio,
                                             row.alignmentSeconds);
         row.fixedDurationSeconds = juce::jlimit(0.0,
             row.regionEndSeconds - row.regionStartSeconds, row.fixedDurationSeconds);
+        row.hjmVersion = 2;
+        row.role = row.name == "_" || row.name.containsChar('_')
+            ? NativeSegmentRole::transition
+            : row.name == "-" ? NativeSegmentRole::unknown
+            : NativeSegmentRole::vowel;
+        row.provenance = "utau";
+        row.confidence = 1.0f;
+        const auto firstRole = row.role == NativeSegmentRole::vowel
+            && row.fixedDurationSeconds > 1.0e-6
+            ? NativeSegmentRole::consonant : row.role;
+        row.segments.push_back({ "segment_1", row.name, firstRole,
+            row.regionStartSeconds, row.alignmentSeconds, "utau", 1.0f,
+            row.alignmentSeconds, row.overlapSeconds,
+            row.role != NativeSegmentRole::consonant, 1.0 });
+        if (row.alignmentSeconds < row.regionEndSeconds - 1.0e-6)
+            row.segments.push_back({ "segment_2", row.name, NativeSegmentRole::vowel,
+                row.alignmentSeconds, row.regionEndSeconds, "utau", 1.0f,
+                row.alignmentSeconds, row.overlapSeconds, true, 1.0 });
         rows.push_back(std::move(row));
     }
     if (rows.empty())
@@ -785,8 +1140,27 @@ bool SampleSettings::importVoicebank(const juce::File& root, juce::StringArray& 
     }
     if (otoFiles.isEmpty())
     {
-        warnings.add("oto.ini not found under " + root.getFullPathName());
-        return false;
+        // A native HJM bank no longer needs an OTO source file.  Register its
+        // annotated audio directly so a bank remains reusable after the one
+        // time UTAU -> HJM conversion.
+        juce::Array<juce::File> nativeAudio;
+        if (root.isDirectory())
+            root.findChildFiles(nativeAudio, juce::File::findFiles, true, "*");
+        for (const auto& sample : nativeAudio)
+        {
+            if (!sample.hasFileExtension("wav;flac;aif;aiff;mp3;ogg")) continue;
+            const auto sidecar = sidecarFor(sample);
+            const juce::File legacy(sample.getFullPathName() + ".hachi.csv");
+            if (!sidecar.existsAsFile() && !legacy.existsAsFile()) continue;
+            const auto rows = loadOrDerive(sample, ProjectData{});
+            if (rows.empty()) continue;
+            audioFiles.addIfNotAlreadyThere(sample.getFullPathName(), false);
+            ++sidecarsWritten;
+            regionsWritten += static_cast<int>(rows.size());
+        }
+        if (audioFiles.isEmpty())
+            warnings.add("oto.ini and HJM annotations not found under " + root.getFullPathName());
+        return !audioFiles.isEmpty();
     }
 
     juce::AudioFormatManager formats;

@@ -13,11 +13,11 @@ juce::String algorithmLabel(const TrackData& track)
     const auto pitch = track.pitchAlgorithm == PitchAlgorithm::nsfHifigan ? juce::String("nsf-hifigan")
         : track.pitchAlgorithm == PitchAlgorithm::world ? juce::String("WORLD")
         : track.pitchAlgorithm == PitchAlgorithm::vocalShifter ? juce::String("vslib")
-        : track.pitchAlgorithm == PitchAlgorithm::mld3 ? juce::String("mld3")
+        : track.pitchAlgorithm == PitchAlgorithm::mld3 ? juce::String("mld3 (disabled)")
         : track.pitchAlgorithm == PitchAlgorithm::llsm2 ? juce::String("llsm2")
         : track.pitchAlgorithm == PitchAlgorithm::utau
             ? utauModeLabel(track.utauMode)
-        : juce::String("mld5");
+        : juce::String("mld5 (disabled)");
     const auto stretch = track.stretchAlgorithm == StretchAlgorithm::variableMelHop
         ? juce::String("variable-mel-hop")
         : track.stretchAlgorithm == StretchAlgorithm::loop ? juce::String("loop")

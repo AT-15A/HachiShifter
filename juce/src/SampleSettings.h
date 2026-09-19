@@ -28,6 +28,14 @@ struct SampleRegionSetting
     // UTAU's sixth oto.ini value.  Kept separately from alignment/preutterance
     // so the wavtool-style mixer can reproduce the intended crossfade.
     double overlapSeconds = 0.0;
+    // v2 native metadata. Appended after legacy fields so old aggregate
+    // initialisers and old CSV columns remain source-compatible.
+    int hjmVersion = 2;
+    NativeSegmentRole role = NativeSegmentRole::unknown;
+    juce::String provenance = "estimated";
+    float confidence = 0.0f;
+    std::vector<NativeSegment> segments;
+    std::vector<AmplitudeEnvelopePoint> amplitudeEnvelope;
 };
 
 struct VoicebankOtoEntry
@@ -66,10 +74,19 @@ class SampleSettings final
 {
 public:
     static juce::File sidecarFor(const juce::File& audio);
+    // Convert one legacy or v2 row to the native, arbitrarily segmented form
+    // consumed by the editor and renderers.  Returned times are local to the
+    // row's source region.
+    [[nodiscard]] static std::vector<NativeSegment> nativeSegmentsFor(
+        const SampleRegionSetting& row);
     static std::vector<SampleRegionSetting> loadOrDerive(const juce::File& audio,
                                                          const ProjectData& project);
     static bool save(const juce::File& audio, const std::vector<SampleRegionSetting>& rows,
                      juce::String& error);
+    // Convert the already-parsed Melodyne project into native HJM annotations
+    // and bind the resulting segments back to its native notes.  This is the
+    // single conversion service used by GUI and headless imports.
+    static bool convertMelodyneProject(ProjectData& project, juce::StringArray& warnings);
     static bool importOto(const juce::File& oto, const juce::File& audio,
                           double audioDuration, std::vector<SampleRegionSetting>& rows,
                           juce::String& error);

@@ -15,9 +15,12 @@ juce::Colour Palette::grid        { 0xff373737 };
 juce::Colour Palette::beatGrid    { 0xff4a4a4a };
 juce::Colour Palette::accent      { 0xff7f69ca };
 juce::Colour Palette::accentLight { 0xffcbcbfa };
-juce::Colour Palette::noteFill    { 0xfff4c000 };
-juce::Colour Palette::noteLight   { 0xffcbcbfa };
-juce::Colour Palette::noteEdge    { 0xff7f69ca };
+// Shared UTAU/Melodyne editor palette.  Yellow is reserved for warnings and
+// exceptional handles; ordinary notes use the blue-green treatment from the
+// migrated UTAU editor.
+juce::Colour Palette::noteFill    { 0xff269b9b };
+juce::Colour Palette::noteLight   { 0xff8be0d5 };
+juce::Colour Palette::noteEdge    { 0xff4fc3b5 };
 juce::Colour Palette::pitchLine   { 0xfff4f4f4 };
 juce::Colour Palette::playhead    { 0xfff05a5a };
 juce::Colour Palette::text        { 0xffd0d0d0 };
@@ -45,9 +48,12 @@ void Palette::applyTheme(const juce::String& theme, juce::Colour accentColour,
     pitchLine = light ? juce::Colour(0xff242424) : juce::Colour(0xfff4f4f4);
     accent = accentColour;
     accentLight = accentLightColour;
-    noteFill = noteColour;
-    noteLight = accentLightColour;
-    noteEdge = accentColour;
+    // Keep note colours tied to the shared editor style.  Older preference
+    // files may contain the retired yellow note colour, so do not reapply it.
+    juce::ignoreUnused(noteColour);
+    noteFill = light ? juce::Colour(0xff43aaa0) : juce::Colour(0xff269b9b);
+    noteLight = light ? juce::Colour(0xff16736e) : juce::Colour(0xff8be0d5);
+    noteEdge = light ? juce::Colour(0xff2c817b) : juce::Colour(0xff4fc3b5);
 }
 
 HachiLookAndFeel::HachiLookAndFeel()
@@ -93,6 +99,40 @@ void HachiLookAndFeel::drawButtonText(juce::Graphics& g, juce::TextButton& butto
     }
 
     auto bounds = button.getLocalBounds().toFloat().reduced(6.0f);
+    // Original SVG artwork on a shared 24px grid. Cache parsing; tint a copy
+    // so active/disabled buttons cannot change another button's cached image.
+    static const auto toolIcons = []
+    {
+        std::array<std::unique_ptr<juce::Drawable>, 6> icons;
+        const std::array<const char*, 6> shapes {{
+            "<path d='M5 3 L5 19 L9 15 L13 22 L16 20 L12 13 L19 13 Z'/>",
+            "<path d='M4 20 L5 15 L16 4 Q18 2 20 4 Q22 6 20 8 L9 19 Z M5 15 L9 19 M14 6 L18 10 M4 20 L8 19'/>",
+            "<path d='M5 19 L19 5'/><rect x='2' y='16' width='5' height='5'/><rect x='17' y='2' width='5' height='5'/>",
+            "<path d='M4 18 C9 18 11 6 20 6'/><circle cx='4' cy='18' r='2'/><circle cx='12' cy='12' r='2'/><circle cx='20' cy='6' r='2'/>",
+            "<path d='M14 3 A6 6 0 0 0 11 12 L3 20 L6 23 L14 15 A6 6 0 0 0 21 7 L17 11 L13 7 L17 3 Z'/>",
+            "<path d='M9 15 L15 9 M8 12 L5 15 A3 3 0 0 0 9 19 L12 16 M12 8 L15 5 A3 3 0 0 1 19 9 L16 12'/>"
+        }};
+        for (std::size_t index = 0; index < icons.size(); ++index)
+        {
+            const auto svg = juce::String("<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g fill='none' stroke='#000000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'>")
+                + shapes[index] + "</g></svg>";
+            if (const auto xml = juce::parseXML(svg))
+                icons[index] = juce::Drawable::createFromSVG(*xml);
+        }
+        return icons;
+    }();
+    const std::array<const char*, 6> toolIds {{ "icon.pointer", "icon.draw",
+        "icon.line", "icon.points", "icon.wrench", "icon.connect" }};
+    for (std::size_t index = 0; index < toolIds.size(); ++index)
+        if (id == toolIds[index] && toolIcons[index])
+        {
+            auto icon = toolIcons[index]->createCopy();
+            icon->replaceColour(juce::Colours::black,
+                button.getToggleState() ? Palette::panel : Palette::text);
+            icon->drawWithin(g, button.getLocalBounds().toFloat().reduced(4.0f),
+                juce::RectanglePlacement::centred, button.isEnabled() ? 1.0f : 0.4f);
+            return;
+        }
     g.setColour(button.getToggleState() ? Palette::panel : Palette::text);
     juce::Path path;
     if (id == "icon.play")

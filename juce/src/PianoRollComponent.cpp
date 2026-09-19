@@ -4738,12 +4738,17 @@ void PianoRollComponent::paint(juce::Graphics& g)
                 const auto blockHeight = std::max(6.0f, rowHeight - 4.0f);
                 const auto bounds = juce::Rectangle<float>(x, y + 2.0f, width, blockHeight);
                 auto displayBounds = bounds;
-                const auto utauMode = track.pitchAlgorithm == PitchAlgorithm::utau;
+                // The visual editor is shared by both workflows.  Melodyne
+                // compatible notes use the same UTAU-style block, contour,
+                // boundary and baseline drawing; only the data operations
+                // below remain gated by the real track algorithm.
+                const auto utauMode = true;
+                const auto dataIsUtau = track.pitchAlgorithm == PitchAlgorithm::utau;
                 const auto previewingConsonant = note.id == draggedNote
                     && dragMode == DragMode::consonantLeadIn;
                 auto displaySpanSeconds = 0.0;
                 std::optional<double> displayLeadIn;
-                if (utauMode)
+                if (dataIsUtau)
                 {
                     if (const auto span = utauSoundSpans.find(note.id.toStdString());
                         span != utauSoundSpans.end())
@@ -4784,6 +4789,18 @@ void PianoRollComponent::paint(juce::Graphics& g)
                             soundingWidth, bounds.getHeight() - 2.0f);
                     }
                 }
+                else
+                {
+                    // Native HJM notes already carry their source-region
+                    // timing.  Use the same sounding rectangle for imported
+                    // Melodyne/MIDI material instead of waiting for an OTO
+                    // lookup, so the native boundary is visible immediately.
+                    displaySpanSeconds = effectiveDuration * sourceScale;
+                    // The imported onset is already inside the recording.
+                    // Alignment is its internal line, not additional lead-in
+                    // audio outside the clip's selected source range.
+                    displayLeadIn = note.consonantSeconds;
+                }
                 // The sounding block reaches furthest left, the nominal block
                 // furthest right, and together they bound everything drawn
                 // below.  Vertical extent is deliberately not tested: a pitch
@@ -4800,7 +4817,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     // sounding block to be drawn as.  It gets an empty one of
                     // its own, which is also what keeps it visible with the
                     // note-range outline turned off.
-                    if (backend::isRestLyric(note.label))
+                    if (dataIsUtau && backend::isRestLyric(note.label))
                     {
                         g.setColour(Palette::panelRaised.withAlpha(0.55f));
                         g.fillRoundedRectangle(bounds, 4.0f);
@@ -4822,6 +4839,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     // tool to see it was a poor way to find out.
                     const auto guideOnly = tool != Tool::note;
                     if (utauModeUsesRegions(track.utauMode)
+                        && dataIsUtau
                         && (tool == Tool::note || tool == Tool::points))
                     {
                         const auto dragging = note.id == draggedNote
@@ -4883,6 +4901,116 @@ void PianoRollComponent::paint(juce::Graphics& g)
                         }
                     }
 
+                    // HJM is more expressive than OTO: draw every native
+                    // segment, including arbitrary vowel subdivisions and the
+                    // '_' transition placeholders.  Unknown '-' regions stay
+                    // visible but subdued until the user supplies an alias.
+                    if (!note.nativeSegments.empty())
+                    {
+                        const auto segmentXAt = [&](double sourceLocal)
+                        {
+                            const auto sourceAbsolute = note.nativeSourceStartSeconds >= 0.0
+                                ? note.nativeSourceStartSeconds + sourceLocal
+                                : clip.sourceOffsetSeconds + note.startSeconds + sourceLocal;
+                            if (sourceEditMode) return timeToX(sourceAbsolute);
+                            const auto source = sourceAbsolute - clip.sourceOffsetSeconds;
+                            auto target = clip.sourceDurationSeconds > 1.0e-9
+                                ? source * clip.durationSeconds / clip.sourceDurationSeconds : source;
+                            const auto& map = clip.sourceTimeMap;
+                            if (!map.empty())
+                            {
+                                target = map.back().targetSeconds;
+                                if (source <= map.front().sourceSeconds) target = map.front().targetSeconds;
+                                else for (std::size_t i = 1; i < map.size(); ++i)
+                                    if (source <= map[i].sourceSeconds)
+                                    {
+                                        const auto span = map[i].sourceSeconds - map[i-1].sourceSeconds;
+                                        const auto u = span > 1.0e-9 ? (source-map[i-1].sourceSeconds)/span : 0.0;
+                                        target = map[i-1].targetSeconds + u*(map[i].targetSeconds-map[i-1].targetSeconds);
+                                        break;
+                                    }
+                            }
+                            return timeToX(clip.startSeconds + target);
+                        };
+                        const auto segmentColour = [](const NativeSegment& segment)
+                        {
+                            switch (segment.role)
+                            {
+                                case NativeSegmentRole::consonant:
+                                    return Palette::noteLight;
+                                case NativeSegmentRole::transition:
+                                    return juce::Colour(0xff79c9c3);
+                                case NativeSegmentRole::unknown:
+                                    return Palette::textMuted;
+                                case NativeSegmentRole::silence:
+                                    return Palette::panelRaised;
+                                case NativeSegmentRole::breath:
+                                    return juce::Colour(0xff9fc6e8);
+                                case NativeSegmentRole::noise:
+                                    return juce::Colour(0xffc2a7de);
+                                case NativeSegmentRole::ending:
+                                    return juce::Colour(0xff6ea6a2);
+                                case NativeSegmentRole::vowel:
+                                    return segment.stretchable ? juce::Colour(0xff81c784)
+                                                               : juce::Colour(0xff4fc3f7);
+                            }
+                            return Palette::noteFill;
+                        };
+                        for (std::size_t index = 0; index < note.nativeSegments.size(); ++index)
+                        {
+                            const auto& segment = note.nativeSegments[index];
+                            const auto segmentX = segmentXAt(segment.sourceStartSeconds);
+                            const auto segmentRight = segmentXAt(segment.sourceEndSeconds);
+                            const auto segmentWidth = std::max(0.0f,
+                                segmentRight - segmentX);
+                            if (segmentWidth <= 0.5f) continue;
+                            const auto alpha = segment.role == NativeSegmentRole::unknown
+                                ? 0.12f : segment.role == NativeSegmentRole::transition
+                                    ? 0.25f : 0.20f;
+                            g.setColour(segmentColour(segment).withAlpha(alpha));
+                            g.fillRect(juce::Rectangle<float>(segmentX,
+                                displayBounds.getY() + 1.0f, segmentWidth,
+                                displayBounds.getHeight() - 2.0f));
+                            if (index > 0)
+                            {
+                                g.setColour(segmentColour(segment).withAlpha(
+                                    segment.role == NativeSegmentRole::unknown ? 0.42f : 0.86f));
+                                g.drawVerticalLine(static_cast<int>(std::lround(segmentX)),
+                                    displayBounds.getY() + 1.0f,
+                                    displayBounds.getBottom() - 1.0f);
+                            }
+                            const auto alias = segment.alias.trim().isEmpty()
+                                ? juce::String("-") : segment.alias.trim();
+                            if (segmentWidth >= 22.0f && (note.nativeSegments.size() > 1
+                                || alias == "-" || alias == "_"))
+                            {
+                                g.setColour(Palette::text.withAlpha(
+                                    segment.role == NativeSegmentRole::unknown ? 0.60f : 0.86f));
+                                g.setFont(std::min(10.0f,
+                                    std::max(7.0f, displayBounds.getHeight() - 3.0f)));
+                                g.drawFittedText(alias,
+                                    juce::Rectangle<float>(segmentX + 3.0f,
+                                        displayBounds.getY(),
+                                        std::max(1.0f, segmentWidth - 6.0f),
+                                        displayBounds.getHeight()).toNearestInt(),
+                                    juce::Justification::centredLeft, 1);
+                            }
+                        }
+                        const auto alignment = note.nativeSegments.front().alignmentSeconds;
+                        if (alignment > 1.0e-9)
+                        {
+                            const auto alignmentX = segmentXAt(alignment);
+                            const float dash[] { 3.0f, 2.0f };
+                            juce::Path line;
+                            line.startNewSubPath(alignmentX, displayBounds.getY());
+                            line.lineTo(alignmentX, displayBounds.getBottom());
+                            juce::Path dashed;
+                            juce::PathStrokeType(1.0f).createDashedStroke(dashed, line, dash, 2);
+                            g.setColour(Palette::accentLight.withAlpha(0.92f));
+                            g.fillPath(dashed);
+                        }
+                    }
+
                     // The body carries its own amplitude envelope: the top
                     // edge follows the gain, so a glance says where the note
                     // fades in, holds and falls away.  Drawn with exactly the
@@ -4940,14 +5068,12 @@ void PianoRollComponent::paint(juce::Graphics& g)
                         }
                     }
 
-                    // Keep the MIDI note's nominal range visible independently
-                    // from oto.ini preutterance, overlap and consonant timing.
-                    // The hollow outline above is the actual sounding range;
-                    // this heavier baseline is always exactly [note start, end].
+                    // Keep a narrow warm baseline for the nominal note extent;
+                    // the note body itself remains the shared blue-green style.
                     const auto nominalBar = juce::Rectangle<float>(
                         bounds.getX(), bounds.getBottom() - 2.0f,
                         bounds.getWidth(), 3.5f);
-                    g.setColour(juce::Colour(0xffff9f2f));
+                    g.setColour(juce::Colour(0xffe7a34b));
                     g.fillRoundedRectangle(nominalBar, 1.75f);
                     if (selectedNotes.contains(note.id.toStdString())
                         && displayBounds.getX() < bounds.getX() - 0.5f)
@@ -4962,7 +5088,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     {
                         g.setColour(Palette::text);
                         g.setFont(10.5f);
-                        g.drawText(juce::String::fromUTF8("辅音速度 ")
+                        g.drawText(juce::String::fromUTF8(dataIsUtau ? "辅音速度 " : "先行 ")
                                 + juce::String(previewConsonantVelocity),
                             static_cast<int>(displayBounds.getX() + 6.0f),
                             static_cast<int>(displayBounds.getY() - 19.0f),
@@ -4971,14 +5097,14 @@ void PianoRollComponent::paint(juce::Graphics& g)
                 }
                 else
                 {
-                    g.setColour(Palette::noteFill.darker(0.18f));
+                    g.setColour(Palette::noteFill.withAlpha(0.90f));
                     g.fillRoundedRectangle(bounds, 4.0f);
                     const auto consonantWidth = juce::jlimit(0.0f, width,
                         static_cast<float>(note.consonantSeconds * sourceScale) * pixelsPerSecond);
-                    g.setColour(Palette::noteLight.withAlpha(0.58f));
+                    g.setColour(Palette::noteLight.withAlpha(0.38f));
                     g.fillRoundedRectangle(bounds.withWidth(consonantWidth), 4.0f);
-                    g.setColour(Palette::noteEdge);
-                    g.drawRoundedRectangle(bounds, 4.0f, 1.2f);
+                    g.setColour(Palette::noteLight.withAlpha(0.82f));
+                    g.drawRoundedRectangle(bounds, 3.0f, 1.2f);
                 }
                 if (selectedNotes.contains(note.id.toStdString()))
                 {

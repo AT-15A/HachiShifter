@@ -51,6 +51,7 @@ struct NsfHifiganEdgeGuard
 class NsfHifiganRenderer final
 {
 public:
+    [[nodiscard]] static bool modelAvailable(const juce::File& configuredModelDirectory);
     static NsfHifiganRenderResult render(
         const juce::AudioBuffer<float>& source,
         double sampleRate,

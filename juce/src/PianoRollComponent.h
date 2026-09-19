@@ -783,7 +783,9 @@ private:
     int lowestMidi = 24;
     bool sourceEditMode = false;
     bool showNoteLabels = false;
-    bool showWaveforms = true;
+    // The shared UTAU-style editor starts with waveform ink hidden; it can be
+    // enabled from the view menu when source detail is useful.
+    bool showWaveforms = false;
     bool showUtauWaveforms = false;
     std::shared_ptr<const std::vector<UtauNoteWaveform>> utauWaveforms;
     void drawUtauNoteWaveforms(juce::Graphics& g);

@@ -1,5 +1,14 @@
 # HachiShifter-x integration
 
+## Current UI test override
+
+The independent MPD importer is enabled at the user's request for UI testing.
+Native Melodyne import and experimental merged rendering remain unavailable.
+The six editing tools now use original SVG artwork on a shared 24px grid;
+icon-icons.com search returned HTTP 403, so no third-party icons were copied.
+Horizontal (H) and vertical (V) zoom pairs now sit beside the edit tools, with
+the piano viewport using the space previously reserved at its lower/right edges.
+
 ## Baseline and scope
 
 Destination: `next`, baseline `2871d55`. Source: the supplied `HachiShifter-x`
@@ -93,10 +102,9 @@ comments and bundled smoke tests do not by themselves establish passing tests.
   and carrying the source overlap.  The source Melodyne notes remain intact in
   the in-memory import result; this conversion only affects the first generated
   material annotation.
-- When an HJM sidecar already exists, first-time Melodyne import compares the
-  generated rows with the existing rows.  A mismatch asks whether to use the
-  new Melodyne-derived annotation, retain the existing annotation, or cancel;
-  the old file is never overwritten silently.
+- During current UI testing, Melodyne import directly overwrites the existing
+  HJM sidecar with the newly converted rows.  The comparison/conflict prompt
+  is temporarily disabled and should be restored after interface review.
 - VST3 probing is now implemented through JUCE's plugin host boundary.  In the
   current WSL process it correctly reports the Windows VST3 as discovered but
   not hostable; a Windows build can proceed to plugin description and instance

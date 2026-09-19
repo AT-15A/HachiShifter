@@ -1,6 +1,7 @@
 #include "ProjectModel.h"
 #include "SampleSettings.h"
 #include "backend/UstImporter.h"
+#include "backend/NsfHifiganRenderer.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -9,6 +10,40 @@
 
 namespace hachi
 {
+PitchAlgorithm defaultPitchAlgorithm(const juce::File& modelDirectory)
+{
+    return backend::NsfHifiganRenderer::modelAvailable(modelDirectory)
+        ? PitchAlgorithm::nsfHifigan : PitchAlgorithm::llsm2;
+}
+juce::String nativeSegmentRoleName(NativeSegmentRole role)
+{
+    switch (role)
+    {
+        case NativeSegmentRole::consonant: return "consonant";
+        case NativeSegmentRole::vowel: return "vowel";
+        case NativeSegmentRole::transition: return "transition";
+        case NativeSegmentRole::silence: return "silence";
+        case NativeSegmentRole::breath: return "breath";
+        case NativeSegmentRole::noise: return "noise";
+        case NativeSegmentRole::ending: return "ending";
+        case NativeSegmentRole::unknown: break;
+    }
+    return "unknown";
+}
+
+NativeSegmentRole parseNativeSegmentRole(const juce::String& value)
+{
+    const auto role = value.trim().toLowerCase();
+    if (role == "consonant") return NativeSegmentRole::consonant;
+    if (role == "vowel") return NativeSegmentRole::vowel;
+    if (role == "transition") return NativeSegmentRole::transition;
+    if (role == "silence") return NativeSegmentRole::silence;
+    if (role == "breath") return NativeSegmentRole::breath;
+    if (role == "noise") return NativeSegmentRole::noise;
+    if (role == "ending") return NativeSegmentRole::ending;
+    return NativeSegmentRole::unknown;
+}
+
 float renderedPitchCents(const NoteData& note, const PitchPoint& point)
 {
     if (point.hasManualTarget) return point.manualTargetCents;
@@ -301,18 +336,19 @@ juce::String pitchAlgorithmName(PitchAlgorithm value)
         case PitchAlgorithm::llsm2: return "llsm2";
         case PitchAlgorithm::utau: return "utau";
     }
-    return "mld5";
+    return "llsm2";
 }
 
 PitchAlgorithm parsePitchAlgorithm(const juce::String& value)
 {
     if (value == "nsf-hifigan") return PitchAlgorithm::nsfHifigan;
     if (value == "mld3") return PitchAlgorithm::mld3;
+    if (value == "mld5") return PitchAlgorithm::mld5;
     if (value == "world") return PitchAlgorithm::world;
     if (value == "vslib") return PitchAlgorithm::vocalShifter;
     if (value == "llsm2") return PitchAlgorithm::llsm2;
     if (value == "utau") return PitchAlgorithm::utau;
-    return PitchAlgorithm::mld5;
+    return PitchAlgorithm::llsm2;
 }
 
 juce::String stretchAlgorithmName(StretchAlgorithm value)
@@ -560,6 +596,12 @@ juce::String ProjectModel::addAudioFile(const juce::File& file, double durationS
             if (regionEnd - regionStart < 0.001) continue;
             NoteData note;
             note.id = makeId("note");
+            note.label = row.name.trim().isEmpty() ? "-" : row.name.trim();
+            note.nativeRole = row.role;
+            note.nativeProvenance = row.provenance;
+            note.nativeConfidence = row.confidence;
+            note.nativeSourceStartSeconds = row.regionStartSeconds;
+            note.nativeSourceEndSeconds = row.regionEndSeconds;
             note.startSeconds = regionStart;
             note.durationSeconds = regionEnd - regionStart;
             note.consonantSeconds = juce::jlimit(0.0, note.durationSeconds,
@@ -588,6 +630,13 @@ juce::String ProjectModel::addAudioFile(const juce::File& file, double durationS
             note.attackSpeed = juce::jlimit(0.05f, 20.0f,
                 static_cast<float>(row.melodyneAttackSeconds > 1.0e-6
                     ? row.fixedDurationSeconds / row.melodyneAttackSeconds : 1.0));
+            note.nativeSegments = SampleSettings::nativeSegmentsFor(row);
+            note.amplitudeEnvelope = row.amplitudeEnvelope;
+            note.utauPreutteranceOverrideEnabled = true;
+            note.utauPreutteranceSeconds = std::max(0.0,
+                row.alignmentSeconds - row.regionStartSeconds);
+            note.utauOverlapOverrideEnabled = std::abs(row.overlapSeconds) > 1.0e-9;
+            note.utauOverlapSeconds = row.overlapSeconds;
             // A sidecar stores note-level controls rather than a dense F0
             // curve.  A neutral two-point contour keeps the source waveform's
             // own micro-pitch intact while allowing the whole region to move.
@@ -695,18 +744,63 @@ bool ProjectModel::setClipNotesIfEmpty(const juce::String& clipId,
 {
     if (notes.empty()) return false;
     auto changed = false;
+    juce::File annotationSource;
+    std::vector<SampleRegionSetting> annotationRows;
     {
         const juce::ScopedLock guard(lock);
         for (auto& track : project.tracks)
+        {
             for (auto& clip : track.clips)
                 if (clip.id == clipId && clip.notes.empty())
                 {
                     // Import analysis is one operation.  More importantly,
                     // do not replace notes the user drew while it was running.
+                    annotationSource = clip.sourceFile;
+                    const auto ratio = clip.durationSeconds > 1.0e-9
+                        ? clip.sourceDurationSeconds / clip.durationSeconds : 1.0;
+                    annotationRows.reserve(notes.size());
+                    for (auto& note : notes)
+                    {
+                        if (note.label.trim().isEmpty()) note.label = "-";
+                        note.nativeRole = note.label == "_"
+                            ? NativeSegmentRole::transition : NativeSegmentRole::unknown;
+                        note.nativeProvenance = "estimated";
+                        note.nativeConfidence = 0.0f;
+                        note.nativeSourceStartSeconds = clip.sourceOffsetSeconds
+                            + note.startSeconds * ratio;
+                        note.nativeSourceEndSeconds = note.nativeSourceStartSeconds
+                            + note.durationSeconds * ratio;
+                        note.nativeSegments = { { "segment_1", note.label,
+                            note.nativeRole, 0.0, note.durationSeconds,
+                            "estimated", 0.0f, note.durationSeconds, 0.0,
+                            true, 1.0 } };
+                        SampleRegionSetting row;
+                        row.name = note.label;
+                        row.role = note.nativeRole;
+                        row.provenance = "estimated";
+                        row.confidence = 0.0f;
+                        row.regionStartSeconds = clip.sourceOffsetSeconds
+                            + note.startSeconds * ratio;
+                        row.regionEndSeconds = row.regionStartSeconds
+                            + note.durationSeconds * ratio;
+                        row.segments.push_back({ "segment_1", note.label,
+                            note.nativeRole, row.regionStartSeconds,
+                            row.regionEndSeconds, "estimated", 0.0f,
+                            row.regionEndSeconds, 0.0, true, 1.0 });
+                        annotationRows.push_back(std::move(row));
+                    }
                     clip.notes = std::move(notes);
                     changed = true;
                     break;
                 }
+            if (changed) break;
+        }
+    }
+    if (changed && annotationSource.existsAsFile())
+    {
+        juce::String annotationError;
+        if (!SampleSettings::save(annotationSource, annotationRows, annotationError))
+            DBG("Could not save analysed HJM annotation: " + annotationError);
     }
     if (changed) sendChangeMessage();
     return changed;
@@ -954,6 +1048,12 @@ bool ProjectModel::addUstFile(const juce::File& file, juce::String& error,
         NoteData note;
         note.id = makeId("note");
         note.label = source.lyric.trim();
+        note.nativeRole = note.label == "_" || note.label.containsChar('_')
+            ? NativeSegmentRole::transition
+            : note.label == "-" ? NativeSegmentRole::unknown
+            : NativeSegmentRole::vowel;
+            note.nativeProvenance = "utau";
+            note.nativeConfidence = note.nativeRole == NativeSegmentRole::unknown ? 0.0f : 1.0f;
         note.midiNote = static_cast<float>(source.noteNum);
         note.sourceMidiCenter = note.midiNote;
         note.utauFlags = source.flags;
@@ -1012,6 +1112,10 @@ bool ProjectModel::addUstFile(const juce::File& file, juce::String& error,
             note.durationSeconds = std::max(0.01,
                 project.secondsForQuarterPosition(endQuarters) - note.startSeconds);
             note.consonantSeconds = 0.0;
+            note.nativeSegments = { { "segment_1", note.label.isEmpty() ? "-" : note.label,
+                note.nativeRole, 0.0, note.durationSeconds, "utau",
+                note.nativeConfidence, note.durationSeconds, note.utauOverlapSeconds,
+                note.nativeRole != NativeSegmentRole::consonant, 1.0 } };
             note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
             note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
             applyUstPitchBend(note, *sources[index]);
@@ -2766,6 +2870,51 @@ void ProjectModel::setNoteAttackSpeed(const juce::String& noteId, float attackSp
 
 namespace
 {
+struct NativeLabelUpdate
+{
+    juce::File source;
+    double startSeconds = 0.0;
+    double endSeconds = 0.0;
+    juce::String oldLabel;
+    juce::String newLabel;
+};
+
+void persistNativeLabels(const std::vector<NativeLabelUpdate>& updates)
+{
+    for (const auto& update : updates)
+    {
+        if (!update.source.existsAsFile()) continue;
+        const auto sidecar = SampleSettings::sidecarFor(update.source);
+        const juce::File legacy(update.source.getFullPathName() + ".hachi.csv");
+        if (!sidecar.existsAsFile() && !legacy.existsAsFile()) continue;
+        auto rows = SampleSettings::loadOrDerive(update.source, ProjectData{});
+        auto matched = std::find_if(rows.begin(), rows.end(), [&](const auto& row)
+        {
+            return std::abs(row.regionStartSeconds - update.startSeconds) < 0.002
+                && std::abs(row.regionEndSeconds - update.endSeconds) < 0.002;
+        });
+        if (matched == rows.end()) continue;
+        matched->name = update.newLabel;
+        if (update.newLabel == "_") matched->role = NativeSegmentRole::transition;
+        else if (update.newLabel == "-") matched->role = NativeSegmentRole::unknown;
+        else if (matched->role == NativeSegmentRole::unknown
+                 || matched->role == NativeSegmentRole::transition)
+            matched->role = NativeSegmentRole::vowel;
+        if (matched->segments.empty())
+            matched->segments = SampleSettings::nativeSegmentsFor(*matched);
+        for (auto& segment : matched->segments)
+        {
+            const auto isPlaceholder = segment.alias == update.oldLabel
+                || segment.alias == "-" || segment.alias == "_";
+            if (isPlaceholder && segment.role != NativeSegmentRole::transition)
+                segment.alias = update.newLabel;
+        }
+        juce::String error;
+        if (!SampleSettings::save(update.source, rows, error))
+            DBG("Could not persist native HJM label: " + error);
+    }
+}
+
 // What changing a note's lyric costs it, wherever that happens.
 //
 // Preutterance and overlap are millimetre marks on one particular recording,
@@ -2780,7 +2929,20 @@ namespace
 // read off a waveform it no longer plays.
 void relabelNote(NoteData& note, const juce::String& trimmed)
 {
-    note.label = trimmed;
+    const auto native = !note.nativeSegments.empty();
+    const auto label = trimmed.isEmpty() ? juce::String("-") : trimmed;
+    const auto oldLabel = note.label;
+    note.label = label;
+    if (native)
+    {
+        note.nativeRole = label == "_" ? NativeSegmentRole::transition
+            : label == "-" ? NativeSegmentRole::unknown : NativeSegmentRole::vowel;
+        for (auto& segment : note.nativeSegments)
+            if (segment.role != NativeSegmentRole::transition
+                && (segment.alias == oldLabel || segment.alias == "-"))
+                segment.alias = label;
+        return;
+    }
     note.utauPreutteranceOverrideEnabled = false;
     note.utauPreutteranceSeconds = 0.0;
     note.utauOverlapOverrideEnabled = false;
@@ -2799,11 +2961,12 @@ void ProjectModel::setNoteLabels(
     const std::vector<std::pair<juce::String, juce::String>>& labels)
 {
     auto changed = false;
+    std::vector<NativeLabelUpdate> nativeUpdates;
     {
         const juce::ScopedLock guard(lock);
         for (const auto& [noteId, label] : labels)
         {
-            const auto trimmed = label.trim();
+            const auto trimmed = label.trim().isEmpty() ? juce::String("-") : label.trim();
             for (auto& track : project.tracks)
                 for (auto& clip : track.clips)
                     for (auto& note : clip.notes)
@@ -2811,18 +2974,35 @@ void ProjectModel::setNoteLabels(
                         {
                             // Once for the whole batch, so it undoes as one.
                             if (!changed) pushUndoLocked();
+                            if (!note.nativeSegments.empty())
+                            {
+                                const auto ratio = clip.durationSeconds > 1.0e-9
+                                    ? clip.sourceDurationSeconds / clip.durationSeconds : 1.0;
+                                const auto sourceStart = note.nativeSourceStartSeconds >= 0.0
+                                    ? note.nativeSourceStartSeconds
+                                    : clip.sourceOffsetSeconds + note.startSeconds * ratio;
+                                const auto sourceEnd = note.nativeSourceEndSeconds >= sourceStart
+                                    ? note.nativeSourceEndSeconds
+                                    : clip.sourceOffsetSeconds
+                                        + (note.startSeconds + note.durationSeconds) * ratio;
+                                nativeUpdates.push_back({ clip.sourceFile,
+                                    sourceStart, sourceEnd,
+                                    note.label, trimmed });
+                            }
                             relabelNote(note, trimmed);
                             changed = true;
                         }
         }
     }
+    persistNativeLabels(nativeUpdates);
     if (changed) sendChangeMessage();
 }
 
 void ProjectModel::setNoteLabel(const juce::String& noteId, const juce::String& label)
 {
-    const auto trimmed = label.trim();
+    const auto trimmed = label.trim().isEmpty() ? juce::String("-") : label.trim();
     auto changed = false;
+    std::vector<NativeLabelUpdate> nativeUpdates;
     {
         const juce::ScopedLock guard(lock);
         for (auto& track : project.tracks)
@@ -2831,11 +3011,27 @@ void ProjectModel::setNoteLabel(const juce::String& noteId, const juce::String& 
                     if (note.id == noteId && note.label != trimmed)
                     {
                         pushUndoLocked();
+                        if (!note.nativeSegments.empty())
+                        {
+                            const auto ratio = clip.durationSeconds > 1.0e-9
+                                ? clip.sourceDurationSeconds / clip.durationSeconds : 1.0;
+                            const auto sourceStart = note.nativeSourceStartSeconds >= 0.0
+                                ? note.nativeSourceStartSeconds
+                                : clip.sourceOffsetSeconds + note.startSeconds * ratio;
+                            const auto sourceEnd = note.nativeSourceEndSeconds >= sourceStart
+                                ? note.nativeSourceEndSeconds
+                                : clip.sourceOffsetSeconds
+                                    + (note.startSeconds + note.durationSeconds) * ratio;
+                            nativeUpdates.push_back({ clip.sourceFile,
+                                sourceStart, sourceEnd,
+                                note.label, trimmed });
+                        }
                         relabelNote(note, trimmed);
                         changed = true;
                         break;
                     }
     }
+    persistNativeLabels(nativeUpdates);
     if (changed) sendChangeMessage();
 }
 
@@ -2895,6 +3091,56 @@ void ProjectModel::setNotesUtauConsonantVelocity(
                         && note.utauConsonantVelocity != velocity)
                     {
                         if (!changed) pushUndoLocked();
+                        if (track.pitchAlgorithm != PitchAlgorithm::utau
+                            && note.consonantSeconds > 1.0e-6
+                            && note.consonantSeconds < note.durationSeconds - 1.0e-6)
+                        {
+                            const auto oldVelocity = note.utauConsonantVelocity
+                                == inheritedUtauConsonantVelocity ? 100 : note.utauConsonantVelocity;
+                            const auto newVelocity = velocity == inheritedUtauConsonantVelocity
+                                ? 100 : velocity;
+                            const auto oldBoundary = note.consonantSeconds;
+                            const auto newBoundary = juce::jlimit(0.001,
+                                std::max(0.001, note.durationSeconds - 0.001),
+                                oldBoundary * std::exp2(juce::jlimit(-20.0, 20.0,
+                                    (static_cast<double>(oldVelocity) - newVelocity) / 100.0)));
+                            const auto remapLocal = [&](double time)
+                            {
+                                if (time <= 0.0 || time >= note.durationSeconds) return time;
+                                return time <= oldBoundary ? time * newBoundary / oldBoundary
+                                    : newBoundary + (time - oldBoundary)
+                                        * (note.durationSeconds - newBoundary)
+                                        / (note.durationSeconds - oldBoundary);
+                            };
+                            if (clip.sourceTimeMap.empty())
+                                clip.sourceTimeMap = { { 0.0, 0.0 },
+                                    { clip.durationSeconds, clip.sourceDurationSeconds } };
+                            const auto insertAnchor = [&](double time)
+                            {
+                                auto& map = clip.sourceTimeMap;
+                                const auto right = std::lower_bound(map.begin(), map.end(), time,
+                                    [](const auto& point, double t) { return point.targetSeconds < t; });
+                                if (right == map.begin() || right == map.end()
+                                    || std::abs(right->targetSeconds - time) < 1.0e-9) return;
+                                const auto& left = *std::prev(right);
+                                const auto u = (time-left.targetSeconds)/(right->targetSeconds-left.targetSeconds);
+                                const auto source = left.sourceSeconds + u*(right->sourceSeconds-left.sourceSeconds);
+                                map.insert(right, { time, source });
+                            };
+                            insertAnchor(note.startSeconds);
+                            insertAnchor(note.startSeconds + oldBoundary);
+                            insertAnchor(note.startSeconds + note.durationSeconds);
+                            for (auto& point : clip.sourceTimeMap)
+                                point.targetSeconds = note.startSeconds
+                                    + remapLocal(point.targetSeconds - note.startSeconds);
+                            for (auto& point : note.contour) point.timeSeconds = remapLocal(point.timeSeconds);
+                            for (auto& point : note.pitchControlPoints) point.timeSeconds = remapLocal(point.timeSeconds);
+                            for (auto& point : note.amplitudeEnvelope) point.timeSeconds = remapLocal(point.timeSeconds);
+                            for (auto& marker : note.sibilantMarkers) marker = remapLocal(marker);
+                            note.attackSpeed *= static_cast<float>(oldBoundary / newBoundary);
+                            note.consonantSeconds = newBoundary;
+                            note.utauPreutteranceSeconds = newBoundary;
+                        }
                         note.utauConsonantVelocity = velocity;
                         changed = true;
                     }
@@ -4059,6 +4305,31 @@ void ProjectModel::toggleNoteConnection(const juce::String& noteId)
                         && ordered[index - 1].note->connectedToNext;
                     ordered[index].note->connectedToPrevious = !connected;
                     ordered[index - 1].note->connectedToNext = !connected;
+                    if (connected)
+                    {
+                        std::erase_if(project.nativeConnections,
+                            [&](const auto& connection)
+                            {
+                                return connection.leftNoteId == ordered[index - 1].note->id
+                                    && connection.rightNoteId == ordered[index].note->id;
+                            });
+                    }
+                    else
+                    {
+                        std::erase_if(project.nativeConnections,
+                            [&](const auto& connection)
+                            {
+                                return connection.leftNoteId == ordered[index - 1].note->id
+                                    || connection.rightNoteId == ordered[index - 1].note->id
+                                    || connection.leftNoteId == ordered[index].note->id
+                                    || connection.rightNoteId == ordered[index].note->id;
+                            });
+                        project.nativeConnections.push_back({
+                            makeId("connection"), ordered[index - 1].note->id,
+                            ordered[index].note->id, "pitch-and-amplitude",
+                            (ordered[index - 1].start + ordered[index].start) * 0.5,
+                            {}, {} });
+                    }
                     changed = true;
                     break;
                 }
@@ -4092,7 +4363,13 @@ void ProjectModel::applySourceSettings(const juce::File& source,
             auto& clip = *entries[index].clip;
             auto& note = *entries[index].note;
             const auto& row = rows[index];
-            note.label = row.name.trim();
+            note.label = row.name.trim().isEmpty() ? "-" : row.name.trim();
+            note.nativeRole = row.role;
+            note.nativeProvenance = row.provenance;
+            note.nativeConfidence = row.confidence;
+            note.nativeSourceStartSeconds = row.regionStartSeconds;
+            note.nativeSourceEndSeconds = row.regionEndSeconds;
+            note.nativeSegments = SampleSettings::nativeSegmentsFor(row);
             clip.sourceOffsetSeconds = std::max(0.0, row.regionStartSeconds);
             clip.sourceDurationSeconds = std::max(0.001,
                 row.regionEndSeconds - row.regionStartSeconds);
@@ -4105,6 +4382,19 @@ void ProjectModel::applySourceSettings(const juce::File& source,
             const auto targetPerSource = clip.durationSeconds / clip.sourceDurationSeconds;
             note.consonantSeconds = juce::jlimit(0.0, note.durationSeconds,
                 row.fixedDurationSeconds * targetPerSource);
+            note.utauPreutteranceOverrideEnabled = true;
+            note.utauPreutteranceSeconds = std::max(0.0,
+                (row.alignmentSeconds - row.regionStartSeconds) * targetPerSource);
+            note.utauOverlapOverrideEnabled = std::abs(row.overlapSeconds) > 1.0e-9;
+            note.utauOverlapSeconds = row.overlapSeconds * targetPerSource;
+            note.amplitudeEnvelope = row.amplitudeEnvelope;
+            if (note.amplitudeEnvelope.empty() && row.melodyneAmplitude > 1.0e-6)
+            {
+                const auto gainDb = static_cast<float>(20.0
+                    * std::log10(row.melodyneAmplitude));
+                note.amplitudeEnvelope = { { 0.0, gainDb },
+                    { note.durationSeconds, gainDb } };
+            }
             if (note.sourceMidiCenter >= 0.0f)
                 note.midiNote = juce::jlimit(0.0f, 127.0f,
                     note.sourceMidiCenter + static_cast<float>(row.relativePitchCents / 100.0));
@@ -4132,7 +4422,8 @@ juce::ValueTree ProjectModel::toValueTree(const juce::File& projectFile) const
 {
     const auto data = snapshot();
     juce::ValueTree root("HachiShifterProject");
-    root.setProperty("version", 13, nullptr);
+    root.setProperty("version", 14, nullptr);
+    root.setProperty("nativeSchemaVersion", 2, nullptr);
     root.setProperty("name", data.name, nullptr);
     root.setProperty("bpm", data.bpm, nullptr);
     root.setProperty("beatOriginSeconds", data.beatOriginSeconds, nullptr);
@@ -4148,6 +4439,36 @@ juce::ValueTree ProjectModel::toValueTree(const juce::File& projectFile) const
         tempoTree.setProperty("quarterPosition", change.quarterPosition, nullptr);
         tempoTree.setProperty("bpm", change.bpm, nullptr);
         root.addChild(tempoTree, -1, nullptr);
+    }
+
+    for (const auto& connection : data.nativeConnections)
+    {
+        juce::ValueTree connectionTree("NativeConnection");
+        connectionTree.setProperty("id", connection.id, nullptr);
+        connectionTree.setProperty("leftNoteId", connection.leftNoteId, nullptr);
+        connectionTree.setProperty("rightNoteId", connection.rightNoteId, nullptr);
+        connectionTree.setProperty("type", connection.type, nullptr);
+        connectionTree.setProperty("boundarySeconds", connection.boundarySeconds, nullptr);
+        for (const auto& point : connection.pitchCurve)
+        {
+            juce::ValueTree pointTree("PitchCurvePoint");
+            pointTree.setProperty("timeSeconds", point.timeSeconds, nullptr);
+            pointTree.setProperty("targetMidi", point.targetMidi, nullptr);
+            pointTree.setProperty("shape", pitchCurveShapeName(point.shape), nullptr);
+            pointTree.setProperty("bezierX1", point.bezierX1, nullptr);
+            pointTree.setProperty("bezierY1", point.bezierY1, nullptr);
+            pointTree.setProperty("bezierX2", point.bezierX2, nullptr);
+            pointTree.setProperty("bezierY2", point.bezierY2, nullptr);
+            connectionTree.addChild(pointTree, -1, nullptr);
+        }
+        for (const auto& point : connection.amplitudeCurve)
+        {
+            juce::ValueTree pointTree("AmplitudeCurvePoint");
+            pointTree.setProperty("timeSeconds", point.timeSeconds, nullptr);
+            pointTree.setProperty("gainDb", point.gainDb, nullptr);
+            connectionTree.addChild(pointTree, -1, nullptr);
+        }
+        root.addChild(connectionTree, -1, nullptr);
     }
 
     for (const auto& track : data.tracks)
@@ -4221,6 +4542,13 @@ juce::ValueTree ProjectModel::toValueTree(const juce::File& projectFile) const
                 juce::ValueTree noteTree("Note");
                 noteTree.setProperty("id", note.id, nullptr);
                 noteTree.setProperty("label", note.label, nullptr);
+                noteTree.setProperty("nativeRole", nativeSegmentRoleName(note.nativeRole), nullptr);
+                noteTree.setProperty("nativeProvenance", note.nativeProvenance, nullptr);
+                noteTree.setProperty("nativeConfidence", note.nativeConfidence, nullptr);
+                noteTree.setProperty("nativeSourceStartSeconds",
+                    note.nativeSourceStartSeconds, nullptr);
+                noteTree.setProperty("nativeSourceEndSeconds",
+                    note.nativeSourceEndSeconds, nullptr);
                 noteTree.setProperty("utauFlags", note.utauFlags, nullptr);
                 noteTree.setProperty("vibratoEnabled", note.vibratoEnabled, nullptr);
                 noteTree.setProperty("vibratoLengthPercent", note.vibratoLengthPercent, nullptr);
@@ -4260,6 +4588,10 @@ juce::ValueTree ProjectModel::toValueTree(const juce::File& projectFile) const
                 noteTree.setProperty("startSeconds", note.startSeconds, nullptr);
                 noteTree.setProperty("durationSeconds", note.durationSeconds, nullptr);
                 noteTree.setProperty("consonantSeconds", note.consonantSeconds, nullptr);
+                noteTree.setProperty("melodyneConsonantCandidate",
+                    note.melodyneConsonantCandidate, nullptr);
+                noteTree.setProperty("melodyneVowelNoteId",
+                    note.melodyneVowelNoteId, nullptr);
                 noteTree.setProperty("midiNote", note.midiNote, nullptr);
                 noteTree.setProperty("sourceMidiCenter", note.sourceMidiCenter, nullptr);
                 noteTree.setProperty("modulation", note.modulation, nullptr);
@@ -4301,6 +4633,22 @@ juce::ValueTree ProjectModel::toValueTree(const juce::File& projectFile) const
                     pointTree.setProperty("timeSeconds", point.timeSeconds, nullptr);
                     pointTree.setProperty("gainDb", point.gainDb, nullptr);
                     noteTree.addChild(pointTree, -1, nullptr);
+                }
+                for (const auto& segment : note.nativeSegments)
+                {
+                    juce::ValueTree segmentTree("NativeSegment");
+                    segmentTree.setProperty("id", segment.id, nullptr);
+                    segmentTree.setProperty("alias", segment.alias, nullptr);
+                    segmentTree.setProperty("role", nativeSegmentRoleName(segment.role), nullptr);
+                    segmentTree.setProperty("sourceStartSeconds", segment.sourceStartSeconds, nullptr);
+                    segmentTree.setProperty("sourceEndSeconds", segment.sourceEndSeconds, nullptr);
+                    segmentTree.setProperty("provenance", segment.provenance, nullptr);
+                    segmentTree.setProperty("confidence", segment.confidence, nullptr);
+                    segmentTree.setProperty("alignmentSeconds", segment.alignmentSeconds, nullptr);
+                    segmentTree.setProperty("overlapSeconds", segment.overlapSeconds, nullptr);
+                    segmentTree.setProperty("stretchable", segment.stretchable, nullptr);
+                    segmentTree.setProperty("stretchWeight", segment.stretchWeight, nullptr);
+                    noteTree.addChild(segmentTree, -1, nullptr);
                 }
                 for (const auto& curve : note.utauFlagCurves)
                 for (const auto& point : curve.points)
@@ -4393,6 +4741,35 @@ ProjectData ProjectModel::fromValueTree(const juce::ValueTree& root,
             return left.quarterPosition < right.quarterPosition;
         });
 
+    for (const auto connectionTree : root)
+        if (connectionTree.hasType("NativeConnection"))
+        {
+            NativeConnection connection;
+            connection.id = connectionTree.getProperty("id").toString();
+            connection.leftNoteId = connectionTree.getProperty("leftNoteId").toString();
+            connection.rightNoteId = connectionTree.getProperty("rightNoteId").toString();
+            connection.type = connectionTree.getProperty("type", "pitch-and-amplitude").toString();
+            connection.boundarySeconds = static_cast<double>(
+                connectionTree.getProperty("boundarySeconds", 0.0));
+            for (const auto pointTree : connectionTree)
+            {
+                if (pointTree.hasType("PitchCurvePoint"))
+                    connection.pitchCurve.push_back({
+                        static_cast<double>(pointTree.getProperty("timeSeconds", 0.0)),
+                        static_cast<float>(pointTree.getProperty("targetMidi", 60.0)),
+                        parsePitchCurveShape(pointTree.getProperty("shape", "natural").toString()),
+                        static_cast<float>(pointTree.getProperty("bezierX1", 0.33)),
+                        static_cast<float>(pointTree.getProperty("bezierY1", 0.0)),
+                        static_cast<float>(pointTree.getProperty("bezierX2", 0.67)),
+                        static_cast<float>(pointTree.getProperty("bezierY2", 1.0)) });
+                else if (pointTree.hasType("AmplitudeCurvePoint"))
+                    connection.amplitudeCurve.push_back({
+                        static_cast<double>(pointTree.getProperty("timeSeconds", 0.0)),
+                        static_cast<float>(pointTree.getProperty("gainDb", 0.0)) });
+            }
+            data.nativeConnections.push_back(std::move(connection));
+        }
+
     for (const auto trackTree : root)
     {
         if (!trackTree.hasType("Track")) continue;
@@ -4465,6 +4842,15 @@ ProjectData ProjectModel::fromValueTree(const juce::ValueTree& root,
                 NoteData note;
                 note.id = noteTree.getProperty("id").toString();
                 note.label = noteTree.getProperty("label").toString();
+                note.nativeRole = parseNativeSegmentRole(
+                    noteTree.getProperty("nativeRole", "unknown").toString());
+                note.nativeProvenance = noteTree.getProperty("nativeProvenance", "estimated").toString();
+                note.nativeConfidence = static_cast<float>(
+                    noteTree.getProperty("nativeConfidence", 0.0));
+                note.nativeSourceStartSeconds = static_cast<double>(
+                    noteTree.getProperty("nativeSourceStartSeconds", -1.0));
+                note.nativeSourceEndSeconds = static_cast<double>(
+                    noteTree.getProperty("nativeSourceEndSeconds", -1.0));
                 note.utauFlags = noteTree.getProperty("utauFlags").toString();
                 const auto storedVelocity = static_cast<int>(
                     noteTree.getProperty("utauConsonantVelocity", -1));
@@ -4516,6 +4902,10 @@ ProjectData ProjectModel::fromValueTree(const juce::ValueTree& root,
                 note.startSeconds = static_cast<double>(noteTree.getProperty("startSeconds", 0.0));
                 note.durationSeconds = static_cast<double>(noteTree.getProperty("durationSeconds", 0.25));
                 note.consonantSeconds = static_cast<double>(noteTree.getProperty("consonantSeconds", 0.04));
+                note.melodyneConsonantCandidate = static_cast<bool>(
+                    noteTree.getProperty("melodyneConsonantCandidate", false));
+                note.melodyneVowelNoteId = noteTree.getProperty(
+                    "melodyneVowelNoteId").toString();
                 note.midiNote = static_cast<float>(noteTree.getProperty("midiNote", 60.0));
                 note.sourceMidiCenter = static_cast<float>(noteTree.getProperty("sourceMidiCenter", -1.0));
                 note.modulation = static_cast<float>(noteTree.getProperty("modulation", 1.0));
@@ -4555,6 +4945,19 @@ ProjectData ProjectModel::fromValueTree(const juce::ValueTree& root,
                             static_cast<double>(child.getProperty("timeSeconds", 0.0)),
                             juce::jlimit(-60.0f, 12.0f,
                                 static_cast<float>(child.getProperty("gainDb", 0.0))) });
+                    else if (child.hasType("NativeSegment"))
+                        note.nativeSegments.push_back({
+                            child.getProperty("id", "segment").toString(),
+                            child.getProperty("alias", "-").toString(),
+                            parseNativeSegmentRole(child.getProperty("role", "unknown").toString()),
+                            static_cast<double>(child.getProperty("sourceStartSeconds", 0.0)),
+                            static_cast<double>(child.getProperty("sourceEndSeconds", 0.0)),
+                            child.getProperty("provenance", "estimated").toString(),
+                            static_cast<float>(child.getProperty("confidence", 0.0)),
+                            static_cast<double>(child.getProperty("alignmentSeconds", 0.0)),
+                            static_cast<double>(child.getProperty("overlapSeconds", 0.0)),
+                            static_cast<bool>(child.getProperty("stretchable", true)),
+                            static_cast<double>(child.getProperty("stretchWeight", 1.0)) });
                     // "FlagCurveG" is how the g curve was written before any
                     // other flag could have one; it reads as the g curve.
                     else if (child.hasType("FlagCurvePoint")

@@ -506,9 +506,24 @@ sourceChain(const Graph& graph, std::uint32_t element)
 juce::File resolveMedia(const juce::String& stored, const juce::File& projectDirectory,
                         const std::map<juce::String, juce::File>& media)
 {
-    const juce::File direct(stored);
-    if (direct.existsAsFile()) return direct;
     const auto normalized = stored.replaceCharacter('\\', '/');
+#if JUCE_LINUX
+    // MPD stores Windows absolute paths even when opened through WSL. Resolve
+    // the exact drive path before basename search (which can select a different
+    // recording with the same name).
+    if (normalized.length() >= 3 && normalized[1] == ':' && normalized[2] == '/')
+    {
+        const auto drive = normalized.substring(0, 1).toLowerCase();
+        const auto mounted = juce::File("/mnt").getChildFile(drive)
+            .getChildFile(normalized.substring(3));
+        if (mounted.existsAsFile()) return mounted;
+    }
+#endif
+    if (juce::File::isAbsolutePath(normalized))
+    {
+        const juce::File direct(normalized);
+        if (direct.existsAsFile()) return direct;
+    }
     const auto relative = projectDirectory.getChildFile(normalized);
     if (relative.existsAsFile()) return relative;
     const auto name = juce::File(normalized).getFileName();
@@ -647,6 +662,41 @@ MelodyneImporter::consonantCandidates(const std::vector<NoteData>& notes)
     return mappings;
 }
 
+juce::var MelodyneImporter::inspectTracks(const juce::File& file, juce::String& error)
+{
+    auto bytes = decodeGraph(file, error, {});
+    Graph graph;
+    if (!bytes || !graph.parse(std::move(*bytes), error)) return {};
+    juce::Array<juce::var> tracks;
+    for (std::uint32_t id = 0; id < graph.objectCount(); ++id)
+    {
+        const auto className = juce::String(graph.className(id));
+        if (!className.containsIgnoreCase("track")) continue;
+        auto* row = new juce::DynamicObject();
+        row->setProperty("object_id", static_cast<int>(id));
+        row->setProperty("class", className);
+        row->setProperty("title", graph.stringField(id, "title"));
+        row->setProperty("name", graph.stringField(id, "name"));
+        const auto elements = graph.reference(id, "elements");
+        row->setProperty("elements", elements ? static_cast<int>(graph.list(*elements).size()) : 0);
+        juce::StringArray media;
+        if (elements)
+            for (const auto element : graph.list(*elements))
+                if (const auto chain = sourceChain(graph, element))
+                {
+                    const auto [source, item, description] = *chain;
+                    juce::ignoreUnused(item, description);
+                    if (const auto path = graph.reference(source, "filePath"))
+                        media.addIfNotAlreadyThere(graph.stringField(*path, "posixPath"));
+                }
+        row->setProperty("media", media.joinIntoString("\n"));
+        const auto children = graph.reference(id, "subtracks");
+        row->setProperty("subtracks", children ? static_cast<int>(graph.list(*children).size()) : 0);
+        tracks.add(juce::var(row));
+    }
+    return tracks;
+}
+
 std::optional<MelodyneImportResult> MelodyneImporter::importProject(
     const juce::File& file, juce::String& error, Progress progress,
     MelodyneImportOptions options)
@@ -720,7 +770,7 @@ std::optional<MelodyneImportResult> MelodyneImporter::importProject(
         }
         const auto analyzer = graph.stringField(trackId, "defaultAnalyzerParameterSetIdenfier").toLowerCase();
         track.compose = analyzer.contains(".melodic");
-        track.pitchAlgorithm = PitchAlgorithm::mld5;
+        track.pitchAlgorithm = defaultPitchAlgorithm();
         track.stretchAlgorithm = StretchAlgorithm::melodyneHybrid;
 
         const auto elementList = graph.reference(trackId, "elements");
@@ -853,6 +903,18 @@ std::optional<MelodyneImportResult> MelodyneImporter::importProject(
                 graph.number(element, "sibilantBalance").value_or(0.0), 0.0, 1.0));
             note.attackSpeed = static_cast<float>(std::max(1.0e-6,
                 graph.number(element, "sourceTimeForElementTimeFunctionAttackSlope").value_or(1.0)));
+            // Melodyne stores its element gain and fade limits separately from
+            // the pitch object.  Carry the simple envelope into the native
+            // layer so the HJM conversion does not lose note-level decay.
+            const auto gainDb = note.gain > 1.0e-6f
+                ? juce::jlimit(-60.0f, 12.0f,
+                    static_cast<float>(20.0 * std::log10(note.gain))) : -60.0f;
+            const auto fadeIn = juce::jlimit(0.0, duration, clip.fadeInSeconds);
+            const auto fadeOut = juce::jlimit(0.0, duration, clip.fadeOutSeconds);
+            note.amplitudeEnvelope = { { 0.0, fadeIn > 1.0e-9 ? -60.0f : gainDb },
+                { fadeIn, gainDb },
+                { std::max(fadeIn, duration - fadeOut), gainDb },
+                { duration, fadeOut > 1.0e-9 ? -60.0f : gainDb } };
             const auto robustFields = { "robustPitchCurve", "robustPitchCurveSwitch",
                 "robustPitchCurveEnabled", "useRobustPitchCurve",
                 "usesRobustPitchCurve", "isRobustPitchCurveEnabled" };
@@ -958,6 +1020,8 @@ std::optional<MelodyneImportResult> MelodyneImporter::importProject(
                 note.formantSemitones = 0.0f;
                 note.breath = 0.0f;
                 note.gain = 1.0f;
+                note.amplitudeEnvelope = { { 0.0, 0.0f },
+                    { note.durationSeconds, 0.0f } };
                 note.attackSpeed = 1.0f;
                 note.connectedToPrevious = false;
                 note.connectedToNext = false;

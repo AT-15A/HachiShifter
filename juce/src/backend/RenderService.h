@@ -39,7 +39,7 @@ struct Mld5FileRenderRequest
     std::vector<TimeMapPoint> timeMap;
     juce::File hifiganModelDirectory;
     OrtExecutionConfig inference;
-    PitchRenderBackend pitchBackend = PitchRenderBackend::mld5;
+    PitchRenderBackend pitchBackend = PitchRenderBackend::llsm2;
     int stretchAlgorithm = 0;
     bool normalizeVolume = false;
     bool matchNsfSourceLevel = false;

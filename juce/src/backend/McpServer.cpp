@@ -168,6 +168,28 @@ juce::var sampleRowsJson(const std::vector<SampleRegionSetting>& rows)
         set(value, "melodyne_sibilant_balance", row.melodyneSibilantBalance);
         set(value, "melodyne_attack_seconds", row.melodyneAttackSeconds);
         set(value, "melodyne_decay_elongation", row.melodyneDecayElongation);
+        set(value, "hjm_version", row.hjmVersion);
+        set(value, "native_role", nativeSegmentRoleName(row.role));
+        set(value, "native_provenance", row.provenance);
+        set(value, "native_confidence", row.confidence);
+        std::vector<juce::var> segmentValues;
+        for (const auto& segment : row.segments)
+        {
+            auto segmentValue = object();
+            set(segmentValue, "id", segment.id);
+            set(segmentValue, "alias", segment.alias);
+            set(segmentValue, "role", nativeSegmentRoleName(segment.role));
+            set(segmentValue, "source_start_seconds", segment.sourceStartSeconds);
+            set(segmentValue, "source_end_seconds", segment.sourceEndSeconds);
+            set(segmentValue, "provenance", segment.provenance);
+            set(segmentValue, "confidence", segment.confidence);
+            set(segmentValue, "alignment_seconds", segment.alignmentSeconds);
+            set(segmentValue, "overlap_seconds", segment.overlapSeconds);
+            set(segmentValue, "stretchable", segment.stretchable);
+            set(segmentValue, "stretch_weight", segment.stretchWeight);
+            segmentValues.push_back(std::move(segmentValue));
+        }
+        set(value, "native_segments", array(std::move(segmentValues)));
         values.push_back(std::move(value));
     }
     return array(std::move(values));
@@ -198,6 +220,23 @@ std::vector<SampleRegionSetting> sampleRowsFromJson(const juce::var& source)
             row.melodyneSibilantBalance = number(value, "melodyne_sibilant_balance");
             row.melodyneAttackSeconds = number(value, "melodyne_attack_seconds");
             row.melodyneDecayElongation = number(value, "melodyne_decay_elongation");
+            row.hjmVersion = static_cast<int>(number(value, "hjm_version", 1.0));
+            row.role = parseNativeSegmentRole(string(value, "native_role"));
+            row.provenance = string(value, "native_provenance");
+            row.confidence = static_cast<float>(number(value, "native_confidence"));
+            if (const auto* segments = value.getProperty("native_segments", {}).getArray())
+                for (const auto& segmentValue : *segments)
+                    row.segments.push_back({
+                        string(segmentValue, "id"), string(segmentValue, "alias"),
+                        parseNativeSegmentRole(string(segmentValue, "role")),
+                        number(segmentValue, "source_start_seconds"),
+                        number(segmentValue, "source_end_seconds"),
+                        string(segmentValue, "provenance"),
+                        static_cast<float>(number(segmentValue, "confidence")),
+                        number(segmentValue, "alignment_seconds"),
+                        number(segmentValue, "overlap_seconds"),
+                        static_cast<bool>(segmentValue.getProperty("stretchable", true)),
+                        number(segmentValue, "stretch_weight", 1.0) });
             if (row.regionEndSeconds > row.regionStartSeconds)
                 rows.push_back(std::move(row));
         }
@@ -371,8 +410,14 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
         {
             if (auto imported = MelodyneImporter::importProject(file, error))
             {
+                juce::StringArray annotationWarnings;
+                SampleSettings::convertMelodyneProject(imported->project,
+                                                       annotationWarnings);
                 project.replace(std::move(imported->project));
-                return toolResult(summary(project.snapshot()));
+                return toolResult(summary(project.snapshot())
+                    + (annotationWarnings.isEmpty() ? juce::String()
+                        : "; annotation_warnings="
+                            + annotationWarnings.joinIntoString(" | ")));
             }
         }
         else if (file.hasFileExtension("mid;midi"))
@@ -459,8 +504,14 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
                 (void) AnalysisService::reanalyseProjectSourcePitch(
                     imported->project, analysisConfig(args), pitchError);
             }
+            juce::StringArray annotationWarnings;
+            SampleSettings::convertMelodyneProject(imported->project,
+                                                   annotationWarnings);
             project.replace(std::move(imported->project));
-            return toolResult(summary(project.snapshot()));
+            return toolResult(summary(project.snapshot())
+                + (annotationWarnings.isEmpty() ? juce::String()
+                    : "; annotation_warnings="
+                        + annotationWarnings.joinIntoString(" | ")));
         }
     }
     else if (name == "set_tempo")
@@ -478,6 +529,17 @@ juce::var McpServer::callTool(const juce::String& name, const juce::var& args)
     else if (name == "set_track")
     {
         const auto id = string(args, "track_id");
+        if (args.hasProperty("pitch_algorithm"))
+        {
+            const auto chosen = string(args, "pitch_algorithm").toLowerCase();
+            if (chosen == "mld5" || chosen == "mld3")
+                return toolResult(chosen + " is disabled (incomplete algorithm)", true);
+            if (chosen == "vslib")
+                return toolResult("vslib native implementation is not integrated", true);
+            if (chosen != "nsf-hifigan" && chosen != "world" && chosen != "llsm2"
+                && chosen != "utau" && chosen != "utau4" && chosen != "utaumou")
+                return toolResult("Unknown pitch algorithm: " + chosen, true);
+        }
         if (args.hasProperty("name")) project.setTrackName(id, string(args, "name"));
         if (args.hasProperty("utau_global_flags"))
             project.setTrackUtauGlobalFlags(id, string(args, "utau_global_flags"));
@@ -1015,6 +1077,18 @@ juce::var McpServer::projectJson() const
     set(root, "denominator", data.denominator);
     set(root, "grid", data.gridDivision);
     set(root, "base_scale", data.baseScale);
+    std::vector<juce::var> nativeConnections;
+    for (const auto& connection : data.nativeConnections)
+    {
+        auto value = object();
+        set(value, "id", connection.id);
+        set(value, "left_note_id", connection.leftNoteId);
+        set(value, "right_note_id", connection.rightNoteId);
+        set(value, "type", connection.type);
+        set(value, "boundary_seconds", connection.boundarySeconds);
+        nativeConnections.push_back(std::move(value));
+    }
+    set(root, "native_connections", array(std::move(nativeConnections)));
     std::vector<juce::var> tracks;
     for (const auto& track : data.tracks)
     {
@@ -1066,6 +1140,27 @@ juce::var McpServer::projectJson() const
                 auto noteValue = object();
                 set(noteValue, "id", note.id);
                 set(noteValue, "label", note.label);
+                set(noteValue, "native_role", nativeSegmentRoleName(note.nativeRole));
+                set(noteValue, "native_provenance", note.nativeProvenance);
+                set(noteValue, "native_confidence", note.nativeConfidence);
+                std::vector<juce::var> nativeSegments;
+                for (const auto& segment : note.nativeSegments)
+                {
+                    auto segmentValue = object();
+                    set(segmentValue, "id", segment.id);
+                    set(segmentValue, "alias", segment.alias);
+                    set(segmentValue, "role", nativeSegmentRoleName(segment.role));
+                    set(segmentValue, "source_start_seconds", segment.sourceStartSeconds);
+                    set(segmentValue, "source_end_seconds", segment.sourceEndSeconds);
+                    set(segmentValue, "provenance", segment.provenance);
+                    set(segmentValue, "confidence", segment.confidence);
+                    set(segmentValue, "alignment_seconds", segment.alignmentSeconds);
+                    set(segmentValue, "overlap_seconds", segment.overlapSeconds);
+                    set(segmentValue, "stretchable", segment.stretchable);
+                    set(segmentValue, "stretch_weight", segment.stretchWeight);
+                    nativeSegments.push_back(std::move(segmentValue));
+                }
+                set(noteValue, "native_segments", array(std::move(nativeSegments)));
                 set(noteValue, "start_seconds", note.startSeconds);
                 set(noteValue, "duration_seconds", note.durationSeconds);
                 set(noteValue, "consonant_seconds", note.consonantSeconds);
@@ -1170,7 +1265,8 @@ bool McpServer::waitForRender(double timeoutSeconds, juce::String& error)
         }
         juce::Thread::sleep(10);
     }
-    return true;
+    error = audio->activeRenderWarnings();
+    return error.isEmpty();
 }
 
 juce::var McpServer::transportStatusJson() const
@@ -1180,6 +1276,7 @@ juce::var McpServer::transportStatusJson() const
     const auto prepared = audioPrepared && fingerprint == preparedFingerprint;
     const auto progress = prepared ? audio->renderProgress() : std::optional<double>();
     set(value, "prepared", prepared);
+    set(value, "merged_phrase_count", audio->diagnosticMergedPhraseCount());
     set(value, "rendering", progress.has_value());
     set(value, "render_progress", progress.has_value() ? *progress : (prepared ? 1.0 : 0.0));
     set(value, "backend", prepared ? audio->activeRenderBackends() : juce::String());

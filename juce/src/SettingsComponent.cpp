@@ -1,4 +1,5 @@
 #include "SettingsComponent.h"
+#include "backend/NsfHifiganRenderer.h"
 #include <cmath>
 
 namespace hachi
@@ -156,12 +157,13 @@ SettingsComponent::SettingsComponent(I18n& stringsToUse,
     melodyneCompose.addItem("Audio only", 4);
     melodynePitchSource.addItem("Project data", 1);
     melodynePitchSource.addItem("GAME + FCPE / Native fallback", 2);
-    importedAlgorithm.addItem("mld5", 1);
     importedAlgorithm.addItem("nsf-hifigan", 2);
     importedAlgorithm.addItem("WORLD", 3);
-    importedAlgorithm.addItem("vslib", 4);
     importedAlgorithm.addItem("llsm2", 6);
-    refreshImportedStretchItems(1);
+    const auto configuredHifigan = juce::File(properties.getValue("algorithm.hifiganPath"));
+    const auto defaultImportedAlgorithm = backend::NsfHifiganRenderer::modelAvailable(
+        configuredHifigan) ? 2 : 6;
+    refreshImportedStretchItems(defaultImportedAlgorithm);
     importedAlgorithm.onChange = [this]
     {
         refreshImportedStretchItems(importedStretchAlgorithm.getSelectedId());
@@ -238,9 +240,13 @@ void SettingsComponent::loadValues()
     confirmDestructive.setToggleState(properties.getBoolValue("operation.confirmDestructive", true), juce::dontSendNotification);
     melodyneCompose.setSelectedId(properties.getIntValue("import.melodyneCompose", 1), juce::dontSendNotification);
     melodynePitchSource.setSelectedId(properties.getIntValue("import.melodynePitchSource", 1), juce::dontSendNotification);
-    const auto importedAlgorithmId = properties.getIntValue("import.algorithm", 1);
+    const auto configuredHifigan = juce::File(properties.getValue("algorithm.hifiganPath"));
+    const auto defaultImportedAlgorithm = backend::NsfHifiganRenderer::modelAvailable(
+        configuredHifigan) ? 2 : 6;
+    const auto importedAlgorithmId = properties.getIntValue("import.algorithm",
+        defaultImportedAlgorithm);
     importedAlgorithm.setSelectedId(importedAlgorithm.indexOfItemId(importedAlgorithmId) >= 0
-        ? importedAlgorithmId : 1, juce::dontSendNotification);
+        ? importedAlgorithmId : defaultImportedAlgorithm, juce::dontSendNotification);
     refreshImportedStretchItems(properties.getIntValue("import.stretchAlgorithm", 1));
     preserveProjectEdits.setToggleState(properties.getBoolValue("import.preserveEdits", true), juce::dontSendNotification);
     locateMediaRecursively.setToggleState(properties.getBoolValue("import.recursiveMedia", true), juce::dontSendNotification);
