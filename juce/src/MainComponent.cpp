@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include "StartupLog.h"
 #include "backend/NsfHifiganRenderer.h"
 #include "OtoWaveformEditorComponent.h"
 #include <algorithm>
@@ -122,6 +123,7 @@ MainComponent::MainComponent()
     : tooltipWindow(this, 450), menuBar(this), progressBar(progress),
       trackList(project, strings), timeline(project), pianoRoll(project, strings)
 {
+    startupLog("MainComponent: members constructed");
     juce::PropertiesFile::Options options;
     options.applicationName = "HachiShifterNext";
     options.filenameSuffix = "settings";
@@ -129,10 +131,12 @@ MainComponent::MainComponent()
     options.osxLibrarySubFolder = "Application Support";
     options.storageFormat = juce::PropertiesFile::storeAsXML;
     preferences = std::make_unique<juce::PropertiesFile>(options);
+    startupLog("MainComponent: preferences opened");
     restoreRecentProjects();
     savedProjectRevision = project.revisionNumber();
     audio.restoreDeviceState(*preferences);
     applyPreferences();
+    startupLog("MainComponent: preferences applied");
     setLookAndFeel(&lookAndFeel);
     setOpaque(true);
     setWantsKeyboardFocus(true);

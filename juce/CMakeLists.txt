@@ -30,6 +30,13 @@ if(WIN32)
     if(NOT HACHI_WINDOWING_SOURCE MATCHES "parentHWND, false, 0")
         message(FATAL_ERROR "JUCE Windows software-peer patch no longer matches")
     endif()
+    # GDI's onVBlank is a no-op. Do not create a DXGI display-wait thread for
+    # this software-only host: WaitForVBlank can block inside vendor drivers
+    # even when the main window never uses Direct2D.
+    string(REPLACE
+        "VBlankDispatcher::getInstance()->updateDisplay (*this, currentMonitor);"
+        "(void) currentMonitor; // HachiShifter software rendering: no DXGI wait thread"
+        HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
     file(WRITE "${HACHI_WINDOWING_FILE}" "${HACHI_WINDOWING_SOURCE}")
     set(HACHI_VBLANK_FILE "${juce_SOURCE_DIR}/modules/juce_gui_basics/native/juce_VBlank_windows.cpp")
     file(READ "${HACHI_VBLANK_FILE}" HACHI_VBLANK_SOURCE)

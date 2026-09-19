@@ -1,4 +1,5 @@
 #include "AudioEngine.h"
+#include "StartupLog.h"
 #include "backend/MelodyneProvider.h"
 #include <algorithm>
 #include <cmath>
@@ -893,6 +894,7 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
 
 AudioEngine::AudioEngine()
 {
+    startupLog("AudioEngine: construct");
     // Before anyone says otherwise, the engine that travels with the
     // application is the one to use.  Without this a headless caller that
     // never sets a resampler renders through the built-in fallback and sounds
@@ -901,7 +903,9 @@ AudioEngine::AudioEngine()
         juce::File::currentExecutableFile).getParentDirectory());
     formatManager.registerBasicFormats();
     sourcePlayer.setSource(this);
+    startupLog("AudioEngine: opening default devices");
     deviceManager.initialiseWithDefaultDevices(0, 2);
+    startupLog("AudioEngine: default devices returned");
     deviceManager.addAudioCallback(&sourcePlayer);
 }
 
@@ -939,7 +943,9 @@ bool AudioEngine::ensureOutputDevice(juce::String& error)
     // endpoint enabled, or Windows device service restarted).  Retry here so
     // Play does not enter a false playing state with no callback to advance
     // the transport.
+    startupLog("AudioEngine: opening output device");
     error = deviceManager.initialiseWithDefaultDevices(0, 2);
+    startupLog("AudioEngine: device initialisation returned: " + error);
     if (hasOutput())
     {
         error.clear();
@@ -955,9 +961,9 @@ void AudioEngine::restoreDeviceState(juce::PropertiesFile& properties)
     if (saved.isEmpty()) return;
     const auto xml = juce::parseXML(saved);
     if (xml == nullptr) return;
-    // Keep the application usable if a previously selected interface has
-    // been unplugged; JUCE then selects the current system default.
+    startupLog("AudioEngine: restoring saved device");
     deviceManager.initialise(0, 2, xml.get(), true);
+    startupLog("AudioEngine: saved device returned");
 }
 
 void AudioEngine::saveDeviceState(juce::PropertiesFile& properties) const

@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include "StartupLog.h"
 #include "backend/McpServer.h"
 #include "backend/AnalysisService.h"
 #include "backend/NativeAnalyzer.h"
@@ -31,6 +32,7 @@ public:
 
     void initialise(const juce::String& commandLine) override
     {
+        startupLog("Application: initialise " + getApplicationVersion());
         auto arguments = juce::StringArray::fromTokens(commandLine, true);
         if (!arguments.isEmpty() && arguments[0] == "--mcp")
         {
@@ -11138,6 +11140,7 @@ private:
             : DocumentWindow(name, Palette::background, DocumentWindow::allButtons, false)
         {
             setUsingNativeTitleBar(true);
+            startupLog("MainWindow: constructed, creating editor");
            #if JUCE_WINDOWS
             if (auto* peer = getPeer())
             {
@@ -11148,12 +11151,20 @@ private:
            #endif
             std::cerr << "startup: creating editor" << std::endl;
             setContentOwned(new MainComponent(), true);
+            startupLog("MainWindow: editor created");
             std::cerr << "startup: editor created" << std::endl;
+            startupLog("MainWindow: setResizable begin");
             setResizable(true, false);
+            startupLog("MainWindow: setResizeLimits begin");
             setResizeLimits(900, 560, 8192, 8192);
+            startupLog("MainWindow: centreWithSize begin");
             centreWithSize(1280, 760);
+            startupLog("MainWindow: addToDesktop begin");
             addToDesktop(getDesktopWindowStyleFlags());
+            startupLog("MainWindow: native peer created");
             setVisible(true);
+            startupLog("MainWindow: visible");
+            juce::MessageManager::callAsync([] { startupLog("Application: message loop responsive"); });
             std::cerr << "startup: window visible" << std::endl;
         }
 
