@@ -196,6 +196,12 @@ target_include_directories(HachiShifterNext PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith-stretch"
 )
 
+if(MSVC)
+    # Avoid relying on the newer constexpr mutex ABI during startup when an
+    # older compatible VC runtime (including Wine's implementation) is loaded.
+    target_compile_definitions(HachiShifterNext PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+endif()
+
 target_link_libraries(HachiShifterNext PRIVATE
     juce::juce_audio_formats
     juce::juce_audio_utils

@@ -34,6 +34,7 @@ jobs:
           cmake -S juce -B build-windows `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_EXE_LINKER_FLAGS=/MAP `
             -DFETCHCONTENT_BASE_DIR="$env:FETCH_CACHE"
 
       - name: Build
@@ -89,6 +90,12 @@ jobs:
             HachiShifterNext-windows-x64-no-model.zip
             HachiShifterNext-windows-x64-no-model.zip.sha256
           retention-days: 30
+
+      - name: Upload startup symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-link-map
+          path: build-windows/**/*.map
 
       - name: Probe Melodyne provider
         # Informational only: the runner has no Melodyne installation, so this
