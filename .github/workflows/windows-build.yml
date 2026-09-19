@@ -65,6 +65,13 @@ jobs:
 
           Copy-Item LICENSE "$stage/LICENSE"
 
+          # Bundle the redistributable CRT required by both the application
+          # and ONNX Runtime on machines without Visual Studio installed.
+          $crt = Get-ChildItem "$env:VCToolsRedistDir/x64" -Directory -Filter "Microsoft.VC*.CRT" |
+            Select-Object -First 1
+          if (-not $crt) { throw "MSVC redistributable CRT directory not found" }
+          Copy-Item "$($crt.FullName)/*.dll" $stage
+
           # Models stay out of the package, exactly as the GitLab job requires.
           if ((Get-ChildItem "$stage/models" -Recurse -File).Count -ne 0) {
             throw "The package must not ship model files"
