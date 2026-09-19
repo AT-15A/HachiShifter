@@ -17,6 +17,22 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(JUCE)
 
+# JUCE 8.0.8 creates Windows peers with Direct2D before application code can
+# choose an engine. Start with software rendering to avoid driver-dependent
+# hangs during DocumentWindow construction (reproduced with Wine/WSLg).
+if(WIN32)
+    set(HACHI_WINDOWING_FILE "${juce_SOURCE_DIR}/modules/juce_gui_basics/native/juce_Windowing_windows.cpp")
+    file(READ "${HACHI_WINDOWING_FILE}" HACHI_WINDOWING_SOURCE)
+    string(REPLACE
+        "new HWNDComponentPeer { *this, styleFlags, (HWND) parentHWND, false, 1 }"
+        "new HWNDComponentPeer { *this, styleFlags, (HWND) parentHWND, false, 0 }"
+        HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
+    if(NOT HACHI_WINDOWING_SOURCE MATCHES "parentHWND, false, 0")
+        message(FATAL_ERROR "JUCE Windows software-peer patch no longer matches")
+    endif()
+    file(WRITE "${HACHI_WINDOWING_FILE}" "${HACHI_WINDOWING_SOURCE}")
+endif()
+
 # GAME, FCPE and NSF-HiFiGAN use the official ONNX Runtime C++ API.  The runtime is part of
 # the application package, while the considerably larger model files remain in
 # the optional models/ directory.  Linux packages use CPU inference; Windows
