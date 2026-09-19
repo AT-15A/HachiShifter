@@ -11135,7 +11135,7 @@ private:
     {
     public:
         explicit MainWindow(const juce::String& name)
-            : DocumentWindow(name, Palette::background, DocumentWindow::allButtons)
+            : DocumentWindow(name, Palette::background, DocumentWindow::allButtons, false)
         {
             setUsingNativeTitleBar(true);
            #if JUCE_WINDOWS
@@ -11152,6 +11152,7 @@ private:
             setResizable(true, false);
             setResizeLimits(900, 560, 8192, 8192);
             centreWithSize(1280, 760);
+            addToDesktop(getDesktopWindowStyleFlags());
             setVisible(true);
             std::cerr << "startup: window visible" << std::endl;
         }
