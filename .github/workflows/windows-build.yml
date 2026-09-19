@@ -91,6 +91,35 @@ jobs:
             HachiShifterNext-windows-x64-no-model.zip.sha256
           retention-days: 30
 
+      - name: Verify GUI startup and responsiveness
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "HachiShifterNext-windows-x64/HachiShifterNext.exe").Path
+          $app = Start-Process $exe -PassThru -RedirectStandardError gui-startup.log
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "GUI exited during startup: $($app.ExitCode)" }
+              if ($app.MainWindowHandle -ne 0 -and $app.Responding) { $ready = $true; break }
+            }
+            if (-not $ready) { throw "GUI did not create a responsive window" }
+            Start-Sleep -Seconds 5
+            $app.Refresh()
+            if ($app.HasExited -or -not $app.Responding) { throw "GUI stopped responding" }
+            Get-Content gui-startup.log
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+
+      - name: Upload GUI startup log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-startup-log
+          path: gui-startup.log
+
       - name: Upload startup symbols
         uses: actions/upload-artifact@v4
         with:

@@ -31,6 +31,11 @@ if(WIN32)
         message(FATAL_ERROR "JUCE Windows software-peer patch no longer matches")
     endif()
     file(WRITE "${HACHI_WINDOWING_FILE}" "${HACHI_WINDOWING_SOURCE}")
+    set(HACHI_VBLANK_FILE "${juce_SOURCE_DIR}/modules/juce_gui_basics/native/juce_VBlank_windows.cpp")
+    file(READ "${HACHI_VBLANK_FILE}" HACHI_VBLANK_SOURCE)
+    string(REPLACE "for (;;)" "while (! threadShouldExit())"
+        HACHI_VBLANK_SOURCE "${HACHI_VBLANK_SOURCE}")
+    file(WRITE "${HACHI_VBLANK_FILE}" "${HACHI_VBLANK_SOURCE}")
 endif()
 
 # GAME, FCPE and NSF-HiFiGAN use the official ONNX Runtime C++ API.  The runtime is part of
