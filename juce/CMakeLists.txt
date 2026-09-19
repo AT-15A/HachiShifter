@@ -174,7 +174,6 @@ target_compile_definitions(HachiShifterNext PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_MODAL_LOOPS_PERMITTED=0
     JUCE_PLUGINHOST_VST3=1
-    JUCE_DIRECT2D=0
 )
 
 target_include_directories(HachiShifterNext PRIVATE

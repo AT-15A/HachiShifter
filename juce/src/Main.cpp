@@ -11138,11 +11138,22 @@ private:
             : DocumentWindow(name, Palette::background, DocumentWindow::allButtons)
         {
             setUsingNativeTitleBar(true);
+           #if JUCE_WINDOWS
+            if (auto* peer = getPeer())
+            {
+                const auto engines = peer->getAvailableRenderingEngines();
+                const auto software = engines.indexOf("Software Renderer");
+                if (software >= 0) peer->setCurrentRenderingEngine(software);
+            }
+           #endif
+            std::cerr << "startup: creating editor" << std::endl;
             setContentOwned(new MainComponent(), true);
+            std::cerr << "startup: editor created" << std::endl;
             setResizable(true, false);
             setResizeLimits(900, 560, 8192, 8192);
             centreWithSize(1280, 760);
             setVisible(true);
+            std::cerr << "startup: window visible" << std::endl;
         }
 
         void closeButtonPressed() override
