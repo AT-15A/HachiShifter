@@ -135,11 +135,13 @@ backend::Mld5FileRenderRequest makeRenderRequest(const ClipData& clip, const Tra
     request.stretchAlgorithm = static_cast<int>(track.stretchAlgorithm);
     request.normalizeVolume = track.normalizeVolume;
     // Decoding a clip on its own can leave its level below the source's; the
-    // phrase-at-a-time order does not have that problem, because the model
-    // sees the whole phrase.  So the floor is raised only in the per-clip
-    // order, and only where the neural stretch paths actually run.
-    request.matchNsfSourceLevel = track.renderOrder == RenderOrder::processThenSplice
-        && clip.gain <= 1.0f;
+    // phrase-at-a-time order does not have that problem, because the model sees
+    // the whole phrase.  The floor was raised in the per-clip order to
+    // compensate -- but a splice-first reference never raises it, so per-clip
+    // flooring is exactly what pulled a process-then-splice render away from a
+    // splice-first bounce (each of many short clips floored independently).
+    // Match the reference's behaviour: leave the neural level untouched here.
+    request.matchNsfSourceLevel = false;
     const auto sourceDuration = request.sourceDurationSeconds;
     std::vector<backend::TimeMapPoint> timeAnchors;
     if (!clip.sourceTimeMap.empty())
