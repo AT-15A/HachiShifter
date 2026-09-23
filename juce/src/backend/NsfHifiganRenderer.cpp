@@ -1,5 +1,6 @@
 #include "NsfHifiganRenderer.h"
 
+#include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_dsp/juce_dsp.h>
 #include <algorithm>
 #include <array>
@@ -1142,6 +1143,328 @@ NsfHifiganRenderResult NsfHifiganRenderer::render(
                        stretchOrder, normalizeVolume);
     result.error = "NSF-HiFiGAN ONNX runtime is not included";
 #endif
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// UTAU voicebank synthesis on the one NSF-HiFiGAN renderer.
+//
+// These are the native building blocks that let the single NSF-HiFiGAN
+// renderer reproduce the UTAU backend's non-flag behaviour -- OTO timing,
+// consonant velocity, preutterance/overlap, vibrato/pitch as the model's F0
+// input, and overlap crossfade mixing -- without a separate renderer, the
+// classic time-domain resampler, or an external executable.  The timing/F0/mix
+// maths are pure so they can be checked without the ONNX model present.
+
+NsfUtauNotePlan buildNsfUtauNotePlan(const NsfUtauSampleTiming& timing,
+                                     double noteStartSeconds,
+                                     double noteDurationSeconds,
+                                     double consonantVelocityScale,
+                                     double tailSeconds)
+{
+    NsfUtauNotePlan plan;
+    const auto regionStart = std::max(0.0, timing.offsetSeconds);
+    const auto regionEnd = std::max(regionStart + 0.001,
+        timing.fileSeconds > 0.0 ? std::min(timing.endSeconds, timing.fileSeconds)
+                                 : timing.endSeconds);
+    if (regionEnd <= regionStart) return plan;
+
+    // The preutterance cannot reach further back than the note's own start, or
+    // the lead-in would begin before time zero.
+    const auto preutterance = std::min(std::max(0.0, timing.preutteranceSeconds),
+                                       std::max(0.0, noteStartSeconds));
+    // The consonant is measured from the region start; velocity stretches only
+    // this lead segment, reaching the vowel sooner or later.
+    const auto consonant = std::max(0.0, std::min(timing.consonantSeconds,
+                                                  regionEnd - regionStart));
+    const auto scale = consonantVelocityScale > 1.0e-6 ? consonantVelocityScale : 1.0;
+    const auto consonantSourceEnd = std::min(regionEnd, regionStart + consonant);
+
+    const auto tail = std::max(0.0, tailSeconds);
+    const auto outputSeconds = std::max(0.01, preutterance + noteDurationSeconds + tail);
+
+    const auto consonantOutput = consonant * scale;
+    std::vector<NsfHifiganTimeMapPoint> map;
+    map.push_back({ 0.0, regionStart });
+    if (consonantOutput > 1.0e-4 && consonantSourceEnd > regionStart + 1.0e-6)
+        map.push_back({ consonantOutput, consonantSourceEnd });
+    // The vowel is linearly stretched to fill the rest; the model's variable
+    // hop does the spectral stretch, and a longer note reads held final frames.
+    map.push_back({ outputSeconds, regionEnd });
+
+    std::vector<NsfHifiganTimeMapPoint> cleaned;
+    for (const auto& point : map)
+    {
+        if (!cleaned.empty()
+            && point.targetSeconds <= cleaned.back().targetSeconds + 1.0e-7)
+        {
+            cleaned.back().sourceSeconds = std::max(cleaned.back().sourceSeconds,
+                                                    point.sourceSeconds);
+            continue;
+        }
+        cleaned.push_back(point);
+    }
+    if (cleaned.size() < 2) return plan;
+
+    plan.valid = true;
+    plan.sourceStartSeconds = regionStart;
+    plan.sourceEndSeconds = regionEnd;
+    plan.soundStartOffsetSeconds = -preutterance;
+    plan.outputSeconds = outputSeconds;
+    plan.timeMap = std::move(cleaned);
+    return plan;
+}
+
+std::vector<float> buildNsfUtauTargetMidi(float midiNote,
+                                          const std::vector<NsfUtauPitchPoint>& pitchCurve,
+                                          double framePeriodMs, double outputSeconds,
+                                          double soundStartOffsetSeconds)
+{
+    const auto framePeriod = std::max(0.1, framePeriodMs) / 1000.0;
+    const auto frames = std::max(1, static_cast<int>(std::ceil(
+        std::max(0.001, outputSeconds) / framePeriod)) + 1);
+    std::vector<float> target(static_cast<std::size_t>(frames), midiNote);
+    if (pitchCurve.empty()) return target;
+
+    const auto centsAt = [&](double localTime)
+    {
+        if (localTime <= pitchCurve.front().timeSeconds) return pitchCurve.front().cents;
+        if (localTime >= pitchCurve.back().timeSeconds) return pitchCurve.back().cents;
+        for (std::size_t i = 1; i < pitchCurve.size(); ++i)
+        {
+            if (localTime > pitchCurve[i].timeSeconds) continue;
+            const auto& a = pitchCurve[i - 1];
+            const auto& b = pitchCurve[i];
+            const auto span = b.timeSeconds - a.timeSeconds;
+            const auto amount = span > 1.0e-9
+                ? static_cast<float>((localTime - a.timeSeconds) / span) : 0.0f;
+            return a.cents + (b.cents - a.cents) * amount;
+        }
+        return pitchCurve.back().cents;
+    };
+    for (int frame = 0; frame < frames; ++frame)
+    {
+        const auto localTime = static_cast<double>(frame) * framePeriod
+            + soundStartOffsetSeconds;
+        target[static_cast<std::size_t>(frame)] = midiNote + centsAt(localTime) / 100.0f;
+    }
+    return target;
+}
+
+juce::AudioBuffer<float> mixNsfUtauNotes(const std::vector<NsfUtauMixNote>& notes,
+                                         double totalSeconds, double sampleRate,
+                                         int channels)
+{
+    const auto chans = juce::jlimit(1, 2, channels);
+    const auto totalSamples = std::max(1, static_cast<int>(std::ceil(
+        std::max(0.001, totalSeconds) * sampleRate)));
+    juce::AudioBuffer<float> mix(chans, totalSamples);
+    mix.clear();
+    if (sampleRate <= 0.0) return mix;
+
+    std::vector<std::size_t> order(notes.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](auto a, auto b)
+    {
+        return notes[a].soundStartSeconds < notes[b].soundStartSeconds;
+    });
+
+    for (std::size_t oi = 0; oi < order.size(); ++oi)
+    {
+        const auto& note = notes[order[oi]];
+        if (note.rest || note.audio.getNumSamples() <= 0) continue;
+        const auto startSample = static_cast<int>(std::lround(
+            note.soundStartSeconds * sampleRate));
+        const auto fadeInSamples = std::max(0, static_cast<int>(std::lround(
+            std::max(0.0, note.overlapSeconds) * sampleRate)));
+        const auto noteSamples = note.audio.getNumSamples();
+        const auto srcChannels = note.audio.getNumChannels();
+        for (int index = 0; index < noteSamples; ++index)
+        {
+            const auto target = startSample + index;
+            if (target < 0 || target >= totalSamples) continue;
+            auto gain = 1.0f;
+            if (fadeInSamples > 0 && index < fadeInSamples)
+            {
+                const auto phase = (static_cast<double>(index) + 0.5)
+                    / static_cast<double>(fadeInSamples);
+                gain = static_cast<float>(std::sin(
+                    juce::MathConstants<double>::halfPi * phase));
+            }
+            for (int channel = 0; channel < chans; ++channel)
+            {
+                const auto src = note.audio.getSample(
+                    std::min(channel, srcChannels - 1), index) * gain;
+                if (fadeInSamples > 0 && index < fadeInSamples)
+                {
+                    const auto phase = (static_cast<double>(index) + 0.5)
+                        / static_cast<double>(fadeInSamples);
+                    const auto outGain = static_cast<float>(std::cos(
+                        juce::MathConstants<double>::halfPi * phase));
+                    const auto existing = mix.getSample(channel, target);
+                    mix.setSample(channel, target, existing * outGain + src);
+                }
+                else
+                    mix.addSample(channel, target, src);
+            }
+        }
+    }
+    auto peak = 0.0f;
+    for (int channel = 0; channel < mix.getNumChannels(); ++channel)
+        peak = std::max(peak, mix.getMagnitude(channel, 0, mix.getNumSamples()));
+    if (peak > 0.98f) mix.applyGain(0.98f / peak);
+    return mix;
+}
+
+NsfUtauSynthResult synthesizeNsfUtauNote(const juce::File& sampleFile,
+                                         const NsfUtauNotePlan& plan,
+                                         float midiNote,
+                                         const std::vector<NsfUtauPitchPoint>& pitchCurve,
+                                         const juce::File& modelDirectory,
+                                         const OrtExecutionConfig& execution)
+{
+    NsfUtauSynthResult result;
+    if (!plan.valid)
+    {
+        result.error = "invalid note plan";
+        return result;
+    }
+    if (!NsfHifiganRenderer::modelAvailable(modelDirectory))
+    {
+        result.error = "NSF-HiFiGAN model pack unavailable";
+        return result;
+    }
+
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    auto reader = std::unique_ptr<juce::AudioFormatReader>(
+        formats.createReaderFor(sampleFile));
+    if (reader == nullptr || reader->sampleRate <= 0.0)
+    {
+        result.error = "could not read " + sampleFile.getFileName();
+        return result;
+    }
+    const auto sourceRate = reader->sampleRate;
+    const auto regionStart = static_cast<juce::int64>(std::llround(
+        plan.sourceStartSeconds * sourceRate));
+    const auto regionEnd = static_cast<juce::int64>(std::llround(
+        plan.sourceEndSeconds * sourceRate));
+    const auto regionSamples = static_cast<int>(std::max<juce::int64>(1,
+        regionEnd - regionStart));
+    const auto channels = juce::jlimit(1, 2, static_cast<int>(reader->numChannels));
+    juce::AudioBuffer<float> source(channels, regionSamples);
+    source.clear();
+    reader->read(&source, 0, regionSamples, regionStart, true, channels > 1);
+
+    std::vector<NsfHifiganTimeMapPoint> timeMap;
+    timeMap.reserve(plan.timeMap.size());
+    for (const auto& point : plan.timeMap)
+        timeMap.push_back({ point.targetSeconds,
+                            point.sourceSeconds - plan.sourceStartSeconds });
+
+    constexpr auto framePeriodMs = 5.0;
+    const auto targetMidi = buildNsfUtauTargetMidi(midiNote, pitchCurve, framePeriodMs,
+        plan.outputSeconds, plan.soundStartOffsetSeconds);
+    const std::vector<float> formant(targetMidi.size(), 0.0f);
+    const auto targetSamples = std::max(1, static_cast<int>(std::lround(
+        plan.outputSeconds * sourceRate)));
+
+    auto neural = NsfHifiganRenderer::render(source, sourceRate, targetSamples,
+        framePeriodMs, targetMidi, formant, timeMap, modelDirectory, execution,
+        NsfHifiganStretchOrder::fixedHop);
+    if (!neural.usedModel || neural.buffer.getNumSamples() != targetSamples)
+    {
+        result.error = neural.error.isNotEmpty() ? neural.error
+                                                  : "NSF-HiFiGAN render failed";
+        return result;
+    }
+    result.audio = std::move(neural.buffer);
+    result.sampleRate = sourceRate;
+    result.usedModel = true;
+    return result;
+}
+
+UtauRenderResult renderNsfUtauPhrase(const UtauRenderRequest& request,
+                                     const juce::File& modelDirectory,
+                                     const OrtExecutionConfig& execution)
+{
+    UtauRenderResult result;
+    result.backend = "nsf-hifigan-native-voicebank";
+    if (!NsfHifiganRenderer::modelAvailable(modelDirectory))
+    {
+        result.warning = "NSF-HiFiGAN model pack unavailable";
+        return result;
+    }
+
+    // 2^(1 - velocity/100): 100 -> 1.0, larger reaches the vowel sooner.
+    const auto velocityScaleOf = [](int velocity)
+    {
+        return std::pow(2.0, 1.0 - juce::jlimit(0, 200, velocity) / 100.0);
+    };
+    auto missing = 0;
+    auto synthesised = 0;
+    double phraseRate = 0.0;
+    std::vector<NsfUtauMixNote> mixNotes;
+    mixNotes.reserve(request.notes.size());
+    for (const auto& note : request.notes)
+    {
+        if (isRestLyric(note.alias))
+        {
+            mixNotes.push_back({ {}, note.startSeconds, 0.0, true });
+            continue;
+        }
+        const auto resolved = UtauRenderer::resolveVoiceSample(
+            request.voicebankDirectory, note.alias, note.midiNote,
+            note.consonantVelocity, request.fourRegion, request.consonantClasses,
+            note.stpSeconds, note.preutteranceOverrideEnabled, note.preutteranceSeconds,
+            note.overlapOverrideEnabled, note.overlapSeconds);
+        if (!resolved.found) { ++missing; continue; }
+
+        NsfUtauSampleTiming timing;
+        timing.offsetSeconds = resolved.offsetSeconds;
+        timing.endSeconds = resolved.endSeconds;
+        timing.consonantSeconds = resolved.consonantSeconds;
+        timing.preutteranceSeconds = resolved.preutteranceSeconds;
+        timing.overlapSeconds = resolved.overlapSeconds;
+        timing.fileSeconds = resolved.fileSeconds;
+        const auto plan = buildNsfUtauNotePlan(timing, note.startSeconds,
+            note.durationSeconds, velocityScaleOf(note.consonantVelocity), 0.0);
+        if (!plan.valid) { ++missing; continue; }
+
+        std::vector<NsfUtauPitchPoint> pitch;
+        pitch.reserve(note.pitchCurve.size());
+        for (const auto& point : note.pitchCurve)
+            pitch.push_back({ point.timeSeconds, point.cents });
+
+        // The model resynthesises the recording at the target F0 directly, so
+        // the target MIDI is simply the note's pitch (the recording's own pitch
+        // is what the mel carries; no source-vs-target ratio is applied here).
+        auto synth = synthesizeNsfUtauNote(resolved.file, plan, note.midiNote,
+                                           pitch, modelDirectory, execution);
+        if (!synth.usedModel || synth.audio.getNumSamples() <= 0)
+        {
+            if (result.warning.isEmpty() && synth.error.isNotEmpty())
+                result.warning = synth.error;
+            ++missing;
+            continue;
+        }
+        if (note.gain != 1.0f) synth.audio.applyGain(juce::jlimit(0.0f, 4.0f, note.gain));
+        phraseRate = synth.sampleRate;
+        mixNotes.push_back({ std::move(synth.audio),
+                             note.startSeconds + plan.soundStartOffsetSeconds,
+                             resolved.overlapSeconds, false });
+        ++synthesised;
+    }
+
+    if (phraseRate <= 0.0) phraseRate = 44100.0;
+    result.sampleRate = phraseRate;
+    result.buffer = mixNsfUtauNotes(mixNotes,
+        std::max(0.001, request.targetDurationSeconds), phraseRate, 2);
+    if (missing > 0)
+        result.warning = (result.warning.isEmpty() ? juce::String()
+                                                     : result.warning + "; ")
+            + juce::String(missing) + " note(s) not synthesised";
+    juce::ignoreUnused(synthesised);
     return result;
 }
 }

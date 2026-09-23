@@ -120,7 +120,7 @@ void EnvelopePresetButton::paintButton(juce::Graphics& g, bool highlighted, bool
 }
 
 MainComponent::MainComponent()
-    : tooltipWindow(this, 450), menuBar(this), progressBar(progress),
+    : tooltipWindow(this, 450), menuBar(nullptr), progressBar(progress),
       trackList(project, strings), timeline(project), pianoRoll(project, strings)
 {
     startupLog("MainComponent: members constructed");
@@ -738,6 +738,9 @@ MainComponent::MainComponent()
 
     project.addChangeListener(this);
     audio.addChangeListener(this);
+    // MenuBarComponent caches its labels when the model is attached. Attach
+    // only after applyPreferences() restores the saved application language.
+    menuBar.setModel(this);
     refreshTexts();
     refreshProjectControls();
     setSourceEditMode(false);
@@ -756,6 +759,30 @@ MainComponent::~MainComponent()
     project.removeChangeListener(this);
     menuBar.setModel(nullptr);
     setLookAndFeel(nullptr);
+}
+
+void MainComponent::applyRenderingPreference()
+{
+   #if JUCE_WINDOWS
+    if (preferences == nullptr) return;
+    if (auto* peer = getPeer())
+    {
+        const auto engines = peer->getAvailableRenderingEngines();
+        const auto software = engines.indexOf("Software Renderer");
+        const auto gpu = engines.indexOf("Direct2D");
+        const auto forceSoftware = preferences->getBoolValue("ui.softwareRendering", false)
+            || juce::SystemStats::getEnvironmentVariable("HACHI_SOFTWARE_RENDERING", {}) == "1";
+        const auto target = !forceSoftware && gpu >= 0 ? gpu : software;
+        if (target >= 0 && peer->getCurrentRenderingEngine() != target)
+            peer->setCurrentRenderingEngine(target);
+        const auto current = peer->getCurrentRenderingEngine();
+        const auto renderer = current >= 0 && current < engines.size()
+            ? engines[current] : juce::String("Unavailable");
+        startupLog("UI renderer: " + renderer
+                   + "; requested=" + (forceSoftware ? "software" : "gpu"));
+        repaint();
+    }
+   #endif
 }
 
 void MainComponent::applyPreferences()
@@ -806,7 +833,14 @@ void MainComponent::applyPreferences()
     // settings change appear ineffective.
     syncAudio(project.snapshot());
     lookAndFeel.refreshColours();
+    // A theme switch changes the shared Palette; components that cached a
+    // Palette colour through setColour (labels, editors) must re-apply it or
+    // they keep the previous theme's colour and, in light mode, draw a pale
+    // dark-theme text colour that is unreadable.  Cascade the change so each
+    // one's lookAndFeelChanged() re-applies from the current Palette.
+    sendLookAndFeelChange();
     applyUiScale();
+    applyRenderingPreference();
 }
 
 void MainComponent::applyUiScale()
@@ -943,9 +977,9 @@ void MainComponent::refreshTexts()
         };
         addAndMakeVisible(button);
     }
-    spliceButton.setButtonText(utf8("拼接"));
-    spliceButton.setTooltip(utf8("把选中的相邻音符在交界处交叉淡入淡出；"
-                                  "需要选中两个以上相邻的音符"));
+    spliceButton.setButtonText(utf8("强制连接"));
+    spliceButton.setTooltip(utf8("把选中的音符连接为一条可渲染的原生边界；"
+                                  "保留每个音符和素材数据，支持跨片段连接"));
     spliceButton.onClick = [this] { spliceSelectedNotes(); };
     spliceButton.setEnabled(false);
     flagCurveButton.setButtonText(utf8("线性flag"));
@@ -1331,8 +1365,7 @@ void MainComponent::refreshSpliceButton()
 {
     // One note has no boundary to splice, so the action stays out of reach
     // until at least two are selected.
-    spliceButton.setEnabled(isUtauAlgorithmSelected()
-        && pianoRoll.selectedNoteIds().size() >= 2);
+    spliceButton.setEnabled(pianoRoll.selectedNoteIds().size() >= 2);
 }
 
 void MainComponent::spliceSelectedNotes()
@@ -1340,6 +1373,20 @@ void MainComponent::spliceSelectedNotes()
     const auto selected = pianoRoll.selectedNoteIds();
     if (selected.size() < 2) return;
     const auto data = project.snapshot();
+    auto hasNonUtau = false;
+    for (const auto& track : data.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (std::find(selected.begin(), selected.end(), note.id) != selected.end()
+                    && track.pitchAlgorithm != PitchAlgorithm::utau)
+                    hasNonUtau = true;
+    if (hasNonUtau)
+    {
+        project.setNotesConnection(selected, true);
+        statusLabel.setText(utf8("强制连接：已保留音符数据并写入原生边界"),
+                            juce::dontSendNotification);
+        return;
+    }
 
     struct Placed { juce::String id; double start = 0.0; double end = 0.0; bool spliced = false; };
     std::vector<Placed> notes;
@@ -2224,6 +2271,19 @@ void MainComponent::resized()
 
     auto footer = area.removeFromBottom(24);
     statusLabel.setBounds(footer.reduced(8, 0));
+    // The docked material manager takes a strip down the right of the editing
+    // area (drag-resizable via its left edge) so the piano roll stays visible
+    // beside it and both can be worked at once.
+    if (assetManager != nullptr && assetManagerVisible)
+    {
+        const auto width = juce::jlimit(220, std::max(220, area.getWidth() - 320),
+                                        assetManagerWidth);
+        auto panel = area.removeFromRight(width);
+        assetManager->setBounds(panel);
+        if (assetManagerResizer != nullptr)
+            assetManagerResizer->setBounds(panel.getX() - 3, panel.getY(),
+                                           6, panel.getHeight());
+    }
     const auto utauEditorActive = isUtauAlgorithmSelected();
     volumeParamButton.setButtonText(utauEditorActive ? utf8("响度包络")
                                                      : strings.text("param.volume"));
@@ -2289,8 +2349,8 @@ void MainComponent::resized()
     takeParameterRight(pitchLabel, 50);
     voicebankSettingsButton.setVisible(utauEditorActive);
     if (utauEditorActive) takeParameterRight(voicebankSettingsButton, 104);
-    spliceButton.setVisible(utauEditorActive);
-    if (utauEditorActive) takeParameterRight(spliceButton, 60);
+    spliceButton.setVisible(true);
+    takeParameterRight(spliceButton, 60);
     auto takeParameter = [&parameterHeader](juce::Component& component, int width)
     {
         component.setBounds(parameterHeader.removeFromLeft(width));
@@ -2307,10 +2367,10 @@ void MainComponent::resized()
     takeParameter(wrenchButton, 27);
     takeParameter(connectButton, 27);
     parameterHeader.removeFromLeft(8);
-    horizontalZoomOutButton.setButtonText("H−");
-    horizontalZoomInButton.setButtonText("H+");
-    verticalZoomOutButton.setButtonText("V−");
-    verticalZoomInButton.setButtonText("V+");
+    horizontalZoomOutButton.setButtonText("-");
+    horizontalZoomInButton.setButtonText("+");
+    verticalZoomOutButton.setButtonText("-");
+    verticalZoomInButton.setButtonText("+");
     takeParameter(horizontalZoomOutButton, 30);
     takeParameter(horizontalZoomInButton, 30);
     parameterHeader.removeFromLeft(5);
@@ -2586,12 +2646,18 @@ void MainComponent::timerCallback()
             {
                 const auto backend = audio.activeRenderBackends();
                 const auto renderWarning = audio.activeRenderWarnings();
+                // Edits the chosen backend cannot honour: editing never hides a
+                // feature, so this is the one place the difference is stated.
+                const auto capability = AudioEngine::renderCapabilityWarnings(
+                    project.snapshot()).joinIntoString("；");
                 statusLabel.setText((audio.isPlaying() ? strings.text("transport.play")
                                                         : strings.text("status.ready"))
                                         + "  " + juce::String(audio.position(), 2) + " s"
                                         + (backend.isNotEmpty() ? "  ·  " + backend : juce::String())
                                         + (renderWarning.isNotEmpty()
-                                            ? "  ·  UTAU: " + renderWarning : juce::String()),
+                                            ? "  ·  UTAU: " + renderWarning : juce::String())
+                                        + (capability.isNotEmpty()
+                                            ? "  ·  ⚠ " + capability : juce::String()),
                                     juce::dontSendNotification);
             }
             if (playWhenRenderReady)
@@ -3165,14 +3231,41 @@ void MainComponent::showSettings()
 void MainComponent::showAssetManager()
 {
     if (preferences == nullptr) return;
-    juce::DialogWindow::LaunchOptions options;
-    options.dialogTitle = strings.text("asset.title");
-    options.dialogBackgroundColour = Palette::panel;
-    options.escapeKeyTriggersCloseButton = true;
-    options.useNativeTitleBar = true;
-    options.resizable = true;
-    options.content.setOwned(new AssetManagerComponent(strings, *preferences));
-    options.launchAsync();
+    // Docked in the main window, not a separate window: it stays operable
+    // alongside the piano roll, and toggles off when its menu item is chosen
+    // again.  Created lazily the first time it is shown.
+    if (assetManager == nullptr)
+    {
+        assetManager = std::make_unique<AssetManagerComponent>(strings, *preferences);
+        addChildComponent(assetManager.get());
+        assetManagerWidth = juce::jlimit(220, 640,
+            preferences->getIntValue("ui.assetManagerWidth", 320));
+        // A drag handle on the panel's left edge resizes its width.  The
+        // constrainer bounds it; resized() re-lays everything from the width.
+        assetManagerConstrainer.setMinimumWidth(220);
+        assetManagerConstrainer.setMaximumWidth(640);
+        assetManagerConstrainer.onWidth = [this](int width)
+        {
+            assetManagerWidth = juce::jlimit(220, 640, width);
+            if (preferences != nullptr)
+                preferences->setValue("ui.assetManagerWidth", assetManagerWidth);
+            resized();
+        };
+        assetManagerResizer = std::make_unique<juce::ResizableEdgeComponent>(
+            assetManager.get(), &assetManagerConstrainer,
+            juce::ResizableEdgeComponent::leftEdge);
+        addChildComponent(assetManagerResizer.get());
+    }
+    assetManagerVisible = !assetManagerVisible;
+    assetManager->setVisible(assetManagerVisible);
+    assetManagerResizer->setVisible(assetManagerVisible);
+    if (assetManagerVisible)
+    {
+        assetManager->toFront(false);
+        assetManagerResizer->toFront(false);
+        statusLabel.setText(strings.text("asset.docked"), juce::dontSendNotification);
+    }
+    resized();
 }
 
 void MainComponent::showClipGainDialog()
@@ -3728,12 +3821,18 @@ void MainComponent::performWithUnsavedCheck(std::function<void()> action)
         if (action) action();
         return;
     }
+    // Keep the unsaved-document prompt owned by the main window.  A bare
+    // AlertWindow can create an unowned native peer on Windows; with the GDI
+    // peer that peer may end up behind the editor while still remaining modal,
+    // which makes every editor control appear dead.
     auto* dialog = new juce::AlertWindow(strings.text("dialog.unsavedTitle"),
-        strings.text("dialog.unsavedMessage"), juce::MessageBoxIconType::WarningIcon);
+        strings.text("dialog.unsavedMessage"), juce::MessageBoxIconType::WarningIcon, this);
     dialog->addButton(strings.text("dialog.save"), 1);
     dialog->addButton(strings.text("dialog.discard"), 2);
     dialog->addButton(strings.text("dialog.cancel"), 0,
                       juce::KeyPress(juce::KeyPress::escapeKey));
+    dialog->centreAroundComponent(getTopLevelComponent(), dialog->getWidth(), dialog->getHeight());
+    dialog->setAlwaysOnTop(true);
     juce::Component::SafePointer<MainComponent> safe(this);
     dialog->enterModalState(true,
         juce::ModalCallbackFunction::create(
@@ -4269,10 +4368,15 @@ void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResul
             else if (composeMode == 4) track.compose = false;
             // Mode 2 retains the melodic classification stored by Melodyne.
         }
+        const auto importedForFolders = imported.project;
         project.replace(std::move(imported.project));
+        refreshProjectControls();
+        menuItemsChanged();
+        repaint();
         if (!imported.missingFiles.isEmpty())
             showError(strings.text("warning.missingMedia") + "\n"
                       + imported.missingFiles.joinIntoString("\n"));
+        offerMaterialFolderForImport(importedForFolders);
         return;
     }
     auto state = std::make_shared<backend::MelodyneImportResult>(std::move(imported));
@@ -4295,7 +4399,12 @@ void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResul
             {
                 for (std::size_t index = 0; index < state->project.tracks.size(); ++index)
                     state->project.tracks[index].compose = selector->isCompose(index);
+                const auto importedForFolders = state->project;
                 safe->project.replace(std::move(state->project));
+                safe->refreshProjectControls();
+                safe->menuItemsChanged();
+                safe->repaint();
+                safe->offerMaterialFolderForImport(importedForFolders);
             }
             dialog->removeCustomComponent(0);
             delete selector;
@@ -4303,6 +4412,101 @@ void MainComponent::presentMelodyneComposeSelection(backend::MelodyneImportResul
             if (safe != nullptr && result == 1 && !state->missingFiles.isEmpty())
                 safe->showError(safe->strings.text("warning.missingMedia") + "\n"
                     + state->missingFiles.joinIntoString("\n"));
+        }), false);
+}
+
+void MainComponent::offerMaterialFolderForImport(const ProjectData& imported)
+{
+    if (preferences == nullptr) return;
+    // The unique folders that hold the imported recordings.
+    juce::StringArray folders;
+    for (const auto& track : imported.tracks)
+        for (const auto& clip : track.clips)
+            if (clip.sourceFile.existsAsFile())
+                folders.addIfNotAlreadyThere(
+                    clip.sourceFile.getParentDirectory().getFullPathName());
+    if (folders.isEmpty()) return;
+    // Skip folders that are already registered.
+    const auto registered = juce::StringArray::fromLines(
+        preferences->getValue("assets.materialFolders"));
+    juce::StringArray fresh;
+    for (const auto& folder : folders)
+    {
+        auto known = false;
+        for (const auto& line : registered)
+            known = known || line.upToFirstOccurrenceOf("\t", false, false) == folder;
+        if (!known) fresh.add(folder);
+    }
+    if (fresh.isEmpty()) return;
+
+    // The unique source audio files, to copy when the user asks for it.
+    juce::StringArray sourceFiles;
+    for (const auto& track : imported.tracks)
+        for (const auto& clip : track.clips)
+            if (clip.sourceFile.existsAsFile())
+                sourceFiles.addIfNotAlreadyThere(clip.sourceFile.getFullPathName());
+
+    // Register once registration is decided, in place or into copiedFolder.
+    juce::Component::SafePointer<MainComponent> safe(this);
+    const auto registerFolders = [safe](const juce::StringArray& toRegister)
+    {
+        if (safe == nullptr || safe->preferences == nullptr || toRegister.isEmpty())
+            return;
+        auto lines = juce::StringArray::fromLines(
+            safe->preferences->getValue("assets.materialFolders"));
+        lines.removeEmptyStrings();
+        for (const auto& folder : toRegister)
+            lines.addIfNotAlreadyThere(folder + "\t" + juce::File(folder).getFileName());
+        safe->preferences->setValue("assets.materialFolders", lines.joinIntoString("\n"));
+        safe->preferences->saveIfNeeded();
+        safe->statusLabel.setText(safe->strings.text("asset.melodyneFolderDone")
+            .replace("{count}", juce::String(toRegister.size())),
+            juce::dontSendNotification);
+        if (safe->assetManager != nullptr) safe->showAssetManager();
+    };
+
+    auto* dialog = new juce::AlertWindow(strings.text("asset.melodyneFolderTitle"),
+        strings.text("asset.melodyneFolderPrompt").replace("{count}",
+            juce::String(fresh.size())),
+        juce::MessageBoxIconType::QuestionIcon, this);
+    // Default is to register; registering can optionally copy the media into a
+    // chosen folder (e.g. beside the project) so the material is self-contained.
+    dialog->addButton(strings.text("asset.melodyneRegisterInPlace"), 1,
+                      juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton(strings.text("asset.melodyneRegisterCopy"), 2);
+    dialog->addButton(strings.text("asset.melodyneNoRegister"), 0,
+                      juce::KeyPress(juce::KeyPress::escapeKey));
+    dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+        [safe, fresh, sourceFiles, registerFolders, dialog](int result)
+        {
+            std::unique_ptr<juce::AlertWindow> owned(dialog);
+            if (safe == nullptr || result == 0) return;
+            if (result == 1) { registerFolders(fresh); return; }
+            // result == 2: choose a destination, copy the media in, register it.
+            safe->chooser = std::make_unique<juce::FileChooser>(
+                safe->strings.text("asset.melodyneRegisterCopy"), juce::File{});
+            safe->chooser->launchAsync(juce::FileBrowserComponent::openMode
+                    | juce::FileBrowserComponent::canSelectDirectories,
+                [safe, sourceFiles, registerFolders](const juce::FileChooser& chosen)
+                {
+                    const auto base = chosen.getResult();
+                    if (safe == nullptr || !base.isDirectory()) return;
+                    const auto dest = base.getChildFile("melodyne-materials");
+                    dest.createDirectory();
+                    for (const auto& path : sourceFiles)
+                    {
+                        const juce::File src(path);
+                        if (!src.existsAsFile()) continue;
+                        const auto target = dest.getChildFile(src.getFileName());
+                        if (src.getFullPathName() != target.getFullPathName())
+                            src.copyFileTo(target);
+                        // Carry any native sidecar alongside the copied audio.
+                        const auto sidecar = SampleSettings::sidecarFor(src);
+                        if (sidecar.existsAsFile())
+                            sidecar.copyFileTo(SampleSettings::sidecarFor(target));
+                    }
+                    registerFolders({ dest.getFullPathName() });
+                });
         }), false);
 }
 

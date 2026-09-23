@@ -195,7 +195,7 @@ void OtoWaveformEditorComponent::WaveformView::paint(juce::Graphics& g)
         auto badge = juce::Rectangle<float>(x, static_cast<float>(2 + (index % 2) * 16), 38.0f, 15.0f);
         g.setColour(colours[index].withAlpha(0.78f));
         g.fillRoundedRectangle(badge, 3.0f);
-        g.setColour(juce::Colours::white);
+        g.setColour(colours[index].contrasting(0.9f));
         g.drawText(labels[index].second, badge, juce::Justification::centred);
     }
 
@@ -217,7 +217,7 @@ void OtoWaveformEditorComponent::WaveformView::paint(juce::Graphics& g)
                 static_cast<float>(plot.getBottom() - 19), 34.0f, 15.0f);
             g.setColour(jieColours[index].withAlpha(0.82f));
             g.fillRoundedRectangle(badge, 3.0f);
-            g.setColour(juce::Colours::white);
+            g.setColour(jieColours[index].contrasting(0.9f));
             g.drawText(regionName(mou, static_cast<int>(index)), badge,
                        juce::Justification::centred);
         }
@@ -1046,6 +1046,21 @@ void OtoWaveformEditorComponent::save()
 {
     commitEditors();
     juce::String error;
+    // A from-scratch material is stored natively: the override writes the HJM
+    // sidecar and the oto files are left untouched.
+    if (saveOverride)
+    {
+        if (!saveOverride(edited, error))
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                utf8("无法保存原生标注"), error);
+            return;
+        }
+        backend::UtauRenderer::invalidateVoicebankCache();
+        if (onSaved) onSaved();
+        closeWindow();
+        return;
+    }
     const auto savedClassicTiming = jie
         ? SampleSettings::updateJieVoicebankOtoEntry(original, edited, error)
         : SampleSettings::updateVoicebankOtoEntry(original, edited, error);

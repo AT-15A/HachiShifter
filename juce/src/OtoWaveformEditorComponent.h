@@ -23,6 +23,16 @@ public:
                                bool mouMode,
                                std::function<void()> savedCallback);
 
+    // Native-material save: when set, Save hands the edited entry to this
+    // instead of writing oto.ini, so the same waveform editor persists a
+    // from-scratch material as its native HJM sidecar.  Editing is one native
+    // operation; OTO and HJM are just the two stores it can write to.  Return
+    // true on success, or false with the reason in error.
+    void setSaveOverride(std::function<bool(const VoicebankOtoEntry&, juce::String&)> handler)
+    {
+        saveOverride = std::move(handler);
+    }
+
     void paint(juce::Graphics& g) override;
     void resized() override;
     // Read-only views for the offline layout check in --smoke-oto-editor.
@@ -252,6 +262,7 @@ private:
     VoicebankOtoEntry original;
     VoicebankOtoEntry edited;
     std::function<void()> onSaved;
+    std::function<bool(const VoicebankOtoEntry&, juce::String&)> saveOverride;
     juce::Label fileLabel;
     juce::Label helpLabel;
     // The class string, shown only in 谋 mode: one letter per region, and its

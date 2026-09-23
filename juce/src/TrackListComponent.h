@@ -50,6 +50,9 @@ public:
     ~TrackListComponent() override;
 
     void paint(juce::Graphics& g) override;
+    // Re-apply the Palette-derived label colours so a theme switch does not
+    // leave them on the previous theme's (unreadable) colour.
+    void lookAndFeelChanged() override;
     void mouseDown(const juce::MouseEvent& event) override;
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;

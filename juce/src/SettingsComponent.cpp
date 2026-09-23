@@ -91,6 +91,9 @@ SettingsComponent::SettingsComponent(I18n& stringsToUse,
     interfacePage.addRow(accentLightLabel, accentLight);
     interfacePage.addRow(noteColourLabel, noteColour);
     interfacePage.addWide(showNoteLabels);
+   #if JUCE_WINDOWS
+    interfacePage.addWide(softwareRendering);
+   #endif
     uiScale.setRange(0.6, 2.0, 0.1);
     uiScale.setSliderStyle(juce::Slider::LinearHorizontal);
     uiScale.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 20);
@@ -224,6 +227,8 @@ void SettingsComponent::loadValues()
     noteColour.setText(properties.getValue("ui.noteColour", "F4C000"), false);
     showNoteLabels.setToggleState(properties.getBoolValue("ui.showNoteLabels", false),
                                   juce::dontSendNotification);
+    softwareRendering.setToggleState(properties.getBoolValue("ui.softwareRendering", false),
+                                     juce::dontSendNotification);
     uiScale.setValue(properties.getDoubleValue("ui.uiScale", 1.0), juce::dontSendNotification);
     gamePath.setText(properties.getValue("algorithm.gamePath"), false);
     gameModel.setSelectedId(properties.getValue("algorithm.gameModel", "large") == "small" ? 2 : 1,
@@ -263,6 +268,7 @@ void SettingsComponent::saveValues()
     properties.setValue("ui.accentLight", accentLight.getText().trim());
     properties.setValue("ui.noteColour", noteColour.getText().trim());
     properties.setValue("ui.showNoteLabels", showNoteLabels.getToggleState());
+    properties.setValue("ui.softwareRendering", softwareRendering.getToggleState());
     properties.setValue("ui.uiScale", uiScale.getValue());
     properties.setValue("algorithm.gamePath", gamePath.getText());
     properties.setValue("algorithm.gameModel", gameModel.getSelectedId() == 2 ? "small" : "large");
@@ -304,6 +310,7 @@ void SettingsComponent::setTexts()
     accentLightLabel.setText(strings.text("settings.accentLight"), juce::dontSendNotification);
     noteColourLabel.setText(strings.text("settings.noteColour"), juce::dontSendNotification);
     showNoteLabels.setButtonText(strings.text("settings.showNoteLabels"));
+    softwareRendering.setButtonText(strings.text("settings.softwareRendering"));
     uiScaleLabel.setText(strings.text("settings.uiScale"), juce::dontSendNotification);
     theme.changeItemText(1, strings.text("settings.themeDark"));
     theme.changeItemText(2, strings.text("settings.themeLight"));

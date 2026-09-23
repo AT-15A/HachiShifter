@@ -66,13 +66,30 @@ void HachiLookAndFeel::refreshColours()
     setColour(juce::ResizableWindow::backgroundColourId, Palette::background);
     setColour(juce::Label::textColourId, Palette::text);
     setColour(juce::TextButton::textColourOffId, Palette::text);
+    // Text drawn on a toggled-on (accent) button must contrast with the accent,
+    // not follow the panel colour: in light mode panel is near-white and washed
+    // out against a light accent.  contrasting() picks black or white per accent.
+    setColour(juce::TextButton::textColourOnId, Palette::accent.contrasting(0.85f));
     setColour(juce::ComboBox::backgroundColourId, Palette::base);
     setColour(juce::ComboBox::textColourId, Palette::text);
     setColour(juce::ComboBox::outlineColourId, Palette::border);
+    setColour(juce::ComboBox::arrowColourId, Palette::text);
+    // Text editors were left on the JUCE default (white field, black text),
+    // which reads as an out-of-theme box in either mode.  Tie them to the
+    // Palette so they follow dark/light like everything else.
+    setColour(juce::TextEditor::backgroundColourId, Palette::base);
+    setColour(juce::TextEditor::textColourId, Palette::text);
+    setColour(juce::TextEditor::highlightedTextColourId, Palette::text);
+    setColour(juce::TextEditor::highlightColourId, Palette::accent.withAlpha(0.35f));
+    setColour(juce::TextEditor::outlineColourId, Palette::border);
+    setColour(juce::TextEditor::focusedOutlineColourId, Palette::accent);
+    setColour(juce::CaretComponent::caretColourId, Palette::text);
     setColour(juce::PopupMenu::backgroundColourId, Palette::panelRaised);
     setColour(juce::PopupMenu::textColourId, Palette::text);
     setColour(juce::PopupMenu::highlightedBackgroundColourId, Palette::accent);
-    setColour(juce::PopupMenu::highlightedTextColourId, Palette::panel);
+    // Highlighted menu text must contrast with the accent highlight, not the
+    // panel (near-white in light mode → invisible on a light accent).
+    setColour(juce::PopupMenu::highlightedTextColourId, Palette::accent.contrasting(0.85f));
     setColour(juce::ScrollBar::backgroundColourId, Palette::base);
     setColour(juce::ScrollBar::trackColourId, Palette::base);
     setColour(juce::ScrollBar::thumbColourId, Palette::scrollThumb);
@@ -92,6 +109,18 @@ void HachiLookAndFeel::drawButtonBackground(juce::Graphics& g, juce::Button& but
 void HachiLookAndFeel::drawButtonText(juce::Graphics& g, juce::TextButton& button, bool, bool)
 {
     const auto id = button.getComponentID();
+    if (button.getButtonText() == "+" || button.getButtonText() == "-")
+    {
+        // Draw zoom symbols geometrically so narrow buttons never ellipsize.
+        const auto bounds = button.getLocalBounds().toFloat();
+        const auto centre = bounds.getCentre();
+        const auto radius = juce::jmin(6.0f, juce::jmin(bounds.getWidth(), bounds.getHeight()) * 0.25f);
+        g.setColour(Palette::text.withMultipliedAlpha(button.isEnabled() ? 1.0f : 0.4f));
+        g.drawLine(centre.x - radius, centre.y, centre.x + radius, centre.y, 1.8f);
+        if (button.getButtonText() == "+")
+            g.drawLine(centre.x, centre.y - radius, centre.x, centre.y + radius, 1.8f);
+        return;
+    }
     if (!id.startsWith("icon."))
     {
         LookAndFeel_V4::drawButtonText(g, button, false, false);
@@ -128,12 +157,12 @@ void HachiLookAndFeel::drawButtonText(juce::Graphics& g, juce::TextButton& butto
         {
             auto icon = toolIcons[index]->createCopy();
             icon->replaceColour(juce::Colours::black,
-                button.getToggleState() ? Palette::panel : Palette::text);
+                button.getToggleState() ? Palette::accent.contrasting(0.85f) : Palette::text);
             icon->drawWithin(g, button.getLocalBounds().toFloat().reduced(4.0f),
                 juce::RectanglePlacement::centred, button.isEnabled() ? 1.0f : 0.4f);
             return;
         }
-    g.setColour(button.getToggleState() ? Palette::panel : Palette::text);
+    g.setColour(button.getToggleState() ? Palette::accent.contrasting(0.85f) : Palette::text);
     juce::Path path;
     if (id == "icon.play")
         path.addTriangle(bounds.getX() + 2.0f, bounds.getY(), bounds.getRight(), bounds.getCentreY(),

@@ -445,6 +445,8 @@ public:
     [[nodiscard]] int pixelForSeconds(double seconds) const;
     [[nodiscard]] double secondsForPixel(int pixel) const;
     void paint(juce::Graphics& g) override;
+    // Re-apply Palette-derived colours held by child editors on a theme switch.
+    void lookAndFeelChanged() override;
     void mouseMove(const juce::MouseEvent& event) override;
     void mouseExit(const juce::MouseEvent& event) override;
     void mouseDown(const juce::MouseEvent& event) override;
@@ -650,6 +652,13 @@ private:
         const juce::String& noteId) const;
     [[nodiscard]] static bool formsAdjacentPitchBoundary(
         const PositionedUtauNote& left, const PositionedUtauNote& right);
+    // A native pitch join: a connected note whose displayed line must start at
+    // the previous note's tail pitch and glide to its own over a short window,
+    // exactly as the renderer blends the two so what is drawn is what is heard.
+    // Empty for a note with no incoming connection or no adjacent predecessor.
+    struct IncomingJoinGlide { double leadMidi = 60.0; double joinSeconds = 0.0; };
+    [[nodiscard]] std::optional<IncomingJoinGlide> incomingJoinGlideFor(
+        const NoteData& note);
     std::vector<PitchCurveEditPoint>& pitchAnchorsFor(const NoteData& note);
     [[nodiscard]] juce::PopupMenu buildPitchCurveShapeMenu(const juce::String& noteId,
                                                            int anchorIndex);
@@ -676,6 +685,13 @@ private:
     void showGapDialog(const juce::String& noteId);
     // Asks for an STP in milliseconds and gives it to every selected note.
     void showStpDialog(const juce::String& noteId);
+    // Scales the whole amplitude envelope of the note up or down by a base
+    // percent without reshaping it.  A shared amplitude concept, offered on
+    // every track type.
+    void showEnvelopeBaseDialog(const juce::String& noteId);
+    // The overlap this note's lyric resolves to, honouring an override.  Used
+    // when inserting a lead-in note so it inherits the right crossfade.
+    [[nodiscard]] double effectiveUtauOverlapFor(const juce::String& noteId) const;
     // A silence with a note on either side of it.  Right-clicking one offers
     // to close it up or to open a note into it; both move what follows.
     struct GapInfo

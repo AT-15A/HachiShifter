@@ -86,7 +86,7 @@ private:
     juce::Label languageLabel, themeLabel, accentLabel, accentLightLabel, noteColourLabel;
     juce::ComboBox language, theme;
     juce::TextEditor accent, accentLight, noteColour;
-    juce::ToggleButton showNoteLabels;
+    juce::ToggleButton showNoteLabels, softwareRendering;
     juce::Label uiScaleLabel;
     juce::Slider uiScale;
 

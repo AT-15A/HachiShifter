@@ -8,6 +8,7 @@ namespace
 {
 using Row = std::array<const char*, 5>;
 const std::unordered_map<std::string, Row> strings {
+    { "settings.softwareRendering", { "回退到软件绘制（关闭 GPU 界面加速）", "退回軟體繪製（關閉 GPU 介面加速）", "ソフトウェア描画に切替（GPU描画を無効化）", "소프트웨어 렌더링 사용 (GPU UI 가속 끄기)", "Use software rendering (disable GPU UI acceleration)" } },
     { "app.title",       { "HachiShifter Next", "HachiShifter Next", "HachiShifter Next", "HachiShifter Next", "HachiShifter Next" } },
     { "file.open",       { "打开工程", "開啟工程", "プロジェクトを開く", "프로젝트 열기", "Open Project" } },
     { "file.save",       { "保存工程", "儲存工程", "プロジェクトを保存", "프로젝트 저장", "Save Project" } },
@@ -280,7 +281,31 @@ const std::unordered_map<std::string, Row> strings {
     ,{ "asset.utau", { "导入 UTAU 音源库", "匯入 UTAU 音源庫", "UTAU 音源を読み込む", "UTAU 음원 가져오기", "Import UTAU Voicebank" } }
     ,{ "asset.utauDone", { "已注册 {files} 个音频，生成 {sidecars} 个 HJM 文件、{regions} 个分段。", "已註冊 {files} 個音訊，產生 {sidecars} 個 HJM 檔案、{regions} 個分段。", "{files} 件の音声を登録し、{sidecars} 件の HJM と {regions} 件の区間を作成しました。", "오디오 {files}개를 등록하고 HJM {sidecars}개와 구간 {regions}개를 생성했습니다.", "Registered {files} audio files and generated {sidecars} HJM files with {regions} regions." } }
     ,{ "asset.remove", { "移除", "移除", "削除", "제거", "Remove" } }
-    ,{ "asset.empty", { "把音频拖入此处注册；注册后可拖到时间线或钢琴卷帘。", "將音訊拖入此處註冊；註冊後可拖到時間軸或鋼琴捲簾。", "音声をここへドロップして登録し、タイムラインまたはピアノロールへドラッグできます。", "오디오를 여기에 놓아 등록한 뒤 타임라인이나 피아노 롤로 끌 수 있습니다.", "Drop audio here to register it, then drag it to the timeline or piano roll." } }
+    ,{ "asset.empty", { "把素材文件夹或音频拖入此处；音源库和音频文件夹都会成为可复用的素材文件夹。", "將素材資料夾或音訊拖入此處；音源庫和音訊資料夾都會成為可重複使用的素材資料夾。", "素材フォルダーまたは音声をここへドロップします。音源も音声フォルダーも再利用できる素材フォルダーになります。", "소재 폴더나 오디오를 여기에 놓으세요. 음원과 오디오 폴더 모두 재사용 가능한 소재 폴더가 됩니다.", "Drop a material folder or audio here; voicebanks and audio folders both become reusable material folders." } }
+    ,{ "asset.newFolder", { "新建素材夹", "新建素材夾", "素材フォルダー作成", "소재 폴더 생성", "New Folder" } }
+    ,{ "asset.importFolder", { "导入文件夹", "匯入資料夾", "フォルダー読込", "폴더 가져오기", "Import Folder" } }
+    ,{ "asset.addAudio", { "添加音频", "新增音訊", "音声を追加", "오디오 추가", "Add Audio" } }
+    ,{ "asset.assemble", { "活字印刷", "活字印刷", "活字印刷", "활자 인쇄", "Movable Type" } }
+    ,{ "asset.folderEmpty", { "这个素材文件夹还没有音频。用「添加音频」或拖入音频，系统会自动粗略识别参数。", "這個素材資料夾還沒有音訊。用「新增音訊」或拖入音訊，系統會自動粗略辨識參數。", "この素材フォルダーにはまだ音声がありません。「音声を追加」またはドロップすると自動で概略パラメーターを検出します。", "이 소재 폴더에는 아직 오디오가 없습니다. '오디오 추가' 또는 드롭하면 자동으로 파라미터를 대략 감지합니다.", "This folder has no audio yet. Add or drop audio and parameters are roughly detected automatically." } }
+    ,{ "asset.paramsReady", { "参数已识别，可编辑并复用", "參數已辨識，可編輯並重複使用", "パラメーター検出済み・編集/再利用可", "파라미터 감지됨 · 편집/재사용 가능", "Parameters detected — editable and reusable" } }
+    ,{ "asset.paramsNone", { "尚无参数", "尚無參數", "パラメーター未検出", "파라미터 없음", "No parameters yet" } }
+    ,{ "asset.pickFolderFirst", { "请先在左侧选择一个素材文件夹。", "請先在左側選擇一個素材資料夾。", "先に左側で素材フォルダーを選択してください。", "먼저 왼쪽에서 소재 폴더를 선택하세요.", "Select a material folder on the left first." } }
+    ,{ "asset.assembleHint", { "输入歌词，按行/字转拼音并从所选素材库匹配，生成有序素材序列。", "輸入歌詞，按行/字轉拼音並從所選素材庫比對，產生有序素材序列。", "歌詞を入力すると各文字を拼音に変換し、選択した素材から順序付き素材列を生成します。", "가사를 입력하면 각 글자를 병음으로 변환해 선택한 소재에서 순서 있는 소재열을 생성합니다.", "Enter lyrics; each character is converted to pinyin and matched from the chosen material into an ordered sequence." } }
+    ,{ "asset.assembleName", { "新素材夹名称", "新素材夾名稱", "新しい素材フォルダー名", "새 소재 폴더 이름", "New folder name" } }
+    ,{ "asset.assembleLyrics", { "歌词（每字一个素材）", "歌詞（每字一個素材）", "歌詞（1文字ごとに1素材）", "가사 (글자마다 소재 하나)", "Lyrics (one material per character)" } }
+    ,{ "asset.assembleDone", { "已生成 {matched} 个素材，缺失 {missing} 个。", "已產生 {matched} 個素材，缺失 {missing} 個。", "{matched} 件を生成し、{missing} 件が不足しました。", "{matched}개를 생성했고 {missing}개가 누락되었습니다.", "Assembled {matched} materials; {missing} missing." } }
+    ,{ "asset.docked", { "素材管理器已在下方打开；再次点击菜单项可收起。", "素材管理器已在下方開啟；再次點選選單項可收起。", "素材マネージャーを下部に表示しました。メニュー項目を再度選ぶと閉じます。", "소재 관리자를 아래에 열었습니다. 메뉴 항목을 다시 선택하면 닫힙니다.", "Material manager docked below; choose the menu item again to hide it." } }
+    ,{ "asset.editTitle", { "素材参数编辑器", "素材參數編輯器", "素材パラメーター編集", "소재 파라미터 편집", "Material Parameter Editor" } }
+    ,{ "asset.editNoOto", { "该素材在 oto.ini 中没有对应条目，无法编辑。", "該素材在 oto.ini 中沒有對應條目，無法編輯。", "この素材は oto.ini に対応する行がないため編集できません。", "이 소재는 oto.ini에 해당 항목이 없어 편집할 수 없습니다.", "This material has no oto.ini entry to edit." } }
+    ,{ "asset.exportOto", { "另存为 OTO", "另存為 OTO", "OTO として書き出し", "OTO로 내보내기", "Export as OTO" } }
+    ,{ "asset.exportOtoDone", { "已导出 {rows} 行到 oto.ini（原生标注仍保留）。", "已匯出 {rows} 行到 oto.ini（原生標註仍保留）。", "{rows} 行を oto.ini に書き出しました（ネイティブ注釈は保持）。", "{rows}행을 oto.ini로 내보냈습니다(네이티브 주석 유지).", "Exported {rows} rows to oto.ini (native annotations kept)." } }
+    ,{ "asset.melodyneFolderTitle", { "创建素材文件夹", "建立素材資料夾", "素材フォルダーを作成", "소재 폴더 생성", "Create Material Folder" } }
+    ,{ "asset.melodyneFolderPrompt", { "此 Melodyne 工程引用了 {count} 个源音频文件夹。是否登记为可复用的素材文件夹？", "此 Melodyne 工程引用了 {count} 個來源音訊資料夾。是否登記為可重複使用的素材資料夾？", "この Melodyne プロジェクトは {count} 個の音源フォルダーを参照しています。再利用可能な素材フォルダーとして登録しますか？", "이 Melodyne 프로젝트는 소스 오디오 폴더 {count}개를 참조합니다. 재사용 가능한 소재 폴더로 등록할까요?", "This Melodyne project references {count} source audio folder(s). Register them as reusable material folders?" } }
+    ,{ "asset.melodyneFolderCreate", { "登记素材夹", "登記素材夾", "登録する", "등록", "Register" } }
+    ,{ "asset.melodyneRegisterInPlace", { "登记（默认）", "登記（預設）", "登録（既定）", "등록(기본)", "Register (default)" } }
+    ,{ "asset.melodyneRegisterCopy", { "登记并复制到文件夹…", "登記並複製到資料夾…", "登録してフォルダーへコピー…", "등록 후 폴더로 복사…", "Register and copy to folder…" } }
+    ,{ "asset.melodyneNoRegister", { "不登记", "不登記", "登録しない", "등록 안 함", "Don't register" } }
+    ,{ "asset.melodyneFolderDone", { "已登记 {count} 个素材文件夹，可在素材管理器中复用。", "已登記 {count} 個素材資料夾，可在素材管理器中重複使用。", "{count} 個の素材フォルダーを登録しました。素材マネージャーで再利用できます。", "소재 폴더 {count}개를 등록했습니다. 소재 관리자에서 재사용할 수 있습니다.", "Registered {count} material folder(s), reusable in the Asset Manager." } }
     ,{ "settings.browse", { "浏览…", "瀏覽…", "参照…", "찾아보기…", "Browse…" } }
     ,{ "settings.utauVoicebank", { "UTAU 默认音源文件夹", "UTAU 預設音源資料夾", "UTAU 既定音源フォルダー", "UTAU 기본 음원 폴더", "Default UTAU Voicebank" } }
     ,{ "settings.utauWavtool", { "UTAU 合成器 / wavtool（可选）", "UTAU 合成器 / wavtool（可選）", "UTAU 合成ツール / wavtool（任意）", "UTAU 합성기 / wavtool (선택)", "UTAU Synthesis Tool / wavtool (optional)" } }

@@ -772,7 +772,9 @@ bool SampleSettings::exportOto(const juce::File& oto, const juce::File& audio,
     juce::String output;
     for (const auto& row : rows)
     {
-        const auto cutoff = -std::max(0.0, audioDuration - row.regionEndSeconds) * 1000.0;
+        // Import interprets negative cutoff as a length from offset. Export a
+        // positive tail trim instead so the exact region end round-trips.
+        const auto cutoff = std::max(0.0, audioDuration - row.regionEndSeconds) * 1000.0;
         output += audio.getFileName() + "=" + row.name + ","
             + juce::String(row.regionStartSeconds * 1000.0, 3) + ","
             + juce::String(row.fixedDurationSeconds * 1000.0, 3) + ","
@@ -987,30 +989,9 @@ bool SampleSettings::updateVoicebankOtoEntry(const VoicebankOtoEntry& original,
     if (!writeOtoTextPreservingEncoding(original.otoFile, output, error))
         return false;
 
-    // UTAU rendering consumes the per-sample HJM sidecar generated from oto.ini.
-    // Refresh it immediately so editing timing is reflected by the next render.
-    if (updated.audioFile.existsAsFile())
-    {
-        juce::AudioFormatManager formats;
-        formats.registerBasicFormats();
-        auto reader = std::unique_ptr<juce::AudioFormatReader>(
-            formats.createReaderFor(updated.audioFile));
-        if (reader == nullptr || reader->sampleRate <= 0.0)
-        {
-            error = "oto.ini was saved, but the audio file could not be read";
-            return false;
-        }
-        const auto duration = static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
-        std::vector<SampleRegionSetting> rows;
-        juce::String sidecarError;
-        if (!importOto(original.otoFile, updated.audioFile, duration, rows, sidecarError)
-            || !save(updated.audioFile, rows, sidecarError))
-        {
-            error = "oto.ini was saved, but its render cache could not be updated: "
-                + sidecarError;
-            return false;
-        }
-    }
+    // OTO edits are authoritative for UTAU banks. Do not mirror them into HJM
+    // implicitly: HJM is a separate native-material storage choice and must be
+    // created only by an explicit user action.
     return true;
 }
 
@@ -1176,15 +1157,12 @@ bool SampleSettings::importVoicebank(const juce::File& root, juce::StringArray& 
             auto reader = std::unique_ptr<juce::AudioFormatReader>(formats.createReaderFor(sample));
             if (reader == nullptr || reader->sampleRate <= 0.0) continue;
             const auto duration = static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
+            // Registering a UTAU bank is read-only by default. Keep OTO as the
+            // authority and do not create HJM sidecars as a hidden conversion.
+            // HJM creation remains an explicit native-material action.
             std::vector<SampleRegionSetting> rows;
             juce::String error;
             if (!importOto(oto, sample, duration, rows, error)) continue;
-            if (!save(sample, rows, error))
-            {
-                warnings.add(error);
-                continue;
-            }
-            ++sidecarsWritten;
             regionsWritten += static_cast<int>(rows.size());
         }
     }

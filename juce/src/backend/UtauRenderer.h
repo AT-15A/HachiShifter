@@ -28,6 +28,15 @@ struct UtauNoteRenderSpec
     double durationSeconds = 0.25;
     float midiNote = 60.0f;
     float gain = 1.0f;
+    // A continuous, unclamped native pitch evaluator: cents away from midiNote
+    // at any local time, including the negative lead-in and the tail past the
+    // note's end.  When set it is authoritative and the sampled pitchCurve
+    // below is only a preview/compatibility projection; the resampler reads the
+    // line at its real sounding times so a note's head/tail pitch follows the
+    // true contour across a seam instead of being held flat by clamping.  This
+    // is a native render feature (not UTAU-specific): the same evaluator feeds
+    // the native backends' per-frame target pitch.
+    std::function<float(double)> timelinePitchCents;
     std::vector<UtauPitchPoint> pitchCurve;
     std::vector<UtauAmplitudePoint> amplitudeEnvelope;
     int consonantVelocity = 100;
@@ -149,6 +158,29 @@ public:
         const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
         int consonantVelocity = 100, bool fourRegion = false,
         bool consonantClasses = false);
+    // The recording an alias resolves to, plus its sounding region and OTO
+    // timing after consonant-velocity scaling and STP.  Voicebank loading is
+    // shared native material code; exposing the resolved sample lets a native
+    // renderer (NSF-HiFiGAN, etc.) read the same audio/OTO without the classic
+    // resampler.  found is false when nothing matched.
+    struct ResolvedSample
+    {
+        bool found = false;
+        juce::File file;
+        double offsetSeconds = 0.0;      // region start in the recording (STP-shifted)
+        double endSeconds = 0.0;         // region end
+        double fileSeconds = 0.0;        // whole recording length
+        double preutteranceSeconds = 0.0;// velocity-adjusted lead-in
+        double consonantSeconds = 0.0;   // unscaled fixed consonant length
+        double overlapSeconds = 0.0;
+        float sourceMidi = 60.0f;
+    };
+    [[nodiscard]] static ResolvedSample resolveVoiceSample(
+        const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
+        int consonantVelocity = 100, bool fourRegion = false,
+        bool consonantClasses = false, double stpSeconds = 0.0,
+        bool preutteranceOverrideEnabled = false, double preutteranceSeconds = 0.0,
+        bool overlapOverrideEnabled = false, double overlapSeconds = 0.0);
     static UtauRenderResult render(const UtauRenderRequest& request);
     // How one note's four regions divide its output.  With no manual split
     // this reproduces the engine's own weight allocation, so what the piano

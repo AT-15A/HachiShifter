@@ -89,6 +89,8 @@ class MainComponent final : public juce::Component,
                             private juce::MenuBarModel
 {
 public:
+    void applyRenderingPreference();
+
     // Where a paste lands when nothing says otherwise.  Carried to another
     // track it goes to the moment it was taken from, which is the point of
     // carrying it; dropped back on its own track that would be on top of
@@ -387,6 +389,10 @@ private:
     void confirmDestructive(const juce::String& title, std::function<void()> action);
     void loadMelodyneFile(const juce::File& file);
     void presentMelodyneComposeSelection(backend::MelodyneImportResult imported);
+    // A Melodyne import references source recordings but is not a registered
+    // material folder yet.  Offer to register the folder(s) holding that media
+    // so the material stays reusable, exactly as a UTAU voicebank import is.
+    void offerMaterialFolderForImport(const ProjectData& imported);
     void focusClip(const juce::String& clipId);
     void focusNote(const juce::String& noteId);
     void updateUtauRenderSelection();
@@ -505,6 +511,30 @@ private:
     EditorViewport timelineViewport;
     EditorViewport pianoViewport;
     juce::Component panelSplitter;
+    // The material manager, docked on the right of the main window so it can be
+    // operated while editing.  Hidden until its menu item is chosen; its width
+    // is drag-resizable via the edge on its left and remembered.
+    std::unique_ptr<AssetManagerComponent> assetManager;
+    std::unique_ptr<juce::ResizableEdgeComponent> assetManagerResizer;
+    // Records the width the drag handle settles on and re-lays the window, so
+    // the panel keeps whatever width the user drags it to.
+    struct AssetManagerConstrainer final : juce::ComponentBoundsConstrainer
+    {
+        std::function<void(int)> onWidth;
+        void checkBounds(juce::Rectangle<int>& bounds,
+                         const juce::Rectangle<int>& previous,
+                         const juce::Rectangle<int>& limits,
+                         bool isStretchingTop, bool isStretchingLeft,
+                         bool isStretchingBottom, bool isStretchingRight) override
+        {
+            juce::ComponentBoundsConstrainer::checkBounds(bounds, previous, limits,
+                isStretchingTop, isStretchingLeft, isStretchingBottom, isStretchingRight);
+            if (onWidth) onWidth(bounds.getWidth());
+        }
+    };
+    AssetManagerConstrainer assetManagerConstrainer;
+    bool assetManagerVisible = false;
+    int assetManagerWidth = 320;
     std::unique_ptr<juce::FileChooser> chooser;
     std::unique_ptr<juce::PropertiesFile> preferences;
     int lastTimelineX = 0;

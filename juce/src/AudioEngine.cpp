@@ -40,6 +40,37 @@ std::optional<std::pair<float, float>> contourAt(const NoteData& note, double lo
     return std::pair { source, leftTarget + (rightTarget - leftTarget) * amount };
 }
 
+float amplitudeGainAt(const std::vector<AmplitudeEnvelopePoint>& envelope,
+                      double localSeconds, float basePercent = 100.0f)
+{
+    // The base value scales the whole envelope, and an empty envelope is an
+    // implied flat 0 dB line that the base raises just the same.  Everything
+    // is done on the linear gain so the -60 dB floor and +12 dB ceiling match
+    // the drawn envelope's own clamps.
+    const auto factor = juce::jlimit(0.0f, 200.0f, basePercent) / 100.0f;
+    const auto apply = [factor](float linearGain)
+    {
+        if (factor <= 1.0e-6f) return 0.0f;
+        const auto scaled = linearGain * factor;
+        if (scaled <= 1.0e-4f) return 0.0f;
+        return juce::jlimit(0.0f, 3.981072f, scaled); // +12 dB ceiling.
+    };
+    if (envelope.empty()) return apply(1.0f);
+    const auto right = std::lower_bound(envelope.begin(), envelope.end(), localSeconds,
+        [](const auto& point, double time) { return point.timeSeconds < time; });
+    if (right == envelope.begin())
+        return apply(std::pow(10.0f, right->gainDb / 20.0f));
+    if (right == envelope.end())
+        return apply(std::pow(10.0f, envelope.back().gainDb / 20.0f));
+    const auto& left = *(right - 1);
+    const auto span = right->timeSeconds - left.timeSeconds;
+    const auto amount = span > 1.0e-9
+        ? static_cast<float>(juce::jlimit(0.0, 1.0,
+            (localSeconds - left.timeSeconds) / span)) : 0.0f;
+    const auto db = left.gainDb + (right->gainDb - left.gainDb) * amount;
+    return apply(std::pow(10.0f, db / 20.0f));
+}
+
 std::pair<float, float> panGains(float pan, bool mono)
 {
     pan = juce::jlimit(-1.0f, 1.0f, pan);
@@ -180,7 +211,9 @@ backend::Mld5FileRenderRequest makeRenderRequest(const ClipData& clip, const Tra
             const auto local = time - note.startSeconds;
             if (local < -1.0e-9 || local > note.durationSeconds + 1.0e-9) continue;
             request.formantSemitones[static_cast<std::size_t>(frame)] = note.formantSemitones;
-            request.noteGain[static_cast<std::size_t>(frame)] = note.gain;
+            const auto clampedLocal = juce::jlimit(0.0, note.durationSeconds, local);
+            request.noteGain[static_cast<std::size_t>(frame)] = note.gain
+                * amplitudeGainAt(note.amplitudeEnvelope, clampedLocal, note.amplitudeEnvelopeBasePercent);
             request.tension[static_cast<std::size_t>(frame)] = note.tension;
             request.breath[static_cast<std::size_t>(frame)] = note.breath;
             // Keep adjacent robust notes as separate detector regions.  A
@@ -189,11 +222,15 @@ backend::Mld5FileRenderRequest makeRenderRequest(const ClipData& clip, const Tra
             // Zero remains disabled; positive values identify the owning note.
             request.robustPitchCurve[static_cast<std::size_t>(frame)] =
                 note.robustPitchCurve ? static_cast<float>(noteIndex + 1) : 0.0f;
-            const auto cents = contourAt(note, juce::jlimit(0.0, note.durationSeconds, local));
+            const auto cents = contourAt(note, clampedLocal);
             if (!cents) break; // Preserve the analysed unvoiced mask.
             const auto sourceCenter = note.sourceMidiCenter >= 0.0f ? note.sourceMidiCenter : note.midiNote;
             request.sourceMidi[static_cast<std::size_t>(frame)] = sourceCenter + cents->first / 100.0f;
-            request.targetMidi[static_cast<std::size_t>(frame)] = note.midiNote + cents->second / 100.0f;
+            // Vibrato is a target-pitch edit, not a display-only decoration.
+            // Keep it in the common request so NSF-HiFiGAN and every model-free
+            // native backend hear exactly what the piano roll draws.
+            request.targetMidi[static_cast<std::size_t>(frame)] = note.midiNote
+                + (cents->second + vibratoCentsAt(note, clampedLocal)) / 100.0f;
             break;
         }
     }
@@ -220,7 +257,8 @@ backend::Mld5FileRenderRequest makeRenderRequest(const ClipData& clip, const Tra
         {
             const auto previousCents = contourAt(*previousNote, previousNote->durationSeconds);
             const auto previousPitch = previousNote->midiNote + (previousCents
-                ? previousCents->second / 100.0f
+                ? (previousCents->second
+                    + vibratoCentsAt(*previousNote, previousNote->durationSeconds)) / 100.0f
                 : 0.0f);
             const auto joinSeconds = std::min(0.08,
                 std::max(0.012, joinedNote.durationSeconds * 0.22));
@@ -236,6 +274,60 @@ backend::Mld5FileRenderRequest makeRenderRequest(const ClipData& clip, const Tra
                 const auto x = static_cast<float>(frame) / static_cast<float>(joinFrames - 1);
                 const auto smooth = x * x * (3.0f - 2.0f * x);
                 target = previousPitch + (target - previousPitch) * smooth;
+            }
+        }
+    }
+
+    // Native timeline-pitch continuity: where two notes abut on the timeline
+    // (not an explicit glide, just neighbours), the per-frame target otherwise
+    // steps from the first note's tail pitch to the next note's head pitch in a
+    // single frame -- an audible seam in the model backends.  Lay the same short
+    // automatic S-transition the UTAU path uses (smoothstep across a small inset
+    // either side of the boundary) directly into the target-MIDI line, so the
+    // one native pitch line the models read is continuous across the seam.  Only
+    // between two voiced sides, so an analysed unvoiced gap is never bridged.
+    {
+        std::vector<std::size_t> order(clip.notes.size());
+        std::iota(order.begin(), order.end(), std::size_t { 0 });
+        std::stable_sort(order.begin(), order.end(), [&](auto left, auto right)
+        {
+            return clip.notes[left].startSeconds < clip.notes[right].startSeconds;
+        });
+        const auto targetAt = [&](double seconds) -> float
+        {
+            const auto frame = static_cast<int>(std::llround(seconds / framePeriodSeconds));
+            if (frame < 0 || frame >= frameCount) return 0.0f;
+            return request.targetMidi[static_cast<std::size_t>(frame)];
+        };
+        for (std::size_t position = 1; position < order.size(); ++position)
+        {
+            const auto& previous = clip.notes[order[position - 1]];
+            const auto& next = clip.notes[order[position]];
+            const auto previousEnd = previous.startSeconds + previous.durationSeconds;
+            if (std::abs(previousEnd - next.startSeconds) > 0.002) continue;
+            // An explicit connection already glided this seam above.
+            if (next.connectedToPrevious) continue;
+            const auto inset = automaticUtauPitchTransitionInset(
+                previous.durationSeconds, next.durationSeconds);
+            const auto startSeconds = previousEnd - inset;
+            const auto endSeconds = next.startSeconds + inset;
+            const auto startPitch = targetAt(startSeconds - framePeriodSeconds * 0.0);
+            const auto endPitch = targetAt(endSeconds);
+            // Both sides must be voiced (a real target); 0 marks unvoiced.
+            if (!(startPitch > 0.0f) || !(endPitch > 0.0f)) continue;
+            const auto firstFrame = juce::jlimit(0, frameCount - 1,
+                static_cast<int>(std::llround(startSeconds / framePeriodSeconds)));
+            const auto lastFrame = juce::jlimit(0, frameCount - 1,
+                static_cast<int>(std::llround(endSeconds / framePeriodSeconds)));
+            if (lastFrame - firstFrame < 2) continue;
+            for (int frame = firstFrame; frame <= lastFrame; ++frame)
+            {
+                auto& target = request.targetMidi[static_cast<std::size_t>(frame)];
+                if (!(target > 0.0f)) continue; // never fabricate over unvoiced
+                const auto x = static_cast<float>(frame - firstFrame)
+                    / static_cast<float>(lastFrame - firstFrame);
+                const auto smooth = x * x * (3.0f - 2.0f * x);
+                target = startPitch + (endPitch - startPitch) * smooth;
             }
         }
     }
@@ -404,12 +496,14 @@ backend::Mld5FileRenderRequest AudioEngine::mergedRequestFor(
             const auto noteLocal = local - note.startSeconds;
             if (noteLocal < -1.0e-9 || noteLocal > note.durationSeconds + 1.0e-9) continue;
             request.formantSemitones[static_cast<std::size_t>(frame)] = note.formantSemitones;
-            request.noteGain[static_cast<std::size_t>(frame)] = note.gain;
+            const auto clampedLocal = juce::jlimit(0.0, note.durationSeconds, noteLocal);
+            request.noteGain[static_cast<std::size_t>(frame)] = note.gain
+                * amplitudeGainAt(note.amplitudeEnvelope, clampedLocal, note.amplitudeEnvelopeBasePercent);
             request.tension[static_cast<std::size_t>(frame)] = note.tension;
             request.breath[static_cast<std::size_t>(frame)] = note.breath;
             request.robustPitchCurve[static_cast<std::size_t>(frame)] =
                 note.robustPitchCurve ? static_cast<float>(index + 1) : 0.0f;
-            const auto cents = contourAt(note, juce::jlimit(0.0, note.durationSeconds, noteLocal));
+            const auto cents = contourAt(note, clampedLocal);
             if (!cents)
             {
                 // Unvoiced: carry the last voiced pitch forward so the model
@@ -424,7 +518,8 @@ backend::Mld5FileRenderRequest AudioEngine::mergedRequestFor(
             const auto sourceCenter = note.sourceMidiCenter >= 0.0f
                 ? note.sourceMidiCenter : note.midiNote;
             lastSourceMidi = sourceCenter + cents->first / 100.0f;
-            lastTargetMidi = note.midiNote + cents->second / 100.0f;
+            lastTargetMidi = note.midiNote
+                + (cents->second + vibratoCentsAt(note, clampedLocal)) / 100.0f;
             request.sourceMidi[static_cast<std::size_t>(frame)] = lastSourceMidi;
             request.targetMidi[static_cast<std::size_t>(frame)] = lastTargetMidi;
             break;
@@ -442,7 +537,9 @@ backend::Mld5FileRenderRequest AudioEngine::mergedRequestFor(
         {
             const auto& note = previousClip.notes.back();
             const auto cents = contourAt(note, note.durationSeconds);
-            previousPitch = note.midiNote + (cents ? cents->second / 100.0f : 0.0f);
+            previousPitch = note.midiNote + (cents
+                ? (cents->second + vibratoCentsAt(note, note.durationSeconds)) / 100.0f
+                : 0.0f);
         }
         const auto joinSeconds = std::min(0.08, std::max(0.012, nextClip.durationSeconds * 0.22));
         const auto firstFrame = juce::jlimit(0, frameCount - 1,
@@ -725,8 +822,18 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
         renderedNote.durationSeconds = note.durationSeconds;
         renderedNote.midiNote = note.midiNote;
         renderedNote.gain = note.gain;
-        renderedNote.amplitudeEnvelope.reserve(note.amplitudeEnvelope.size());
-        for (const auto& point : note.amplitudeEnvelope)
+        // The base value scales the whole envelope, and a note with no
+        // envelope of its own still has an implied flat 0 dB line the base
+        // raises just the same -- write one out so UTAU rendering honours it.
+        auto shapedEnvelope = note.amplitudeEnvelope;
+        if (shapedEnvelope.empty()
+            && std::abs(note.amplitudeEnvelopeBasePercent - 100.0f) > 1.0e-6f)
+            shapedEnvelope = { { 0.0, 0.0f },
+                               { std::max(0.01, note.durationSeconds), 0.0f } };
+        shapedEnvelope = scaledAmplitudeEnvelope(shapedEnvelope,
+                                                 note.amplitudeEnvelopeBasePercent);
+        renderedNote.amplitudeEnvelope.reserve(shapedEnvelope.size());
+        for (const auto& point : shapedEnvelope)
             renderedNote.amplitudeEnvelope.push_back({ point.timeSeconds, point.gainDb });
         // Fitting the envelope to the note it is now is left to the mixer,
         // which is where the note's real lead-in is known.  Carrying only the
@@ -812,6 +919,41 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
                                                         renderedPitchCents(note, point) });
             }
         }
+        // A continuous, unclamped native pitch evaluator, shared by the UTAU
+        // resampler PIT and (via contourAt) the native backends: cents from the
+        // note's own MIDI at any local time, so a seam's lead-in and tail read
+        // the true contour instead of a clamped flat hold.  Captures a copy of
+        // the note so it stays valid for the whole async render.
+        renderedNote.timelinePitchCents =
+            [note, baseMidi = note.midiNote](double time) -> float
+        {
+            const auto vib = static_cast<float>(vibratoCentsAt(note,
+                juce::jlimit(0.0, note.durationSeconds, time)));
+            if (!note.pitchControlPoints.empty())
+                return (evaluatePitchCurve(note.pitchControlPoints, time) - baseMidi)
+                    * 100.0f + vib;
+            if (note.contour.empty()) return vib;
+            const auto sampleContour = [&](double t) -> float
+            {
+                if (t <= note.contour.front().timeSeconds)
+                    return renderedPitchCents(note, note.contour.front());
+                if (t >= note.contour.back().timeSeconds)
+                    return renderedPitchCents(note, note.contour.back());
+                for (std::size_t i = 1; i < note.contour.size(); ++i)
+                {
+                    const auto& l = note.contour[i - 1];
+                    const auto& r = note.contour[i];
+                    if (t > r.timeSeconds) continue;
+                    const auto w = r.timeSeconds - l.timeSeconds;
+                    const auto a = w > 1.0e-9
+                        ? static_cast<float>((t - l.timeSeconds) / w) : 0.0f;
+                    return renderedPitchCents(note, l)
+                        + (renderedPitchCents(note, r) - renderedPitchCents(note, l)) * a;
+                }
+                return renderedPitchCents(note, note.contour.back());
+            };
+            return sampleContour(time) + vib;
+        };
         request.notes.push_back(std::move(renderedNote));
     }
 
@@ -1177,6 +1319,20 @@ int AudioEngine::diagnosticMergedPhraseCount() const
     return phrases;
 }
 
+std::vector<float> AudioEngine::diagnosticNativeTargetMidi(
+    const ProjectData& project, int trackIndex, int clipIndex)
+{
+    if (trackIndex < 0 || trackIndex >= static_cast<int>(project.tracks.size()))
+        return {};
+    const auto& track = project.tracks[static_cast<std::size_t>(trackIndex)];
+    if (clipIndex < 0 || clipIndex >= static_cast<int>(track.clips.size()))
+        return {};
+    const auto& clip = track.clips[static_cast<std::size_t>(clipIndex)];
+    const auto request = makeRenderRequest(clip, track, juce::File{},
+                                           backend::OrtExecutionConfig{});
+    return request.targetMidi;
+}
+
 void AudioEngine::syncProject(const ProjectData& project)
 {
     const juce::ScopedWriteLock guard(renderLock);
@@ -1417,7 +1573,16 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
         for (std::size_t clipIndex = 0; clipIndex < count; ++clipIndex)
         {
             const auto& clip = *orderedClips[clipIndex];
-            const auto utauTrack = track.pitchAlgorithm == PitchAlgorithm::utau;
+            // A voicebank track drives synthesis from note labels + OTO rather
+            // than a placed recording.  It may synthesise through the classic
+            // resampler (PitchAlgorithm::utau) or natively through the one
+            // NSF-HiFiGAN renderer (nsfHifigan + a voicebank directory).  Both
+            // need the same note-driven request path; only the final render
+            // call differs.
+            const auto classicUtau = track.pitchAlgorithm == PitchAlgorithm::utau;
+            const auto nsfVoicebank = track.pitchAlgorithm == PitchAlgorithm::nsfHifigan
+                && track.voicebankDirectory.isDirectory();
+            const auto utauTrack = classicUtau || nsfVoicebank;
             if (clip.muted || (!utauTrack && !clip.sourceFile.existsAsFile())) continue;
             std::shared_ptr<juce::AudioFormatReader> reader;
             if (!utauTrack)
@@ -1687,20 +1852,29 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                                     juce::jlimit(0.0, 1.0, value)),
                                     std::memory_order_release);
                         };
-                        renderService.renderUtau(std::move(request),
-                            // publish is declared const, and a copy captured from a
-                            // const variable stays const however mutable this is.
-                            [forward = publish, measure]
-                                (backend::RenderedAudio result) mutable
-                            {
-                                // Measured before publishing, so a roll that
-                                // sees the audio become ready finds the peaks
-                                // for it already there.
-                                if (result.buffer.getNumSamples() > 0
-                                    && result.sampleRate > 0.0)
-                                    measure(result);
-                                forward(std::move(result));
-                            });
+                        // publish is declared const, and a copy captured from a
+                        // const variable stays const however mutable this is.
+                        auto forwardMeasured = [forward = publish, measure]
+                            (backend::RenderedAudio result) mutable
+                        {
+                            // Measured before publishing, so a roll that sees
+                            // the audio become ready finds the peaks already
+                            // there.
+                            if (result.buffer.getNumSamples() > 0
+                                && result.sampleRate > 0.0)
+                                measure(result);
+                            forward(std::move(result));
+                        };
+                        if (nsfVoicebank)
+                            // A voicebank track on NSF-HiFiGAN synthesises
+                            // natively through the one NSF-HiFiGAN renderer,
+                            // not the classic resampler.
+                            renderService.renderNsfUtau(std::move(request),
+                                hifiganModelDirectory, inferenceConfiguration,
+                                std::move(forwardMeasured));
+                        else
+                            renderService.renderUtau(std::move(request),
+                                std::move(forwardMeasured));
                     }
                     else
                         renderService.renderMld5File(makeRenderRequest(
@@ -2262,6 +2436,60 @@ juce::String AudioEngine::activeRenderWarnings() const
             && loaded->rendered->warning.isNotEmpty())
             warnings.addIfNotAlreadyThere(loaded->rendered->warning);
     return warnings.joinIntoString("; ");
+}
+
+juce::StringArray AudioEngine::renderCapabilityWarnings(const ProjectData& project)
+{
+    // The UTAU resampler path (makeUtauRequest) is the only backend that reads
+    // oto flags, consonant velocity, preutterance/overlap overrides, STP and
+    // the four-region flag split.  Every other backend renders from analysed
+    // source audio through the common request, which already carries pitch,
+    // vibrato, amplitude, formant, tension, breath, gain, drift and modulation
+    // -- so those edits are honoured everywhere and are never warned about.
+    juce::StringArray warnings;
+    for (const auto& track : project.tracks)
+    {
+        if (track.pitchAlgorithm == PitchAlgorithm::utau) continue;
+        auto usesFlags = track.utauGlobalFlags.trim().isNotEmpty();
+        auto usesFlagCurve = false;
+        auto usesConsonantVelocity = false;
+        auto usesTimingOverride = false;
+        auto usesStp = false;
+        auto usesRegionFlags = false;
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+            {
+                usesFlags = usesFlags || note.utauFlags.trim().isNotEmpty();
+                usesFlagCurve = usesFlagCurve || note.utauFlagCurveEnabled;
+                usesConsonantVelocity = usesConsonantVelocity
+                    || (note.utauConsonantVelocity != inheritedUtauConsonantVelocity
+                        && note.utauConsonantVelocity != 100);
+                usesTimingOverride = usesTimingOverride
+                    || note.utauPreutteranceOverrideEnabled
+                    || note.utauOverlapOverrideEnabled;
+                usesStp = usesStp || std::abs(note.utauStpSeconds) > 1.0e-6;
+                usesRegionFlags = usesRegionFlags || note.utauFlagSplit
+                    || note.utauRegionFlags1.isNotEmpty()
+                    || note.utauRegionFlags2.isNotEmpty()
+                    || note.utauRegionFlags3.isNotEmpty()
+                    || note.utauRegionFlags4.isNotEmpty();
+            }
+        const auto note = [&](const juce::String& feature)
+        {
+            warnings.addIfNotAlreadyThere("[" + track.name + "] " + feature);
+        };
+        if (usesFlags || usesFlagCurve)
+            note(juce::String::fromUTF8("UTAU flags 仅在 UTAU 渲染后端生效，当前后端将忽略"));
+        if (usesConsonantVelocity)
+            note(juce::String::fromUTF8("辅音速度仅 UTAU 后端生效；其他后端用起音时间映射近似"));
+        if (usesTimingOverride)
+            note(juce::String::fromUTF8("先行/交叠覆盖仅 UTAU 后端生效"));
+        if (usesStp)
+            note(juce::String::fromUTF8("STP 仅 UTAU 后端生效"));
+        if (usesRegionFlags)
+            note(juce::String::fromUTF8("分区 flag 仅 UTAU 后端生效"));
+    }
+    return warnings;
 }
 
 bool AudioEngine::exportWav(const juce::File& file, juce::String& error,

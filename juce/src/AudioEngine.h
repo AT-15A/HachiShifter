@@ -98,6 +98,13 @@ public:
     bool rewindToFirstPlayableRenderedAudio(double leadInSeconds = 0.03);
     [[nodiscard]] juce::String activeRenderBackends() const;
     [[nodiscard]] juce::String activeRenderWarnings() const;
+    // Which edits the tracks carry that their selected render backend cannot
+    // honour.  Editing is unified across UTAU/Melodyne/native, so a feature is
+    // never hidden while editing; this is where the difference finally shows,
+    // as a warning naming the unrenderable edit rather than a silent drop.
+    // Pure and static so the offline check and the UI read the same rule.
+    [[nodiscard]] static juce::StringArray renderCapabilityWarnings(
+        const ProjectData& project);
     // trackId exports that track alone, for one file per track; empty
     // exports the mix.  Whether a track sounds at all is still decided by
     // mute and solo, exactly as in playback.
@@ -129,6 +136,12 @@ public:
 
     // How many phrases the last sync decided to decode in one pass.
     [[nodiscard]] int diagnosticMergedPhraseCount() const;
+
+    // The per-frame target MIDI the native render request would carry for one
+    // clip, so the automatic pitch-seam S-transition can be tested without the
+    // ONNX model.  Empty when the indices are out of range.
+    [[nodiscard]] static std::vector<float> diagnosticNativeTargetMidi(
+        const ProjectData& project, int trackIndex, int clipIndex);
 
     // The rendered UTAU notes, as peaks to draw.  Shared and immutable, so the
     // roll can hold one while a render replaces it.  Only notes whose audio is

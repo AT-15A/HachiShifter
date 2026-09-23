@@ -14,8 +14,55 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
     GIT_TAG 8.0.8
     GIT_SHALLOW TRUE
+    # Populate first; apply the native helper-tool compatibility patch before
+    # adding JUCE. This directory intentionally does not contain CMakeLists.txt.
+    SOURCE_SUBDIR hachi-deferred-configure
 )
 FetchContent_MakeAvailable(JUCE)
+# JUCE's helper-tool bootstrap starts a second CMake configure. On native
+# Windows that child must receive this same Clang-CL/xwin toolchain; otherwise
+# it silently picks MSYS2 cc.exe/c++.exe and JUCE rejects it as MinGW.
+if(WIN32 AND CMAKE_TOOLCHAIN_FILE)
+    get_filename_component(HACHI_TOOLCHAIN_FILE_ABS
+        "${CMAKE_TOOLCHAIN_FILE}" ABSOLUTE)
+    set(HACHI_JUCEAIDE_FILE
+        "${juce_SOURCE_DIR}/extras/Build/juceaide/CMakeLists.txt")
+    file(READ "${HACHI_JUCEAIDE_FILE}" HACHI_JUCEAIDE_SOURCE)
+    if(NOT HACHI_JUCEAIDE_SOURCE MATCHES "HachiShifter passes the native toolchain")
+        string(REPLACE
+            "\"-DCMAKE_BUILD_TYPE=Custom\""
+            "\"-DCMAKE_BUILD_TYPE=Custom\"\n            \"-DCMAKE_TOOLCHAIN_FILE=${HACHI_TOOLCHAIN_FILE_ABS}\" # HachiShifter passes the native toolchain"
+            HACHI_JUCEAIDE_SOURCE "${HACHI_JUCEAIDE_SOURCE}")
+        file(WRITE "${HACHI_JUCEAIDE_FILE}" "${HACHI_JUCEAIDE_SOURCE}")
+    endif()
+endif()
+# Clang-CL 22 no longer accepts JUCE 8.0.8's pointer-to-array to
+# initializer_list conversion in AudioPluginInstance. Use JUCE's existing
+# array conversion helper explicitly; this is ABI-neutral and also works with
+# MSVC and older Clang-CL releases.
+if(WIN32)
+    set(HACHI_AUDIO_PLUGIN_FILE
+        "${juce_SOURCE_DIR}/modules/juce_audio_processors/processors/juce_AudioPluginInstance.h")
+    file(READ "${HACHI_AUDIO_PLUGIN_FILE}" HACHI_AUDIO_PLUGIN_SOURCE)
+    if(NOT HACHI_AUDIO_PLUGIN_SOURCE MATCHES "HachiShifter array-layout compatibility")
+        string(REPLACE
+            "AudioPluginInstance (const short channelLayoutList[numLayouts][2]) : AudioProcessor (channelLayoutList) {}"
+            "AudioPluginInstance (const short (&channelLayoutList)[numLayouts][2]) : AudioProcessor (channelLayoutList) {} // HachiShifter array-layout compatibility"
+            HACHI_AUDIO_PLUGIN_SOURCE "${HACHI_AUDIO_PLUGIN_SOURCE}")
+        file(WRITE "${HACHI_AUDIO_PLUGIN_FILE}" "${HACHI_AUDIO_PLUGIN_SOURCE}")
+    endif()
+    set(HACHI_AUDIO_PROCESSOR_FILE
+        "${juce_SOURCE_DIR}/modules/juce_audio_processors/processors/juce_AudioProcessor.h")
+    file(READ "${HACHI_AUDIO_PROCESSOR_FILE}" HACHI_AUDIO_PROCESSOR_SOURCE)
+    if(NOT HACHI_AUDIO_PROCESSOR_SOURCE MATCHES "HachiShifter array-layout constructor")
+        string(REPLACE
+            "    AudioProcessor (const BusesProperties& ioLayouts);"
+            "    AudioProcessor (const BusesProperties& ioLayouts);\n    // HachiShifter array-layout constructor\n    template <size_t numLayouts>\n    AudioProcessor (const short (&layouts)[numLayouts][2])\n        : AudioProcessor (busesPropertiesFromLayoutArray (layoutListToArray (layouts))) {}"
+            HACHI_AUDIO_PROCESSOR_SOURCE "${HACHI_AUDIO_PROCESSOR_SOURCE}")
+        file(WRITE "${HACHI_AUDIO_PROCESSOR_FILE}" "${HACHI_AUDIO_PROCESSOR_SOURCE}")
+    endif()
+endif()
+add_subdirectory("${juce_SOURCE_DIR}" "${juce_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
 # JUCE 8.0.8 creates Windows peers with Direct2D before application code can
 # choose an engine. Start with software rendering to avoid driver-dependent
@@ -30,13 +77,28 @@ if(WIN32)
     if(NOT HACHI_WINDOWING_SOURCE MATCHES "parentHWND, false, 0")
         message(FATAL_ERROR "JUCE Windows software-peer patch no longer matches")
     endif()
-    # GDI's onVBlank is a no-op. Do not create a DXGI display-wait thread for
-    # this software-only host: WaitForVBlank can block inside vendor drivers
-    # even when the main window never uses Direct2D.
+    # Restore the original site in caches patched by older releases, then
+    # subscribe only Direct2D peers. Software fallback must not wait on DXGI.
     string(REPLACE
-        "VBlankDispatcher::getInstance()->updateDisplay (*this, currentMonitor);"
         "(void) currentMonitor; // HachiShifter software rendering: no DXGI wait thread"
+        "VBlankDispatcher::getInstance()->updateDisplay (*this, currentMonitor);"
         HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
+    if(NOT HACHI_WINDOWING_SOURCE MATCHES "HachiShifter selective VBlank")
+        string(REPLACE
+            "VBlankDispatcher::getInstance()->updateDisplay (*this, currentMonitor);"
+            "if (renderContext != nullptr && getCurrentRenderingEngine() != 0) VBlankDispatcher::getInstance()->updateDisplay (*this, currentMonitor); // HachiShifter selective VBlank"
+            HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
+    endif()
+    if(NOT HACHI_WINDOWING_SOURCE MATCHES "HachiShifter engine refresh")
+        string(REPLACE
+            "renderContext = contextDescriptors[e].construct (*this);"
+            "renderContext = contextDescriptors[e].construct (*this);\n        if (e == 0) { if (auto* dispatcher = VBlankDispatcher::getInstanceWithoutCreating()) dispatcher->removeListener (*this); }\n        else updateCurrentMonitorAndRefreshVBlankDispatcher (ForceRefreshDispatcher::yes); // HachiShifter engine refresh"
+            HACHI_WINDOWING_SOURCE "${HACHI_WINDOWING_SOURCE}")
+    endif()
+    if(NOT HACHI_WINDOWING_SOURCE MATCHES "HachiShifter selective VBlank" OR
+       NOT HACHI_WINDOWING_SOURCE MATCHES "HachiShifter engine refresh")
+        message(FATAL_ERROR "JUCE rendering engine scheduling patch no longer matches")
+    endif()
     # The peer-level onVBlank used to flush GDI's deferred repaint queue.
     # Without DXGI notifications, enqueue WM_PAINT directly. Windows still
     # coalesces invalid rectangles; do not synchronously paint from callbacks.
@@ -145,6 +207,9 @@ target_sources(HachiShifterNext PRIVATE
     src/Theme.h
     src/I18n.cpp
     src/I18n.h
+    src/Pinyin.cpp
+    src/Pinyin.h
+    src/PinyinTable.inc
     src/SettingsComponent.cpp
     src/SettingsComponent.h
     src/SampleSettings.cpp

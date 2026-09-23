@@ -706,7 +706,12 @@ public:
 
         const auto targetSamples = std::max(1, static_cast<int>(std::llround(
             std::max(0.001, request.targetDurationSeconds) * reader->sampleRate)));
-        if (request.pitchBackend == PitchRenderBackend::mld5)
+        // Robust pitch curve is a native analysis stabilizer, not a UTAU flag.
+        // NSF has no source-MIDI input tensor, so apply the same corrected
+        // target curve before its F0 conversion instead of silently dropping
+        // the feature on the neural backend.
+        if (request.pitchBackend == PitchRenderBackend::mld5
+            || request.pitchBackend == PitchRenderBackend::nsfHifigan)
             applyRobustPitchCurve(request.sourceMidi, request.targetMidi,
                                   request.robustPitchCurve);
         juce::AudioBuffer<float> rendered;
@@ -952,6 +957,38 @@ private:
     FileCompletion completion;
 };
 
+class RenderService::NsfUtauRenderJob final : public juce::ThreadPoolJob
+{
+public:
+    NsfUtauRenderJob(UtauRenderRequest requestToUse, juce::File modelDirectoryToUse,
+                     OrtExecutionConfig executionToUse, FileCompletion completionToUse)
+        : ThreadPoolJob("nsf-utau-phrase-render"), request(std::move(requestToUse)),
+          modelDirectory(std::move(modelDirectoryToUse)),
+          execution(std::move(executionToUse)),
+          completion(std::move(completionToUse))
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        if (shouldExit()) return jobHasFinished;
+        auto rendered = renderNsfUtauPhrase(request, modelDirectory, execution);
+        if (shouldExit()) return jobHasFinished;
+        if (rendered.warning.isNotEmpty())
+            juce::Logger::writeToLog("NSF-UTAU: " + rendered.warning);
+        if (completion)
+            completion({ std::move(rendered.buffer), rendered.sampleRate,
+                         std::move(rendered.backend), std::move(rendered.warning) });
+        return jobHasFinished;
+    }
+
+private:
+    UtauRenderRequest request;
+    juce::File modelDirectory;
+    OrtExecutionConfig execution;
+    FileCompletion completion;
+};
+
 RenderService::RenderService()
     : pool(std::max(1, juce::SystemStats::getNumCpus() - 1))
 {
@@ -975,6 +1012,13 @@ void RenderService::renderMld5File(Mld5FileRenderRequest request, FileCompletion
 void RenderService::renderUtau(UtauRenderRequest request, FileCompletion completion)
 {
     pool.addJob(new UtauRenderJob(std::move(request), std::move(completion)), true);
+}
+
+void RenderService::renderNsfUtau(UtauRenderRequest request, juce::File modelDirectory,
+                                  OrtExecutionConfig execution, FileCompletion completion)
+{
+    pool.addJob(new NsfUtauRenderJob(std::move(request), std::move(modelDirectory),
+                                     std::move(execution), std::move(completion)), true);
 }
 
 void RenderService::cancelAll()

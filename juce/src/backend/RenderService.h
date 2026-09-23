@@ -76,12 +76,19 @@ public:
     void renderMld5(Mld5RenderRequest request, Completion completion);
     void renderMld5File(Mld5FileRenderRequest request, FileCompletion completion);
     void renderUtau(UtauRenderRequest request, FileCompletion completion);
+    // Native NSF-HiFiGAN voicebank synthesis of a whole UTAU phrase.  Same
+    // request the classic UTAU path uses; the one NSF-HiFiGAN renderer does the
+    // synthesis (renderNsfUtauPhrase), so a voicebank track on NSF-HiFiGAN is a
+    // native render, not the classic resampler.
+    void renderNsfUtau(UtauRenderRequest request, juce::File modelDirectory,
+                       OrtExecutionConfig execution, FileCompletion completion);
     void cancelAll();
 
 private:
     class RenderJob;
     class FileRenderJob;
     class UtauRenderJob;
+    class NsfUtauRenderJob;
     juce::ThreadPool pool;
 };
 }

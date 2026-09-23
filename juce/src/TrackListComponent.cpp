@@ -176,6 +176,13 @@ void TrackListComponent::resized()
     globalFlagsEditor.toFront(false);
 }
 
+void TrackListComponent::lookAndFeelChanged()
+{
+    consonantVelocityLabel.setColour(juce::Label::textColourId, Palette::textMuted);
+    globalFlagsLabel.setColour(juce::Label::textColourId, Palette::textMuted);
+    repaint();
+}
+
 void TrackListComponent::paint(juce::Graphics& g)
 {
     g.fillAll(Palette::panel);
@@ -229,7 +236,7 @@ void TrackListComponent::paint(juce::Graphics& g)
             const juce::Rectangle<float> bounds(x, buttonY, 28.0f, 21.0f);
             g.setColour(active ? activeColour : Palette::panelRaised);
             g.fillRoundedRectangle(bounds, 3.0f);
-            g.setColour(active ? Palette::panel : Palette::textMuted);
+            g.setColour(active ? activeColour.contrasting(0.85f) : Palette::textMuted);
             g.setFont(11.0f);
             g.drawText(label, bounds.toNearestInt(), juce::Justification::centred);
         };

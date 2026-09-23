@@ -7,12 +7,14 @@
 #include "backend/UtauRenderer.h"
 #include "backend/UstImporter.h"
 #include "backend/Llsm2Renderer.h"
+#include "backend/NsfHifiganRenderer.h"
 #include "AudioEngine.h"
 #include "OtoWaveformEditorComponent.h"
 #include "VoicebankSettingsComponent.h"
 #include "PianoRollComponent.h"
 #include "TimelineComponent.h"
 #include "TrackListComponent.h"
+#include "AssetManagerComponent.h"
 #include "SampleSettings.h"
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <algorithm>
@@ -3770,9 +3772,12 @@ public:
             };
             const auto inThePlainMenu = has(plain, 18);
             const auto notInTheUtauMenu = !has(utau, 18);
-            // And the split of everything else is undisturbed.
-            const auto plainStillShort = plain.size() == 10;
-            const auto utauStillWhole = utau.size() == 18;
+            // And the split of everything else is undisturbed.  The shared
+            // forced-connection (20) and envelope-base (23) items are on both,
+            // so each menu is two longer than the original UTAU-only split.
+            // Pinyin lead-in (24) is UTAU-only, so it lifts the UTAU count too.
+            const auto plainStillShort = plain.size() == 12;
+            const auto utauStillWhole = utau.size() == 21;
 
             ProjectModel project;
             const auto ust = juce::File::getSpecialLocation(juce::File::tempDirectory)
@@ -4330,6 +4335,78 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-native-pitch-seam")
+        {
+            // Two adjacent native (mld5) notes an octave apart: the per-frame
+            // target MIDI must cross the boundary with a short smoothstep S
+            // transition, not a one-frame jump, and must never fabricate pitch
+            // over an unvoiced gap.  Tests makeRenderRequest's native timeline
+            // pitch continuity without the ONNX model.
+            ProjectModel project;
+            const auto wav = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-seam-" + juce::Uuid().toDashedString() + ".wav");
+            constexpr auto rate = 44100.0;
+            {
+                juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * 1.2));
+                for (int i = 0; i < buffer.getNumSamples(); ++i)
+                    buffer.setSample(0, i, static_cast<float>(0.3
+                        * std::sin(2.0 * juce::MathConstants<double>::pi
+                                   * 200.0 * i / rate)));
+                juce::WavAudioFormat format;
+                std::unique_ptr<juce::FileOutputStream> stream(wav.createOutputStream());
+                std::unique_ptr<juce::AudioFormatWriter> writer(
+                    format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                if (writer != nullptr) { stream.release();
+                    writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples()); }
+            }
+            const auto clipId = project.addAudioFile(wav, 1.0, 0.0, {});
+            const auto trackId = project.snapshot().tracks.front().id;
+            project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::mld5);
+            // Two abutting notes: 0.0..0.5 at C4 (60), 0.5..1.0 at C5 (72).
+            project.addNote(clipId, 0.0, 0.5, 60.0f);
+            project.addNote(clipId, 0.5, 0.5, 72.0f);
+            wav.deleteFile();
+
+            const auto target = AudioEngine::diagnosticNativeTargetMidi(
+                project.snapshot(), 0, 0);
+            // Boundary frame index at 0.5s, 5ms frames.
+            const auto boundary = static_cast<int>(std::lround(0.5 / 0.005));
+            auto maxStep = 0.0f;
+            auto voicedFrames = 0;
+            for (std::size_t i = 1; i < target.size(); ++i)
+                if (target[i] > 0.0f && target[i - 1] > 0.0f)
+                {
+                    maxStep = std::max(maxStep, std::abs(target[i] - target[i - 1]));
+                    ++voicedFrames;
+                }
+            // Pitches present at both ends.
+            const auto headVoiced = boundary > 10 && target[static_cast<std::size_t>(10)] > 55.0f
+                && target[static_cast<std::size_t>(10)] < 65.0f;
+            const auto tailIdx = std::min<int>(static_cast<int>(target.size()) - 5, boundary + 30);
+            const auto tailVoiced = tailIdx > 0 && target[static_cast<std::size_t>(tailIdx)] > 67.0f;
+            // The seam is smoothed: no single 5ms frame jumps the whole octave.
+            // A hard step would be ~12 semitones in one frame; the S transition
+            // spreads it over several frames so each step is well under that.
+            const auto smoothed = maxStep < 4.0f && voicedFrames > 0;
+            // Monotone rise across the boundary (60 -> 72), sampled a few frames
+            // either side.
+            const auto before = target[static_cast<std::size_t>(std::max(0, boundary - 6))];
+            const auto after = target[static_cast<std::size_t>(std::min(
+                static_cast<int>(target.size()) - 1, boundary + 6))];
+            const auto risesAcross = after > before + 3.0f;
+
+            const auto ok = headVoiced && tailVoiced && smoothed && risesAcross;
+            std::cout << "head_voiced=" << (headVoiced ? 1 : 0)
+                      << "|tail_voiced=" << (tailVoiced ? 1 : 0)
+                      << "|seam_smoothed=" << (smoothed ? 1 : 0)
+                      << "|rises_across=" << (risesAcross ? 1 : 0)
+                      << "|max_frame_step_st=" << maxStep
+                      << "|frames=" << target.size()
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 1 && arguments[0] == "--smoke-native-pitch-points")
         {
             // The pitch-point tool was UTAU-only: the button was hidden, the
@@ -4714,7 +4791,7 @@ public:
             // Everything the handler can be asked to do has to appear in at
             // least one of the menus, or an item exists that nothing offers.
             const std::vector<int> handled { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                             11, 12, 13, 14, 15, 16, 17, 18, 19 };
+                                             11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24 };
             auto allReachable = true;
             for (const auto id : handled)
                 if (!has(utau, id) && !has(plain, id)) allReachable = false;
@@ -4724,7 +4801,7 @@ public:
 
             // The plain menu is the general pitch/note edits, including
             // vibrato, plus the plain-only pitch-line reset.
-            const std::vector<int> general { 1, 2, 5, 6, 7, 8, 13, 18, 11, 10 };
+            const std::vector<int> general { 1, 2, 5, 6, 7, 8, 13, 18, 11, 10, 20, 23 };
             auto plainIsGeneral = plain.size() == general.size();
             for (const auto id : general)
                 if (!has(plain, id)) plainIsGeneral = false;
@@ -8629,6 +8706,552 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-envelope-base")
+        {
+            // 包络基础值: scales the whole amplitude envelope without reshaping
+            // it, on any track type, persists through save/load, and undoes in
+            // one step.  A shared amplitude concept, not a UTAU-only command.
+            I18n strings;
+            const auto onBothMenus = []
+            {
+                const auto utau = PianoRollComponent::noteMenuItemsFor(true);
+                const auto plain = PianoRollComponent::noteMenuItemsFor(false);
+                const auto has = [](const std::vector<int>& v, int id)
+                { return std::find(v.begin(), v.end(), id) != v.end(); };
+                return has(utau, 23) && has(plain, 23);
+            }();
+
+            ProjectModel project;
+            const auto ust = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-envbase-" + juce::Uuid().toDashedString() + ".ust");
+            ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\n"
+                                "Tempo=120.00\r\nTracks=1\r\nProjectName=e\r\n"
+                                "[#0000]\r\nLength=960\r\nLyric=a\r\nNoteNum=60\r\n"
+                                "[#TRACKEND]\r\n");
+            juce::String ustError;
+            juce::StringArray ustWarnings;
+            const auto built = project.addUstFile(ust, ustError, ustWarnings);
+            ust.deleteFile();
+            if (!built)
+            {
+                std::cout << "built=0|error=" << ustError << std::endl;
+                setApplicationReturnValue(3);
+                juce::MessageManager::callAsync([this] { quit(); });
+                return;
+            }
+            const auto noteId = project.snapshot().tracks.front()
+                .clips.front().notes.front().id;
+            const auto baseOf = [&project]
+            {
+                return project.snapshot().tracks.front().clips.front()
+                    .notes.front().amplitudeEnvelopeBasePercent;
+            };
+            const auto startedAt100 = std::abs(baseOf() - 100.0f) < 1.0e-6f;
+            project.setNotesAmplitudeEnvelopeBase({ noteId }, 150.0f);
+            const auto setTo150 = std::abs(baseOf() - 150.0f) < 1.0e-4f;
+
+            // The scale is applied in the dB domain: 150% is +3.52 dB.
+            const std::vector<AmplitudeEnvelopePoint> flat { { 0.0, 0.0f }, { 0.5, 0.0f } };
+            const auto scaled = scaledAmplitudeEnvelope(flat, 150.0f);
+            const auto scaledUp = scaled.size() == 2
+                && std::abs(scaled[0].gainDb - static_cast<float>(20.0 * std::log10(1.5))) < 0.01f;
+            const auto roundTrip = unscaledAmplitudeEnvelope(scaled, 150.0f);
+            const auto backToZero = roundTrip.size() == 2
+                && std::abs(roundTrip[0].gainDb) < 0.01f;
+
+            // Save and reload: the base survives.
+            const auto hjpx = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-envbase-" + juce::Uuid().toDashedString() + ".hjpx");
+            juce::String saveError;
+            const auto saved = project.save(hjpx, saveError);
+            ProjectModel reloaded;
+            juce::String loadError;
+            const auto loadedOk = saved && reloaded.load(hjpx, loadError);
+            hjpx.deleteFile();
+            const auto persisted = loadedOk
+                && std::abs(reloaded.snapshot().tracks.front().clips.front()
+                    .notes.front().amplitudeEnvelopeBasePercent - 150.0f) < 1.0e-4f;
+
+            // One undo step returns it.
+            project.undo();
+            const auto undoes = std::abs(baseOf() - 100.0f) < 1.0e-6f;
+
+            const auto ok = onBothMenus && startedAt100 && setTo150 && scaledUp
+                && backToZero && persisted && undoes;
+            std::cout << "on_both_menus=" << (onBothMenus ? 1 : 0)
+                      << "|started_at_100=" << (startedAt100 ? 1 : 0)
+                      << "|set_to_150=" << (setTo150 ? 1 : 0)
+                      << "|scaled_up_in_db=" << (scaledUp ? 1 : 0)
+                      << "|round_trip_back=" << (backToZero ? 1 : 0)
+                      << "|persisted=" << (persisted ? 1 : 0)
+                      << "|undoes=" << (undoes ? 1 : 0)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-nsf-utau-phrase")
+        {
+            // The whole-phrase entry point on the one NSF-HiFiGAN renderer:
+            // resolve samples, plan, synthesise, overlap-mix.  Without the ONNX
+            // model it must warn gracefully (never crash or fall back), and it
+            // must be the shared UtauRenderRequest the editor already builds.
+            backend::UtauRenderRequest request;
+            request.voicebankDirectory = juce::File::getSpecialLocation(
+                juce::File::tempDirectory).getChildFile(
+                    "hachi-novb-" + juce::Uuid().toDashedString());
+            request.targetDurationSeconds = 1.0;
+            backend::UtauNoteRenderSpec n1;
+            n1.alias = "a"; n1.startSeconds = 0.0; n1.durationSeconds = 0.5; n1.midiNote = 60.0f;
+            backend::UtauNoteRenderSpec rest;
+            rest.alias = "R"; rest.startSeconds = 0.5; rest.durationSeconds = 0.2; rest.midiNote = 60.0f;
+            request.notes = { n1, rest };
+            backend::OrtExecutionConfig exec;
+            const auto out = backend::renderNsfUtauPhrase(request, juce::File{}, exec);
+            const auto warnsNoModel = out.warning.containsIgnoreCase("model")
+                && out.buffer.getNumSamples() == 0;
+            const auto namedNativeBackend = out.backend.containsIgnoreCase("nsf-hifigan")
+                && out.backend.containsIgnoreCase("native");
+
+            const auto ok = warnsNoModel && namedNativeBackend;
+            std::cout << "warns_when_model_absent=" << (warnsNoModel ? 1 : 0)
+                      << "|native_backend_named=" << (namedNativeBackend ? 1 : 0)
+                      << "|backend=" << out.backend << "|warning=" << out.warning
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-nsf-utau-synth")
+        {
+            // The synthesis entry point composes plan + F0 + neural decode.
+            // Without the ONNX model pack it must report a clear error, never
+            // fail silently or fall back to another engine.
+            using hachi::backend::NsfUtauSampleTiming;
+            using hachi::backend::buildNsfUtauNotePlan;
+            using hachi::backend::synthesizeNsfUtauNote;
+            const auto media = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-nsfutau-" + juce::Uuid().toDashedString() + ".wav");
+            {
+                constexpr auto rate = 44100.0;
+                juce::AudioBuffer<float> tone(1, static_cast<int>(rate * 1.0));
+                for (int i = 0; i < tone.getNumSamples(); ++i)
+                    tone.setSample(0, i, static_cast<float>(
+                        0.2 * std::sin(2.0 * juce::MathConstants<double>::pi
+                                       * 220.0 * i / rate)));
+                media.deleteFile();
+                juce::WavAudioFormat wav;
+                if (auto stream = media.createOutputStream())
+                    if (auto writer = std::unique_ptr<juce::AudioFormatWriter>(
+                            wav.createWriterFor(stream.release(), rate, 1, 16, {}, 0)))
+                        writer->writeFromAudioSampleBuffer(tone, 0, tone.getNumSamples());
+            }
+            NsfUtauSampleTiming timing;
+            timing.offsetSeconds = 0.1; timing.endSeconds = 0.9;
+            timing.consonantSeconds = 0.08; timing.preutteranceSeconds = 0.05;
+            timing.overlapSeconds = 0.03; timing.fileSeconds = 1.0;
+            const auto plan = buildNsfUtauNotePlan(timing, 1.0, 0.5, 1.0, 0.1);
+            backend::OrtExecutionConfig exec;
+            // No model directory configured -> unavailable, must be reported.
+            const auto synth = synthesizeNsfUtauNote(media, plan, 60.0f, {},
+                juce::File{}, exec);
+            media.deleteFile();
+            const auto reportedNotSilent = !synth.usedModel
+                && synth.audio.getNumSamples() == 0
+                && synth.error.isNotEmpty();
+            const auto namesTheModel = synth.error.containsIgnoreCase("model");
+
+            const auto ok = reportedNotSilent && namesTheModel;
+            std::cout << "graceful_when_model_absent=" << (reportedNotSilent ? 1 : 0)
+                      << "|error_names_model=" << (namesTheModel ? 1 : 0)
+                      << "|error=" << synth.error
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-nsf-utau-f0")
+        {
+            // The note's pitch is the NSF model's F0 input, so the pitch line
+            // and vibrato land here as per-frame target MIDI, never a resample.
+            // The lead-in before the beat holds the head pitch.
+            using hachi::backend::NsfUtauPitchPoint;
+            using hachi::backend::buildNsfUtauTargetMidi;
+            // A note at MIDI 60 that bends up to +200 cents (one whole tone) by
+            // its middle and back.  Output starts 0.05 s before the beat.
+            std::vector<NsfUtauPitchPoint> curve {
+                { 0.0, 0.0f }, { 0.25, 200.0f }, { 0.5, 0.0f } };
+            const auto frames = buildNsfUtauTargetMidi(60.0f, curve, 5.0, 0.55, -0.05);
+            const auto frameAt = [&](double outputTime)
+            {
+                const auto idx = juce::jlimit(0, static_cast<int>(frames.size()) - 1,
+                    static_cast<int>(std::lround(outputTime / 0.005)));
+                return frames[static_cast<std::size_t>(idx)];
+            };
+            // Output t=0 is note-local -0.05 (lead-in): holds head pitch 60.
+            const auto leadInHoldsHead = std::abs(frameAt(0.0) - 60.0f) < 1.0e-3f;
+            // Output t=0.05 is note-local 0.0: pitch 60.
+            const auto startAtNote = std::abs(frameAt(0.05) - 60.0f) < 0.02f;
+            // Output t=0.30 is note-local 0.25: peak +200 cents = MIDI 62.
+            const auto peakBend = std::abs(frameAt(0.30) - 62.0f) < 0.05f;
+            // Output t=0.55 is note-local 0.50: back to 60.
+            const auto returns = std::abs(frameAt(0.55) - 60.0f) < 0.05f;
+            // A note with no pitch curve is flat at its own MIDI.
+            const auto flat = buildNsfUtauTargetMidi(67.0f, {}, 5.0, 0.3, 0.0);
+            const auto flatHolds = !flat.empty()
+                && std::abs(flat.front() - 67.0f) < 1.0e-6f
+                && std::abs(flat.back() - 67.0f) < 1.0e-6f;
+
+            const auto ok = leadInHoldsHead && startAtNote && peakBend && returns
+                && flatHolds;
+            std::cout << "lead_in_holds_head=" << (leadInHoldsHead ? 1 : 0)
+                      << "|start_at_note=" << (startAtNote ? 1 : 0)
+                      << "|peak_bend_2st=" << (peakBend ? 1 : 0)
+                      << "|returns=" << (returns ? 1 : 0)
+                      << "|no_curve_flat=" << (flatHolds ? 1 : 0)
+                      << "|peak=" << frameAt(0.30)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-nsf-utau-mix")
+        {
+            // Native overlap crossfade mixing (the wavtool equivalent, done
+            // directly rather than through the UTAU path): two touching notes
+            // cross over the second note's head overlap, and a rest holds its
+            // place without adding audio.
+            using hachi::backend::NsfUtauMixNote;
+            using hachi::backend::mixNsfUtauNotes;
+            constexpr auto rate = 48000.0;
+            const auto flat = [](double seconds, float value)
+            {
+                juce::AudioBuffer<float> b(1, static_cast<int>(rate * seconds));
+                for (int i = 0; i < b.getNumSamples(); ++i) b.setSample(0, i, value);
+                return b;
+            };
+            std::vector<NsfUtauMixNote> notes;
+            notes.push_back({ flat(0.50, 1.0f), 0.0, 0.0, false });   // 0.00..0.50
+            notes.push_back({ flat(0.50, 1.0f), 0.45, 0.10, false }); // fades in 0.45..0.55
+            const auto mix = mixNsfUtauNotes(notes, 1.0, rate, 1);
+            const auto sampleAt = [&](double t)
+            {
+                return mix.getSample(0, juce::jlimit(0, mix.getNumSamples() - 1,
+                    static_cast<int>(std::lround(t * rate))));
+            };
+            // The mix is peak-normalised (as UTAU's wavtool is), so test the
+            // shape relatively: the two single-note plateaus sit at the same
+            // level, and the equal-power crossover stays near that level (no
+            // 2x sum bump) rather than at an absolute value.
+            const auto steady1 = sampleAt(0.20);   // note 1 only
+            const auto steady2 = sampleAt(0.80);   // note 2 only
+            // Inside the shared sounding region (note 1's 0.45..0.50 tail under
+            // note 2's fade-in), where both notes really overlap.
+            const auto mid = sampleAt(0.475);
+            const auto beforeOverlap = steady1 > 0.05f;
+            const auto afterOverlap = std::abs(steady2 - steady1) < 0.05f * steady1;
+            const auto midOverlap = mid > 0.8f * steady1 && mid < 1.5f * steady1;
+            const auto noClip = mix.getMagnitude(0, 0, mix.getNumSamples()) <= 0.99f;
+
+            // A rest between two notes contributes no audio but the mix still
+            // covers the timeline.
+            std::vector<NsfUtauMixNote> withRest;
+            withRest.push_back({ flat(0.30, 0.5f), 0.0, 0.0, false });
+            withRest.push_back({ {}, 0.30, 0.0, true });
+            withRest.push_back({ flat(0.30, 0.5f), 0.60, 0.0, false });
+            const auto restMix = mixNsfUtauNotes(withRest, 1.0, rate, 1);
+            const auto restSilent = std::abs(restMix.getSample(0,
+                static_cast<int>(0.45 * rate))) < 1.0e-4f;
+            const auto restCovers = restMix.getNumSamples()
+                == static_cast<int>(std::ceil(1.0 * rate));
+
+            const auto ok = beforeOverlap && midOverlap && afterOverlap && noClip
+                && restSilent && restCovers;
+            std::cout << "before_overlap_note1=" << (beforeOverlap ? 1 : 0)
+                      << "|mid_overlap_crossfades=" << (midOverlap ? 1 : 0)
+                      << "|after_overlap_note2=" << (afterOverlap ? 1 : 0)
+                      << "|no_clip=" << (noClip ? 1 : 0)
+                      << "|rest_silent=" << (restSilent ? 1 : 0)
+                      << "|rest_covers_timeline=" << (restCovers ? 1 : 0)
+                      << "|steady1=" << steady1 << "|mid=" << mid
+                      << "|steady2=" << steady2 << "|mid475=" << sampleAt(0.475)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-nsf-utau-plan")
+        {
+            // Native NSF-HiFiGAN UTAU note planning: the OTO timing becomes a
+            // pure time warp (pitch is the model's F0 input, never baked into
+            // the map), the consonant stretches by velocity, the vowel fills
+            // the note, and the lead-in sits before the beat.  No model needed.
+            using hachi::backend::NsfUtauSampleTiming;
+            using hachi::backend::buildNsfUtauNotePlan;
+            NsfUtauSampleTiming timing;
+            timing.offsetSeconds = 0.10;     // region starts 100 ms in
+            timing.endSeconds = 0.90;        // region ends at 900 ms
+            timing.consonantSeconds = 0.08;  // 80 ms consonant
+            timing.preutteranceSeconds = 0.05;
+            timing.overlapSeconds = 0.03;
+            timing.fileSeconds = 1.20;
+
+            // A 0.5 s note starting at 1.0 s, neutral velocity (scale 1.0),
+            // 0.1 s tail for the next note's overlap.
+            const auto plan = buildNsfUtauNotePlan(timing, 1.0, 0.5, 1.0, 0.1);
+            const auto valid = plan.valid;
+            const auto leadInBeforeBeat = std::abs(
+                plan.soundStartOffsetSeconds + 0.05) < 1.0e-6;
+            const auto sourceRegion = std::abs(plan.sourceStartSeconds - 0.10) < 1.0e-6
+                && std::abs(plan.sourceEndSeconds - 0.90) < 1.0e-6;
+            const auto output = std::abs(plan.outputSeconds - (0.05 + 0.5 + 0.1)) < 1.0e-6;
+            // Map is monotonic in both axes and never resamples for pitch: the
+            // last anchor reaches the region end.
+            auto monotonic = plan.timeMap.size() >= 2;
+            for (std::size_t i = 1; i < plan.timeMap.size(); ++i)
+                monotonic = monotonic
+                    && plan.timeMap[i].targetSeconds > plan.timeMap[i-1].targetSeconds
+                    && plan.timeMap[i].sourceSeconds >= plan.timeMap[i-1].sourceSeconds;
+            const auto vowelReachesEnd = !plan.timeMap.empty()
+                && std::abs(plan.timeMap.back().sourceSeconds - 0.90) < 1.0e-6
+                && std::abs(plan.timeMap.front().sourceSeconds - 0.10) < 1.0e-6;
+
+            // A faster velocity (scale < 1) shortens the consonant's output
+            // span, reaching the vowel sooner.
+            const auto fast = buildNsfUtauNotePlan(timing, 1.0, 0.5, 0.5, 0.1);
+            auto consonantShorter = fast.valid && fast.timeMap.size() >= 3
+                && plan.timeMap.size() >= 3
+                && fast.timeMap[1].targetSeconds < plan.timeMap[1].targetSeconds + 1.0e-9;
+
+            const auto ok = valid && leadInBeforeBeat && sourceRegion && output
+                && monotonic && vowelReachesEnd && consonantShorter;
+            std::cout << "valid=" << (valid ? 1 : 0)
+                      << "|lead_in_before_beat=" << (leadInBeforeBeat ? 1 : 0)
+                      << "|source_region=" << (sourceRegion ? 1 : 0)
+                      << "|output_len=" << (output ? 1 : 0)
+                      << "|map_monotonic_no_pitch_resample=" << (monotonic ? 1 : 0)
+                      << "|vowel_reaches_end=" << (vowelReachesEnd ? 1 : 0)
+                      << "|velocity_shortens_consonant=" << (consonantShorter ? 1 : 0)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-render-capability")
+        {
+            // Editing never hides a feature; the difference shows only at
+            // render, as a warning naming the edit the backend cannot honour.
+            // A UTAU track warns about nothing (its backend honours all of it);
+            // the same edits on a non-UTAU track are named, one per feature.
+            ProjectModel project;
+            const auto ust = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-cap-" + juce::Uuid().toDashedString() + ".ust");
+            ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\n"
+                                "Tempo=120.00\r\nTracks=1\r\nProjectName=c\r\n"
+                                "[#0000]\r\nLength=960\r\nLyric=a\r\nNoteNum=60\r\n"
+                                "[#TRACKEND]\r\n");
+            juce::String ustError;
+            juce::StringArray ustWarnings;
+            const auto built = project.addUstFile(ust, ustError, ustWarnings);
+            ust.deleteFile();
+            if (!built)
+            {
+                std::cout << "built=0|error=" << ustError << std::endl;
+                setApplicationReturnValue(3);
+                juce::MessageManager::callAsync([this] { quit(); });
+                return;
+            }
+            const auto trackId = project.snapshot().tracks.front().id;
+            const auto noteId = project.snapshot().tracks.front()
+                .clips.front().notes.front().id;
+            // A UTAU flag on the note: an edit only the UTAU backend renders.
+            project.setNoteUtauFlags(noteId, "g-5");
+
+            // On a UTAU track, nothing is unrenderable.
+            project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+            const auto onUtau = AudioEngine::renderCapabilityWarnings(project.snapshot());
+            const auto utauSilent = onUtau.isEmpty();
+
+            // The identical edit on an NSF track is named as unrenderable.
+            project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::nsfHifigan);
+            const auto onNsf = AudioEngine::renderCapabilityWarnings(project.snapshot());
+            const auto nsfWarns = onNsf.size() == 1
+                && onNsf[0].contains("flags");
+
+            const auto ok = utauSilent && nsfWarns;
+            std::cout << "utau_backend_silent=" << (utauSilent ? 1 : 0)
+                      << "|nsf_names_the_flag=" << (nsfWarns ? 1 : 0)
+                      << "|utau_count=" << onUtau.size()
+                      << "|nsf_count=" << onNsf.size()
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 2 && arguments[0] == "--smoke-asset-register-dir")
+        {
+            // Register an existing on-disk folder as a material folder (the
+            // "register into <name>" path, e.g. a "tt" folder), list its
+            // members, and confirm reading bare audio derives timing in memory
+            // without writing any oto.ini or HJM sidecar into the folder.
+            I18n strings;
+            const juce::File folder(arguments[1].unquoted());
+            const auto propsFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-tt-" + juce::Uuid().toDashedString() + ".settings");
+            juce::PropertiesFile::Options options;
+            options.applicationName = "hachi-asset-tt-smoke";
+            options.filenameSuffix = "settings";
+            options.folderName = propsFile.getParentDirectory().getFullPathName();
+            options.storageFormat = juce::PropertiesFile::storeAsXML;
+            juce::PropertiesFile properties(propsFile, options);
+
+            // Snapshot which sidecars/oto exist before registering, so we can
+            // prove registration + reading created none.
+            juce::Array<juce::File> before;
+            folder.findChildFiles(before, juce::File::findFiles, false, "*.hjm");
+            const auto otoBefore = folder.getChildFile("oto.ini").existsAsFile();
+
+            AssetManagerComponent manager(strings, properties);
+            const auto index = manager.diagnosticRegisterFolder(folder);
+            const auto members = manager.diagnosticMembersOf(index);
+
+            juce::Array<juce::File> after;
+            folder.findChildFiles(after, juce::File::findFiles, false, "*.hjm");
+            const auto otoAfter = folder.getChildFile("oto.ini").existsAsFile();
+            const auto wroteNothing = after.size() == before.size()
+                && otoAfter == otoBefore;
+
+            const auto ok = index >= 0 && members.size() > 0 && wroteNothing;
+            std::cout << "registered=" << (index >= 0 ? 1 : 0)
+                      << "|members=" << members.size()
+                      << "|wrote_no_sidecar=" << (wroteNothing ? 1 : 0)
+                      << "|folder=" << folder.getFileName()
+                      << std::endl;
+            propsFile.deleteFile();
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-asset-manager")
+        {
+            // The material manager: a folder is registered, audio added to it
+            // gets its parameters detected at once, and lyrics assemble into an
+            // ordered material sequence by pinyin -- the from-scratch workflow.
+            I18n strings;
+            const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-assets-" + juce::Uuid().toDashedString());
+            root.createDirectory();
+            const auto writeTone = [](const juce::File& file, double seconds)
+            {
+                constexpr auto rate = 44100.0;
+                juce::AudioBuffer<float> tone(1, static_cast<int>(rate * seconds));
+                for (int sample = 0; sample < tone.getNumSamples(); ++sample)
+                    tone.setSample(0, sample, static_cast<float>(
+                        0.2 * std::sin(2.0 * juce::MathConstants<double>::pi
+                                       * 200.0 * sample / rate)));
+                file.deleteFile();
+                juce::WavAudioFormat wav;
+                if (auto stream = file.createOutputStream())
+                    if (auto writer = std::unique_ptr<juce::AudioFormatWriter>(
+                            wav.createWriterFor(stream.release(), rate, 1, 16, {}, 0)))
+                        writer->writeFromAudioSampleBuffer(tone, 0, tone.getNumSamples());
+            };
+            // A source "voicebank" folder named in pinyin, and a loose file.
+            const auto bank = root.getChildFile("bank");
+            bank.createDirectory();
+            for (const auto* stem : { "wo", "xiang", "yao" })
+                writeTone(bank.getChildFile(juce::String(stem) + ".wav"), 0.4);
+            const auto loose = root.getChildFile("loose.wav");
+            writeTone(loose, 0.4);
+            const auto scratch = root.getChildFile("scratch");
+            scratch.createDirectory();
+
+            const auto propsFile = root.getChildFile("props.settings");
+            juce::PropertiesFile::Options options;
+            options.applicationName = "hachi-asset-smoke";
+            options.filenameSuffix = "settings";
+            options.folderName = propsFile.getParentDirectory().getFullPathName();
+            options.storageFormat = juce::PropertiesFile::storeAsXML;
+            juce::PropertiesFile properties(propsFile, options);
+
+            AssetManagerComponent manager(strings, properties);
+            // Register the bank folder and read its members.
+            const auto bankIndex = manager.diagnosticRegisterFolder(bank);
+            const auto bankMembers = manager.diagnosticMembersOf(bankIndex);
+            const auto registeredBank = bankIndex >= 0 && bankMembers.size() == 3;
+
+            // A from-scratch folder: add the loose file, parameters detected.
+            const auto scratchIndex = manager.diagnosticRegisterFolder(scratch);
+            const auto added = manager.diagnosticAddAudioToFolder(scratchIndex,
+                { loose.getFullPathName() });
+            const auto scratchMember = scratch.getChildFile("loose.wav");
+            const auto detectedParams = added == 1
+                && SampleSettings::sidecarFor(scratchMember).existsAsFile();
+
+            // 活字印刷: assemble "我想要" from the bank folder.
+            int matched = 0, missing = 0;
+            juce::String assembleError;
+            const auto assembled = manager.diagnosticAssembleLyrics(bankIndex,
+                juce::String::fromUTF8("\xe6\x88\x91\xe6\x83\xb3\xe8\xa6\x81"),
+                "song", matched, missing, assembleError);
+            juce::Array<juce::File> ordered;
+            if (assembled != juce::File{})
+                assembled.findChildFiles(ordered, juce::File::findFiles, false, "*.wav");
+            const auto assembledInOrder = assembled != juce::File{}
+                && matched == 3 && missing == 0 && ordered.size() == 3;
+            auto firstIsWo = false;
+            if (!ordered.isEmpty())
+            {
+                ordered.sort();
+                firstIsWo = ordered[0].getFileName().startsWith("001_")
+                    && ordered[0].getFileName().contains("wo");
+            }
+            // The assembled sequence is itself registered for reuse next time.
+            if (assembled != juce::File{}) manager.diagnosticRegisterFolder(assembled);
+            const auto reusable = manager.diagnosticFolderCount() >= 3;
+
+            // 另存为 OTO: the bank folder's native parameters export to one
+            // oto.ini, and reading OTO earlier wrote no HJM sidecar (OTO stays
+            // authoritative, converted to native annotation only in memory).
+            const auto otoOut = root.getChildFile("exported-oto.ini");
+            juce::String otoError;
+            const auto otoRows = manager.diagnosticExportFolderAsOto(bankIndex,
+                otoOut, otoError);
+            const auto exportedOto = otoRows == 3 && otoOut.existsAsFile();
+            auto bankHasNoHjm = true;
+            for (const auto& stem : { "wo", "xiang", "yao" })
+                if (SampleSettings::sidecarFor(
+                        bank.getChildFile(juce::String(stem) + ".wav")).existsAsFile())
+                    bankHasNoHjm = false;
+
+            // Native parameter editing on a from-scratch material writes back
+            // to its HJM sidecar (never an oto.ini), and the change round-trips.
+            juce::String nativeError;
+            const auto nativeSaved = AssetManagerComponent::diagnosticWriteNativeTiming(
+                scratchMember, 20.0, 30.0, 40.0, 25.0, 15.0, nativeError);
+            const auto reread = SampleSettings::loadOrDerive(scratchMember, ProjectData{});
+            const auto nativeRoundTrips = nativeSaved && !reread.empty()
+                && std::abs(reread.front().regionStartSeconds - 0.02) < 1.0e-4
+                && !scratch.getChildFile("oto.ini").existsAsFile();
+
+            root.deleteRecursively();
+            const auto ok = registeredBank && detectedParams && assembledInOrder
+                && firstIsWo && reusable && exportedOto && bankHasNoHjm
+                && nativeRoundTrips;
+            std::cout << "registered_bank=" << (registeredBank ? 1 : 0)
+                      << "|detected_params_on_add=" << (detectedParams ? 1 : 0)
+                      << "|assembled_in_order=" << (assembledInOrder ? 1 : 0)
+                      << "|first_is_wo=" << (firstIsWo ? 1 : 0)
+                      << "|assembly_reusable=" << (reusable ? 1 : 0)
+                      << "|exported_oto=" << (exportedOto ? 1 : 0)
+                      << "|read_wrote_no_hjm=" << (bankHasNoHjm ? 1 : 0)
+                      << "|native_edit_round_trips=" << (nativeRoundTrips ? 1 : 0)
+                      << "|matched=" << matched << "|missing=" << missing
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 2 && arguments[0] == "--smoke-gap-menu")
         {
             // The silence between two notes is a thing you can right-click.
@@ -10493,6 +11116,119 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 3 && arguments[0] == "--render-project")
+        {
+            // Headless render of a UTAU project through the same AudioEngine +
+            // RenderService the GUI uses, so a consistency check renders exactly
+            // what the app would.  Args: project.hjpx  out.wav  [voicebankDir]
+            //   [resamplerExe]  [hifiganModelDir]
+            ProjectModel project;
+            juce::String loadError;
+            if (!project.load(juce::File(arguments[1].unquoted()), loadError))
+            {
+                std::cout << "loaded=0|error=" << loadError << std::endl;
+                setApplicationReturnValue(2);
+                juce::MessageManager::callAsync([this] { quit(); });
+                return;
+            }
+            auto data = project.snapshot();
+            if (arguments.size() >= 4 && arguments[3].isNotEmpty())
+            {
+                const juce::File vb(arguments[3].unquoted());
+                for (auto& track : data.tracks)
+                    if (track.pitchAlgorithm == PitchAlgorithm::utau)
+                        track.voicebankDirectory = vb;
+            }
+            // Optional 7th arg: solo one track by 0-based index (mute the rest),
+            // so a single-track reference bounce can be matched exactly.
+            if (arguments.size() >= 7 && arguments[6].isNotEmpty())
+            {
+                const auto soloIndex = arguments[6].getIntValue();
+                for (std::size_t t = 0; t < data.tracks.size(); ++t)
+                    data.tracks[t].muted = (static_cast<int>(t) != soloIndex);
+            }
+            // Optional 8th arg: render order override -- "splice" =
+            // stretchSpliceThenPitch (先拼接后合成), "process" = processThenSplice
+            // (先合成后拼接).  Lets a consistency check exercise either NSF order.
+            if (arguments.size() >= 8 && arguments[7].isNotEmpty())
+            {
+                const auto order = arguments[7].toLowerCase();
+                const auto ro = order.startsWith("splice")
+                    ? RenderOrder::stretchSpliceThenPitch
+                    : RenderOrder::processThenSplice;
+                for (auto& track : data.tracks) track.renderOrder = ro;
+            }
+            cliAudioEngine = std::make_unique<AudioEngine>();
+            if (arguments.size() >= 5 && arguments[4].isNotEmpty())
+                cliAudioEngine->setUtauResamplerFile(juce::File(arguments[4].unquoted()));
+            if (arguments.size() >= 6 && arguments[5].isNotEmpty())
+                cliAudioEngine->setHifiganModelDirectory(juce::File(arguments[5].unquoted()));
+            // UTAU rendering is selection-driven; a headless full render selects
+            // every note so the whole song is synthesised, not just a marquee.
+            cliAudioEngine->selectEveryUtauNote(data);
+            cliAudioEngine->syncProject(data);
+            const auto deadline = juce::Time::getMillisecondCounter() + 1'800'000;
+            for (;;)
+            {
+                const auto progress = cliAudioEngine->renderProgress();
+                if (!progress.has_value()) break;
+                if (juce::Time::getMillisecondCounter() > deadline)
+                {
+                    std::cout << "rendered=0|error=timeout|progress=" << *progress << std::endl;
+                    setApplicationReturnValue(4);
+                    juce::MessageManager::callAsync([this] { quit(); });
+                    return;
+                }
+                juce::Thread::sleep(200);
+            }
+            juce::String exportError;
+            const auto ok = cliAudioEngine->exportWav(juce::File(arguments[2].unquoted()),
+                exportError);
+            std::cout << "rendered=" << (ok ? 1 : 0)
+                      << "|output=" << arguments[2]
+                      << "|backend=" << cliAudioEngine->activeRenderBackends()
+                      << "|warning=" << cliAudioEngine->activeRenderWarnings()
+                      << (ok ? juce::String() : "|error=" + exportError) << std::endl;
+            setApplicationReturnValue(ok ? 0 : 3);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 2 && arguments[0] == "--inspect-project")
+        {
+            ProjectModel project;
+            juce::String error;
+            if (!project.load(juce::File(arguments[1].unquoted()), error))
+            {
+                std::cout << "loaded=0|error=" << error << std::endl;
+                setApplicationReturnValue(2);
+                juce::MessageManager::callAsync([this] { quit(); });
+                return;
+            }
+            const auto data = project.snapshot();
+            std::cout << "loaded=1|bpm=" << data.bpm
+                      << "|duration=" << data.durationSeconds()
+                      << "|tracks=" << data.tracks.size() << std::endl;
+            for (const auto& track : data.tracks)
+            {
+                std::size_t notes = 0;
+                for (const auto& clip : track.clips) notes += clip.notes.size();
+                const auto algo = track.pitchAlgorithm == PitchAlgorithm::utau ? "utau"
+                    : track.pitchAlgorithm == PitchAlgorithm::nsfHifigan ? "nsf-hifigan"
+                    : track.pitchAlgorithm == PitchAlgorithm::world ? "world"
+                    : track.pitchAlgorithm == PitchAlgorithm::llsm2 ? "llsm2"
+                    : track.pitchAlgorithm == PitchAlgorithm::mld5 ? "mld5"
+                    : track.pitchAlgorithm == PitchAlgorithm::mld3 ? "mld3" : "other";
+                std::cout << "track|name=" << track.name
+                          << "|pitchAlgo=" << algo
+                          << "|voicebank=" << track.voicebankDirectory.getFullPathName()
+                          << "|vbExists=" << (track.voicebankDirectory.isDirectory() ? 1 : 0)
+                          << "|clips=" << track.clips.size()
+                          << "|notes=" << notes
+                          << "|flags=" << track.utauGlobalFlags << std::endl;
+            }
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (!arguments.isEmpty() && arguments[0] == "--inspect-settings")
         {
             I18n diagnosticStrings;
@@ -11141,14 +11877,6 @@ private:
         {
             setUsingNativeTitleBar(true);
             startupLog("MainWindow: constructed, creating editor");
-           #if JUCE_WINDOWS
-            if (auto* peer = getPeer())
-            {
-                const auto engines = peer->getAvailableRenderingEngines();
-                const auto software = engines.indexOf("Software Renderer");
-                if (software >= 0) peer->setCurrentRenderingEngine(software);
-            }
-           #endif
             std::cerr << "startup: creating editor" << std::endl;
             setContentOwned(new MainComponent(), true);
             startupLog("MainWindow: editor created");
@@ -11162,6 +11890,8 @@ private:
             startupLog("MainWindow: addToDesktop begin");
             addToDesktop(getDesktopWindowStyleFlags());
             startupLog("MainWindow: native peer created");
+            if (auto* editor = dynamic_cast<MainComponent*>(getContentComponent()))
+                editor->applyRenderingPreference();
             setVisible(true);
             startupLog("MainWindow: visible");
             juce::MessageManager::callAsync([] { startupLog("Application: message loop responsive"); });

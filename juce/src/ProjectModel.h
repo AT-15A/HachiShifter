@@ -354,8 +354,21 @@ struct NoteData
     // deliberately added collinear handle survives simplification and save/load.
     std::vector<PitchCurveEditPoint> pitchControlPoints;
     std::vector<AmplitudeEnvelopePoint> amplitudeEnvelope;
+    // Scales the whole amplitude envelope up or down without changing its
+    // shape.  100 is the envelope as drawn; 200 is twice as loud; 0 is silence.
+    // A note with no envelope of its own still has an implied flat 100% line,
+    // which this raises like any other.
+    float amplitudeEnvelopeBasePercent = 100.0f;
     std::vector<double> sibilantMarkers;
 };
+
+// Scales an amplitude envelope by a base percent (100 = unchanged), in the
+// dB domain, clamped to the same [-60, +12] dB range the UST importer uses.
+[[nodiscard]] std::vector<AmplitudeEnvelopePoint> scaledAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& points, float basePercent);
+// The inverse: recover the drawn envelope from a scaled one.
+[[nodiscard]] std::vector<AmplitudeEnvelopePoint> unscaledAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& points, float basePercent);
 
 [[nodiscard]] float renderedPitchCents(const NoteData& note, const PitchPoint& point);
 
@@ -605,6 +618,15 @@ public:
     [[nodiscard]] juce::String splitNote(const juce::String& noteId,
                                          double localSeconds);
     [[nodiscard]] juce::String mergeNotes(const std::vector<juce::String>& noteIds);
+    // Explicitly connect selected notes without destructively merging their
+    // editable data. Pairs may cross clips and source-material regions.
+    void setNotesConnection(const std::vector<juce::String>& noteIds, bool enabled);
+    // Inserts a zero-length lead-in note in front of this one carrying the same
+    // lyric, and pins the following note's preutterance to 0 with the given
+    // overlap, so a consonant can be sung ahead of the beat.  Returns the new
+    // note's id, or empty when the note is already at the clip start.
+    [[nodiscard]] juce::String insertPrefixNote(const juce::String& noteId,
+                                                double targetOverlapSeconds);
     void setNoteModulation(const juce::String& noteId, float modulation);
     void setNoteDrift(const juce::String& noteId, float drift);
     void setNoteTension(const juce::String& noteId, float tension);
@@ -618,6 +640,9 @@ public:
     // action to the person doing it, so one Ctrl+Z should take it back rather
     // than walking the phrase backwards a syllable at a time.
     void setNoteLabels(const std::vector<std::pair<juce::String, juce::String>>& labels);
+    // Convert Chinese lyrics without tying the command to an import source or
+    // renderer; callers decide which track/selection to apply it to.
+    int convertTrackLyricsToPinyin(const juce::String& trackId);
     void setNoteUtauFlags(const juce::String& noteId, const juce::String& flags);
     void setNotesUtauFlags(const std::vector<juce::String>& noteIds,
                            const juce::String& flags);
@@ -636,6 +661,10 @@ public:
                                   std::vector<AmplitudeEnvelopePoint> points);
     bool setNotesAmplitudeEnvelopes(
         std::vector<std::pair<juce::String, std::vector<AmplitudeEnvelopePoint>>> envelopes);
+    // Scales the whole amplitude envelope of these notes by a base percent
+    // (100 = unchanged, 200 = twice as loud, 0 = silence) without reshaping it.
+    void setNotesAmplitudeEnvelopeBase(const std::vector<juce::String>& noteIds,
+                                       float basePercent);
     // Where a new note goes, and whether there is room for one at all.
     //
     // Notes on one track are a sequence, not a chord: the UTAU modes splice

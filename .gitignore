@@ -54,3 +54,6 @@ __pycache__/
 /reverse/algo_test/test_algo
 /reverse/algo_test/test_algo_local
 /reverse/algo_test/mpd_dump
+juce/build-dsh/
+build-dsh/
+juce/build/

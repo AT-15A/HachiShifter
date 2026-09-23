@@ -1,4 +1,5 @@
 #include "ProjectModel.h"
+#include "Pinyin.h"
 #include "SampleSettings.h"
 #include "backend/UstImporter.h"
 #include "backend/NsfHifiganRenderer.h"
@@ -42,6 +43,41 @@ NativeSegmentRole parseNativeSegmentRole(const juce::String& value)
     if (role == "noise") return NativeSegmentRole::noise;
     if (role == "ending") return NativeSegmentRole::ending;
     return NativeSegmentRole::unknown;
+}
+
+namespace
+{
+float scaledEnvelopeGainDb(float gainDb, double factor)
+{
+    // Silence stays silence however it is scaled, and the renderer reads
+    // anything at or below -60 dB as nothing at all.
+    if (gainDb <= -59.9f || factor <= 1.0e-9) return -60.0f;
+    const auto level = std::pow(10.0, gainDb / 20.0) * factor;
+    if (level <= 1.0e-4) return -60.0f;
+    // The same ceiling the UST importer writes envelopes against: +12 dB is
+    // 400%, as far as a base of 200 can take a point already at 200%.
+    return juce::jlimit(-60.0f, 12.0f, static_cast<float>(20.0 * std::log10(level)));
+}
+}
+
+std::vector<AmplitudeEnvelopePoint> scaledAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& points, float basePercent)
+{
+    auto scaled = points;
+    const auto factor = juce::jlimit(0.0f, 200.0f, basePercent) / 100.0;
+    if (std::abs(factor - 1.0) < 1.0e-9) return scaled;
+    for (auto& point : scaled) point.gainDb = scaledEnvelopeGainDb(point.gainDb, factor);
+    return scaled;
+}
+
+std::vector<AmplitudeEnvelopePoint> unscaledAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& points, float basePercent)
+{
+    auto plain = points;
+    const auto factor = juce::jlimit(0.0f, 200.0f, basePercent) / 100.0;
+    if (std::abs(factor - 1.0) < 1.0e-9 || factor <= 1.0e-9) return plain;
+    for (auto& point : plain) point.gainDb = scaledEnvelopeGainDb(point.gainDb, 1.0 / factor);
+    return plain;
 }
 
 float renderedPitchCents(const NoteData& note, const PitchPoint& point)
@@ -2870,63 +2906,9 @@ void ProjectModel::setNoteAttackSpeed(const juce::String& noteId, float attackSp
 
 namespace
 {
-struct NativeLabelUpdate
-{
-    juce::File source;
-    double startSeconds = 0.0;
-    double endSeconds = 0.0;
-    juce::String oldLabel;
-    juce::String newLabel;
-};
-
-void persistNativeLabels(const std::vector<NativeLabelUpdate>& updates)
-{
-    for (const auto& update : updates)
-    {
-        if (!update.source.existsAsFile()) continue;
-        const auto sidecar = SampleSettings::sidecarFor(update.source);
-        const juce::File legacy(update.source.getFullPathName() + ".hachi.csv");
-        if (!sidecar.existsAsFile() && !legacy.existsAsFile()) continue;
-        auto rows = SampleSettings::loadOrDerive(update.source, ProjectData{});
-        auto matched = std::find_if(rows.begin(), rows.end(), [&](const auto& row)
-        {
-            return std::abs(row.regionStartSeconds - update.startSeconds) < 0.002
-                && std::abs(row.regionEndSeconds - update.endSeconds) < 0.002;
-        });
-        if (matched == rows.end()) continue;
-        matched->name = update.newLabel;
-        if (update.newLabel == "_") matched->role = NativeSegmentRole::transition;
-        else if (update.newLabel == "-") matched->role = NativeSegmentRole::unknown;
-        else if (matched->role == NativeSegmentRole::unknown
-                 || matched->role == NativeSegmentRole::transition)
-            matched->role = NativeSegmentRole::vowel;
-        if (matched->segments.empty())
-            matched->segments = SampleSettings::nativeSegmentsFor(*matched);
-        for (auto& segment : matched->segments)
-        {
-            const auto isPlaceholder = segment.alias == update.oldLabel
-                || segment.alias == "-" || segment.alias == "_";
-            if (isPlaceholder && segment.role != NativeSegmentRole::transition)
-                segment.alias = update.newLabel;
-        }
-        juce::String error;
-        if (!SampleSettings::save(update.source, rows, error))
-            DBG("Could not persist native HJM label: " + error);
-    }
-}
-
-// What changing a note's lyric costs it, wherever that happens.
-//
-// Preutterance and overlap are millimetre marks on one particular recording,
-// so they cannot follow the note to another one: kept, they pin the new
-// sound's lead-in to a length its own oto never asked for, which also freezes
-// the consonant handle, since an override outranks whatever the velocity says.
-// Consonant velocity is a ratio and stays meaningful, so it is left alone.
-//
-// A hand-placed four-region split is where the consonant, the glide and the
-// tail sit in one recording.  Another recording divides differently, so the
-// note goes back to following its own oto rather than keeping proportions
-// read off a waveform it no longer plays.
+// Changing a lyric is an HJPX edit. Material annotations are written only by
+// the explicit material editor, never as a hidden side effect of note editing.
+// This keeps UTAU OTO libraries read-only during ordinary project editing.
 void relabelNote(NoteData& note, const juce::String& trimmed)
 {
     const auto native = !note.nativeSegments.empty();
@@ -2947,8 +2929,8 @@ void relabelNote(NoteData& note, const juce::String& trimmed)
     note.utauPreutteranceSeconds = 0.0;
     note.utauOverlapOverrideEnabled = false;
     note.utauOverlapSeconds = 0.0;
-    // An STP is a distance into one particular recording.  Another recording
-    // has its sound somewhere else, so it goes back to zero with the rest.
+    // An STP is tied to one recording. Changing the alias returns to the
+    // selected voicebank entry instead of carrying the old recording offset.
     note.utauStpSeconds = 0.0;
     note.utauJieSplitSet = false;
     note.utauJieSplit1 = 0.0;
@@ -2961,7 +2943,6 @@ void ProjectModel::setNoteLabels(
     const std::vector<std::pair<juce::String, juce::String>>& labels)
 {
     auto changed = false;
-    std::vector<NativeLabelUpdate> nativeUpdates;
     {
         const juce::ScopedLock guard(lock);
         for (const auto& [noteId, label] : labels)
@@ -2974,27 +2955,11 @@ void ProjectModel::setNoteLabels(
                         {
                             // Once for the whole batch, so it undoes as one.
                             if (!changed) pushUndoLocked();
-                            if (!note.nativeSegments.empty())
-                            {
-                                const auto ratio = clip.durationSeconds > 1.0e-9
-                                    ? clip.sourceDurationSeconds / clip.durationSeconds : 1.0;
-                                const auto sourceStart = note.nativeSourceStartSeconds >= 0.0
-                                    ? note.nativeSourceStartSeconds
-                                    : clip.sourceOffsetSeconds + note.startSeconds * ratio;
-                                const auto sourceEnd = note.nativeSourceEndSeconds >= sourceStart
-                                    ? note.nativeSourceEndSeconds
-                                    : clip.sourceOffsetSeconds
-                                        + (note.startSeconds + note.durationSeconds) * ratio;
-                                nativeUpdates.push_back({ clip.sourceFile,
-                                    sourceStart, sourceEnd,
-                                    note.label, trimmed });
-                            }
                             relabelNote(note, trimmed);
                             changed = true;
                         }
         }
     }
-    persistNativeLabels(nativeUpdates);
     if (changed) sendChangeMessage();
 }
 
@@ -3002,7 +2967,6 @@ void ProjectModel::setNoteLabel(const juce::String& noteId, const juce::String& 
 {
     const auto trimmed = label.trim().isEmpty() ? juce::String("-") : label.trim();
     auto changed = false;
-    std::vector<NativeLabelUpdate> nativeUpdates;
     {
         const juce::ScopedLock guard(lock);
         for (auto& track : project.tracks)
@@ -3011,28 +2975,38 @@ void ProjectModel::setNoteLabel(const juce::String& noteId, const juce::String& 
                     if (note.id == noteId && note.label != trimmed)
                     {
                         pushUndoLocked();
-                        if (!note.nativeSegments.empty())
-                        {
-                            const auto ratio = clip.durationSeconds > 1.0e-9
-                                ? clip.sourceDurationSeconds / clip.durationSeconds : 1.0;
-                            const auto sourceStart = note.nativeSourceStartSeconds >= 0.0
-                                ? note.nativeSourceStartSeconds
-                                : clip.sourceOffsetSeconds + note.startSeconds * ratio;
-                            const auto sourceEnd = note.nativeSourceEndSeconds >= sourceStart
-                                ? note.nativeSourceEndSeconds
-                                : clip.sourceOffsetSeconds
-                                    + (note.startSeconds + note.durationSeconds) * ratio;
-                            nativeUpdates.push_back({ clip.sourceFile,
-                                sourceStart, sourceEnd,
-                                note.label, trimmed });
-                        }
                         relabelNote(note, trimmed);
                         changed = true;
                         break;
                     }
     }
-    persistNativeLabels(nativeUpdates);
     if (changed) sendChangeMessage();
+}
+
+int ProjectModel::convertTrackLyricsToPinyin(const juce::String& trackId)
+{
+    auto changed = false;
+    auto count = 0;
+    {
+        const juce::ScopedLock guard(lock);
+        for (auto& track : project.tracks)
+        {
+            if (track.id != trackId) continue;
+            for (auto& clip : track.clips)
+                for (auto& note : clip.notes)
+                {
+                    const auto converted = lyricInPinyin(note.label);
+                    if (converted == note.label) continue;
+                    if (!changed) pushUndoLocked();
+                    relabelNote(note, converted);
+                    changed = true;
+                    ++count;
+                }
+            break;
+        }
+    }
+    if (changed) sendChangeMessage();
+    return count;
 }
 
 void ProjectModel::setNoteUtauFlags(const juce::String& noteId, const juce::String& flags)
@@ -3795,6 +3769,30 @@ bool ProjectModel::setNotesAmplitudeEnvelopes(
     return changed;
 }
 
+void ProjectModel::setNotesAmplitudeEnvelopeBase(
+    const std::vector<juce::String>& noteIds, float basePercent)
+{
+    if (noteIds.empty()) return;
+    auto changed = false;
+    {
+        const juce::ScopedLock guard(lock);
+        const auto next = juce::jlimit(0.0f, 200.0f, basePercent);
+        auto pushed = false;
+        for (auto& track : project.tracks)
+            for (auto& clip : track.clips)
+                for (auto& note : clip.notes)
+                {
+                    if (std::find(noteIds.begin(), noteIds.end(), note.id) == noteIds.end())
+                        continue;
+                    if (std::abs(note.amplitudeEnvelopeBasePercent - next) <= 1.0e-6f) continue;
+                    if (!pushed) { pushUndoLocked(); pushed = true; }
+                    note.amplitudeEnvelopeBasePercent = next;
+                    changed = true;
+                }
+    }
+    if (changed) sendChangeMessage();
+}
+
 void ProjectModel::setNoteRobustPitchCurve(const juce::String& noteId, bool enabled)
 {
     auto changed = false;
@@ -4339,6 +4337,137 @@ void ProjectModel::toggleNoteConnection(const juce::String& noteId)
     if (changed) sendChangeMessage();
 }
 
+juce::String ProjectModel::insertPrefixNote(const juce::String& noteId,
+                                           double targetOverlapSeconds)
+{
+    juce::String created;
+    {
+        const juce::ScopedLock guard(lock);
+        for (auto& track : project.tracks)
+            for (auto& clip : track.clips)
+            {
+                const auto found = std::find_if(clip.notes.begin(), clip.notes.end(),
+                    [&noteId](const auto& note) { return note.id == noteId; });
+                if (found == clip.notes.end()) continue;
+                if (found->startSeconds <= 1.0e-9) return {};
+                pushUndoLocked();
+                // Its vowel from its own beat, so the consonant is heard up to
+                // it.  The overlap it had goes back in with the pin, since the
+                // two are pinned together.
+                found->utauPreutteranceOverrideEnabled = true;
+                found->utauPreutteranceSeconds = 0.0;
+                found->utauOverlapOverrideEnabled = true;
+                found->utauOverlapSeconds = std::isfinite(targetOverlapSeconds)
+                    ? targetOverlapSeconds : 0.0;
+                NoteData prefix;
+                prefix.id = makeId("note");
+                prefix.startSeconds = found->startSeconds;
+                prefix.durationSeconds = 0.0;
+                prefix.consonantSeconds = 0.0;
+                prefix.midiNote = found->midiNote;
+                prefix.sourceMidiCenter = found->midiNote;
+                prefix.label = found->label;
+                prefix.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                prefix.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                created = prefix.id;
+                clip.notes.insert(found, std::move(prefix));
+                break;
+            }
+    }
+    if (created.isNotEmpty()) sendChangeMessage();
+    return created;
+}
+
+void ProjectModel::setNotesConnection(const std::vector<juce::String>& noteIds,
+                                       bool enabled)
+{
+    if (noteIds.size() < 2) return;
+    const auto includes = [&](const juce::String& id)
+    {
+        return std::find(noteIds.begin(), noteIds.end(), id) != noteIds.end();
+    };
+    auto changed = false;
+    {
+        const juce::ScopedLock guard(lock);
+        struct Positioned
+        {
+            NoteData* note = nullptr;
+            ClipData* clip = nullptr;
+            double start = 0.0;
+        };
+        std::vector<std::vector<Positioned>> groups;
+        for (auto& track : project.tracks)
+        {
+            std::vector<Positioned> selected;
+            for (auto& clip : track.clips)
+                for (auto& note : clip.notes)
+                    if (includes(note.id))
+                        selected.push_back({ &note, &clip,
+                            clip.startSeconds + note.startSeconds });
+            if (selected.size() >= 2)
+            {
+                std::stable_sort(selected.begin(), selected.end(),
+                    [](const auto& left, const auto& right) { return left.start < right.start; });
+                groups.push_back(std::move(selected));
+            }
+        }
+        if (groups.empty()) return;
+        pushUndoLocked();
+        // A note has one incoming and one outgoing native boundary. Clear both
+        // sides of replaced records before erasing them, so a forced
+        // connection cannot silently leave stale compatibility booleans.
+        for (auto& track : project.tracks)
+            for (auto& clip : track.clips)
+                for (auto& note : clip.notes)
+                    for (const auto& connection : project.nativeConnections)
+                        if (includes(connection.leftNoteId) || includes(connection.rightNoteId))
+                        {
+                            if (note.id == connection.leftNoteId) note.connectedToNext = false;
+                            if (note.id == connection.rightNoteId) note.connectedToPrevious = false;
+                        }
+        std::erase_if(project.nativeConnections, [&](const auto& connection)
+        {
+            return includes(connection.leftNoteId) || includes(connection.rightNoteId);
+        });
+        for (auto& track : project.tracks)
+            for (auto& clip : track.clips)
+                for (auto& note : clip.notes)
+                {
+                    if (includes(note.id))
+                    {
+                        note.connectedToPrevious = false;
+                        note.connectedToNext = false;
+                    }
+                    if (enabled)
+                        for (const auto& group : groups)
+                            for (std::size_t index = 1; index < group.size(); ++index)
+                                if (group[index - 1].note->id == note.id)
+                                    note.connectedToNext = true;
+                }
+        if (enabled)
+            for (const auto& group : groups)
+                for (std::size_t index = 1; index < group.size(); ++index)
+                {
+                    auto* left = group[index - 1].note;
+                    auto* right = group[index].note;
+                    if (group[index - 1].clip != group[index].clip)
+                    {
+                        group[index - 1].clip->glideConnectedToNext = true;
+                        group[index].clip->glideConnectedFromPrevious = true;
+                    }
+                    right->connectedToPrevious = true;
+                    left->connectedToNext = true;
+                    project.nativeConnections.push_back({
+                        makeId("connection"), left->id, right->id,
+                        "pitch-and-amplitude",
+                        (group[index - 1].start + group[index].start) * 0.5,
+                        {}, {} });
+                }
+        changed = true;
+    }
+    if (changed) sendChangeMessage();
+}
+
 void ProjectModel::applySourceSettings(const juce::File& source,
                                        const std::vector<SampleRegionSetting>& rows)
 {
@@ -4559,6 +4688,8 @@ juce::ValueTree ProjectModel::toValueTree(const juce::File& projectFile) const
                 noteTree.setProperty("vibratoPhasePercent", note.vibratoPhasePercent, nullptr);
                 noteTree.setProperty("vibratoOffsetPercent", note.vibratoOffsetPercent, nullptr);
                 noteTree.setProperty("vibratoRealLine", note.vibratoRealLine, nullptr);
+                noteTree.setProperty("amplitudeEnvelopeBasePercent",
+                                     note.amplitudeEnvelopeBasePercent, nullptr);
                 noteTree.setProperty("utauFlagSplit", note.utauFlagSplit, nullptr);
                 noteTree.setProperty("utauFlagCurveEnabled",
                                      note.utauFlagCurveEnabled, nullptr);
@@ -4867,6 +4998,9 @@ ProjectData ProjectModel::fromValueTree(const juce::ValueTree& root,
                 note.vibratoOffsetPercent = noteTree.getProperty("vibratoOffsetPercent", 0.0);
                 note.vibratoRealLine = static_cast<bool>(
                     noteTree.getProperty("vibratoRealLine", false));
+                note.amplitudeEnvelopeBasePercent = juce::jlimit(0.0f, 200.0f,
+                    static_cast<float>(static_cast<double>(
+                        noteTree.getProperty("amplitudeEnvelopeBasePercent", 100.0))));
                 note.utauFlagSplit = static_cast<bool>(
                     noteTree.getProperty("utauFlagSplit", false));
                 note.utauFlagCurveEnabled = static_cast<bool>(

@@ -187,6 +187,10 @@ double adjustedPreutterance(const VoiceSample& sample, int velocity)
 
 float pitchCentsAt(const UtauNoteRenderSpec& note, double localSeconds)
 {
+    // The UTAU resampler path reads the sampled pitchCurve (matching standard
+    // host PIT).  The continuous timelinePitchCents evaluator is a native-render
+    // feature consumed by the model backends, not by the resampler protocol, so
+    // it is deliberately not preferred here.
     if (note.pitchCurve.empty()) return 0.0f;
     const auto right = std::lower_bound(note.pitchCurve.begin(), note.pitchCurve.end(), localSeconds,
         [](const UtauPitchPoint& point, double time) { return point.timeSeconds < time; });
@@ -220,6 +224,12 @@ juce::String encodePitchbend(const UtauNoteRenderSpec& note, double bpm,
         const auto curveEnd = note.pitchCurve.empty()
             ? std::max(0.0, note.durationSeconds)
             : std::max(note.durationSeconds, note.pitchCurve.back().timeSeconds);
+        // The UTAU resampler PIT is clamped to the note's own curve span, which
+        // is what standard UTAU hosts do: the lead-in holds the head pitch and
+        // the tail holds the last.  Reading the continuous timeline evaluator
+        // unclamped here would diverge from every host's PIT.  The continuous
+        // evaluator is a native-renderer feature (dense per-frame target), not a
+        // change to the resampler protocol.
         const auto localTime = juce::jlimit(curveStart, curveEnd,
                                             outputTime - preutteranceSeconds);
         auto value = juce::jlimit(-2048, 2047, static_cast<int>(std::lround(
@@ -355,12 +365,9 @@ std::vector<VoiceSample> loadVoicebank(const juce::File& root, bool fourRegion,
 
     juce::AudioFormatManager formats;
     formats.registerBasicFormats();
-    // HJM is the native annotation after voicebank import.  Once present, it
-    // is authoritative and OTO is not consulted for playback.  The OTO path
-    // remains a migration fallback for an unconverted legacy bank.
-    if (auto native = loadHjmVoicebank(root, formats); !native.empty())
-        return native;
-
+    // UTAU voicebanks are OTO-authoritative. HJM is a separate native-material
+    // fallback for banks that do not have OTO at all; a partial HJM conversion
+    // must never hide OTO rows or make an entire mixed bank switch authority.
     juce::StringArray warnings;
     const auto otoEntries = SampleSettings::loadVoicebankOto(root, warnings, fourRegion,
                                                              consonantClasses);
@@ -405,7 +412,26 @@ std::vector<VoiceSample> loadVoicebank(const juce::File& root, bool fourRegion,
         inferSourceMidi(sample);
         result.push_back(std::move(sample));
     }
-    if (!result.empty()) return result;
+    // OTO remains authoritative for rows it defines. HJM-only recordings may
+    // still be appended as migration fallbacks, but never replace an OTO row.
+    if (!result.empty())
+    {
+        if (auto native = loadHjmVoicebank(root, formats); !native.empty())
+        {
+            const auto sameEntry = [&result](const VoiceSample& candidate)
+            {
+                return std::any_of(result.begin(), result.end(), [&](const VoiceSample& existing)
+                {
+                    return existing.file.getFullPathName().equalsIgnoreCase(
+                               candidate.file.getFullPathName())
+                        && existing.alias.equalsIgnoreCase(candidate.alias);
+                });
+            };
+            for (auto& candidate : native)
+                if (!sameEntry(candidate)) result.push_back(std::move(candidate));
+        }
+        return result;
+    }
 
     // A folder without oto.ini remains usable as a one-sample/minimal bank by
     // deriving regions from the existing HJM sidecars or the whole file.
@@ -1077,8 +1103,10 @@ std::vector<double> crossfadeTails(
         // Exactly the cases the mixer crossfades.  A splice is capped at this
         // note's end by the mixer itself, and where the next note starts
         // sounding after this one has finished there is no crossing at all.
-        const auto shared = std::min(noteEnd, soundStart + nextOverlap) - soundStart;
-        if (next.splice && shared > 0.0) continue;
+        // Splicing is not an exception here -- it changes the shape of the
+        // seam, not where it is, so the same tail must be rendered under it.
+        // The old splice short-circuit left nothing to fade across, which is
+        // the hollow/click heard at a spliced join.
         if (!UtauRenderer::crossfadesInto(soundStart, noteEnd)) continue;
         tails[index] = std::max(0.0,
             UtauRenderer::crossfadeEnd(soundStart, nextOverlap,
@@ -1475,6 +1503,40 @@ std::optional<UtauSampleTiming> UtauRenderer::sampleTiming(
     return std::nullopt;
 }
 
+UtauRenderer::ResolvedSample UtauRenderer::resolveVoiceSample(
+    const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
+    int consonantVelocity, bool fourRegion, bool consonantClasses, double stpSeconds,
+    bool preutteranceOverrideEnabled, double preutteranceSecondsOverride,
+    bool overlapOverrideEnabled, double overlapSecondsOverride)
+{
+    ResolvedSample resolved;
+    if (!voicebankDirectory.isDirectory() || alias.trim().isEmpty()
+        || isRestLyric(alias))
+        return resolved;
+    const auto voicebank = loadVoicebankIndex(voicebankDirectory, fourRegion,
+                                              consonantClasses);
+    const auto* found = ::hachi::backend::resolveSample(
+        voicebank->samples, voicebank->prefixMap, alias, midiNote);
+    if (found == nullptr) return resolved;
+    // STP moves the whole entry inside the recording, exactly as the render
+    // path does, so the region read here matches what would be sung.
+    const auto sample = shiftedBy(*found, stpSeconds);
+    const auto velocity = headConsonantVelocity(sample, consonantVelocity);
+    resolved.found = true;
+    resolved.file = sample.file;
+    resolved.offsetSeconds = sample.offset;
+    resolved.endSeconds = sample.end;
+    resolved.fileSeconds = sample.fileSeconds;
+    resolved.preutteranceSeconds = preutteranceOverrideEnabled
+        ? std::max(0.0, preutteranceSecondsOverride)
+        : adjustedPreutterance(sample, velocity);
+    resolved.consonantSeconds = sample.consonant;
+    resolved.overlapSeconds = overlapOverrideEnabled ? overlapSecondsOverride
+                                                     : sample.overlap;
+    resolved.sourceMidi = sample.sourceMidi;
+    return resolved;
+}
+
 UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
 {
     UtauRenderResult result;
@@ -1526,10 +1588,24 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
             else if (note.alias.trim().isEmpty())
             {
                 destination.found = true;
-                destination.piano = true;
                 destination.preutterance = 0.0;
-                destination.overlap = 0.004;
-                destination.audio = renderPianoPreview(note);
+                if (samples.empty())
+                {
+                    // No voicebank at all: an unlabelled MIDI note gets the
+                    // built-in piano preview so a bare arrangement is audible.
+                    destination.piano = true;
+                    destination.overlap = 0.004;
+                    destination.audio = renderPianoPreview(note);
+                }
+                else
+                {
+                    // A voicebank is loaded, so an empty lyric is a rest, exactly
+                    // as a UTAU host treats it -- it holds its place and sounds
+                    // nothing rather than injecting a piano tone the reference
+                    // render never had.
+                    destination.rest = true;
+                    destination.overlap = 0.0;
+                }
             }
             else if (const auto* found = resolveSample(
                          samples, prefixMap, note.alias, note.midiNote))
@@ -1658,25 +1734,10 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
                 const auto nextSoundStart = followingNote.startSeconds
                     - nextRendered.preutterance;
                 const auto currentNominalEnd = note.startSeconds + note.durationSeconds;
-                // The overlap is the stretch both notes sound through, and
-                // it is the whole of what a splice may touch: taking the
-                // lead-in instead faded across ground the earlier note no
-                // longer covers, which the roll then had to draw as a note
-                // that had grown.  Where the oto leaves no overlap there is
-                // nothing to cross, and the ordinary rule handles the seam.
-                const auto sharedSeconds = std::min(currentNominalEnd,
-                    nextSoundStart + nextRendered.overlap) - nextSoundStart;
                 const auto nextNominalEnd = followingNote.startSeconds
                     + followingNote.durationSeconds;
-                if (followingNote.splice && sharedSeconds > 0.0)
-                {
-                    sequenceFadeOutStart = static_cast<int>(std::lround(
-                        nextSoundStart * mixSampleRate));
-                    sequenceFadeOutSeconds = sharedSeconds;
-                    equalPowerFadeOut = true;
-                }
-                else if (UtauRenderer::crossfadesInto(nextSoundStart,
-                                                      currentNominalEnd))
+                if (UtauRenderer::crossfadesInto(nextSoundStart,
+                                                 currentNominalEnd))
                 {
                     if (nextRendered.overlap >= 0.0)
                     {
@@ -1685,6 +1746,13 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
                         sequenceFadeOutSeconds = UtauRenderer::crossfadeEnd(
                             nextSoundStart, nextRendered.overlap, nextNominalEnd)
                             - nextSoundStart;
+                        // Splicing chooses the crossfade curve and nothing
+                        // else: a quarter-sine pair holds the level across the
+                        // seam.  It must not also cap the fade span at this
+                        // note's own end -- that cut off the part of the
+                        // overlap reaching past the beat, which is the very
+                        // seam the splice exists to smooth.
+                        equalPowerFadeOut = followingNote.splice;
                     }
                     else
                     {

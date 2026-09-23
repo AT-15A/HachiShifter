@@ -643,6 +643,57 @@ bool PianoRollComponent::formsAdjacentPitchBoundary(const PositionedUtauNote& le
     return std::abs(left.endSeconds - right.startSeconds) <= 0.002;
 }
 
+std::optional<PianoRollComponent::IncomingJoinGlide>
+PianoRollComponent::incomingJoinGlideFor(const NoteData& note)
+{
+    // A native connection (Melodyne pitch join or a forced connection) means
+    // the renderer glides this note's head out of the previous note's tail
+    // pitch.  The displayed pitch line has to do the same, or a connected note
+    // shows a step the ear never hears.  UTAU adjacency is handled separately
+    // by the crossfade bridge, so this is for the connection-flag path only.
+    if (!note.connectedToPrevious) return std::nullopt;
+    const NoteData* previousNote = nullptr;
+    auto previousEnd = -std::numeric_limits<double>::infinity();
+    for (const auto& track : snapshot.tracks)
+    {
+        auto ownsNote = false;
+        for (const auto& clip : track.clips)
+            for (const auto& candidate : clip.notes)
+                ownsNote = ownsNote || candidate.id == note.id;
+        if (!ownsNote) continue;
+        // The joined start is this note's absolute position on its own track.
+        double joinedStart = 0.0;
+        for (const auto& clip : track.clips)
+            for (const auto& candidate : clip.notes)
+                if (candidate.id == note.id)
+                    joinedStart = clip.startSeconds + candidate.startSeconds;
+        for (const auto& clip : track.clips)
+            for (const auto& candidate : clip.notes)
+            {
+                if (candidate.id == note.id) continue;
+                const auto end = clip.startSeconds + candidate.startSeconds
+                    + candidate.durationSeconds;
+                if (end <= joinedStart + 0.002 && end > previousEnd)
+                {
+                    previousEnd = end;
+                    previousNote = &candidate;
+                }
+            }
+        break;
+    }
+    if (previousNote == nullptr) return std::nullopt;
+    // The previous note's tail pitch is the last thing its own displayed line
+    // reaches, so the two meet exactly.
+    const auto& previousAnchors = pitchAnchorsFor(*previousNote);
+    const auto leadMidi = previousAnchors.empty()
+        ? static_cast<double>(previousNote->midiNote)
+        : static_cast<double>(previousAnchors.back().targetMidi);
+    // The same join window the renderer uses (AudioEngine::makeRenderRequest).
+    const auto joinSeconds = std::min(0.08,
+        std::max(0.012, note.durationSeconds * 0.22));
+    return IncomingJoinGlide { leadMidi, joinSeconds };
+}
+
 float PianoRollComponent::pitchAt(const std::vector<PitchCurveEditPoint>& anchors,
                                   double timeSeconds)
 {
@@ -732,7 +783,9 @@ std::vector<AmplitudeEnvelopePoint> PianoRollComponent::amplitudeEnvelopeFor(
                 }
             }
         }
-        return points;
+        // The base value scales the whole envelope for display, so the roll
+        // shows what will be heard.  The stored shape stays unscaled.
+        return scaledAmplitudeEnvelope(points, note.amplitudeEnvelopeBasePercent);
     }
     auto firstTime = 0.0;
     auto lastTime = std::max(0.02, note.durationSeconds);
@@ -782,8 +835,10 @@ std::vector<AmplitudeEnvelopePoint> PianoRollComponent::amplitudeEnvelopeFor(
         attackEnd = firstTime + spanSeconds / 3.0;
         releaseStart = firstTime + spanSeconds * 2.0 / 3.0;
     }
-    return { { firstTime, -60.0f }, { attackEnd, 0.0f },
-             { releaseStart, 0.0f }, { lastTime, -60.0f } };
+    return scaledAmplitudeEnvelope(
+        { { firstTime, -60.0f }, { attackEnd, 0.0f },
+          { releaseStart, 0.0f }, { lastTime, -60.0f } },
+        note.amplitudeEnvelopeBasePercent);
 }
 
 float PianoRollComponent::amplitudeDbAt(
@@ -1729,6 +1784,11 @@ void PianoRollComponent::commitAmplitudeEnvelopeToSelection(
         bool utau = false;
         if (findNote(id, &utau) == nullptr || !utau) continue;
         auto mapped = mapAmplitudeEnvelopeToNote(source, sourceNoteId, id);
+        // What was dragged is the shape with the base already in it; the note
+        // stores the shape without it, or the base would be multiplied twice.
+        if (const auto* target = findNote(id); target != nullptr)
+            mapped = unscaledAmplitudeEnvelope(mapped,
+                                               target->amplitudeEnvelopeBasePercent);
         if (mapped.size() >= 2) edits.emplace_back(id, std::move(mapped));
     }
     model.setNotesAmplitudeEnvelopes(std::move(edits));
@@ -1947,9 +2007,12 @@ namespace
 enum class NoteMenuScope { both, utauOnly, plainOnly };
 struct NoteMenuEntry { int id; NoteMenuScope scope; };
 using Scope = NoteMenuScope;
-const std::array<NoteMenuEntry, 19> noteMenuEntries {{
+const std::array<NoteMenuEntry, 22> noteMenuEntries {{
     {  1, Scope::both      },   // 分割音符
     {  2, Scope::both      },   // 合并音符
+    { 20, Scope::both      },   // 强制连接（保留各音符数据）
+    { 23, Scope::both      },   // 包络基础值… -- 缩放整条响度包络，任意轨道可用
+    { 24, Scope::utauOnly  },   // 添加拼字音符 -- 前置一个只有引导声的音符
     {  3, Scope::utauOnly  },   // 时序…             -- from the voicebank entry
     { 19, Scope::utauOnly  },   // 修改 STP…         -- moves that entry in the wav
     {  4, Scope::utauOnly  },   // 区域编辑器…       -- refuses off UTAU anyway
@@ -2067,6 +2130,14 @@ PianoRollComponent::NoteMenu PianoRollComponent::buildNoteMenu(
         menu.addItem(1, juce::String::fromUTF8("分割音符"), canSplit, false);
     if (wanted(2))
         menu.addItem(2, juce::String::fromUTF8("合并音符"), allInOneClip, false);
+    if (wanted(20))
+        menu.addItem(20, juce::String::fromUTF8("强制连接（保留音符数据）"),
+                     selectedNotes.size() >= 2, false);
+    if (wanted(23))
+        menu.addItem(23, juce::String::fromUTF8("包络基础值…"), true, false);
+    if (wanted(24))
+        menu.addItem(24, juce::String::fromUTF8("添加拼字音符"),
+                     selectedNotes.size() == 1, false);
     const auto canEditTiming = noteTiming.has_value() && selectedNotes.size() == 1;
     if (wanted(3))
         menu.addItem(3, juce::String::fromUTF8("时序…"), canEditTiming, false);
@@ -2239,6 +2310,28 @@ void PianoRollComponent::showNoteContextMenu(const juce::String& noteId,
                 // Right-clicking already put this note in the selection, so
                 // this removes exactly what Delete would have.
                 safe->deleteSelectedNotes();
+                return;
+            }
+            if (result == 20)
+            {
+                safe->model.setNotesConnection(safe->chosenNoteIds(noteId), true);
+                return;
+            }
+            if (result == 23)
+            {
+                safe->showEnvelopeBaseDialog(noteId);
+                return;
+            }
+            if (result == 24)
+            {
+                const auto prefix = safe->model.insertPrefixNote(noteId,
+                    safe->effectiveUtauOverlapFor(noteId));
+                if (prefix.isEmpty()) return;
+                safe->selectedNote = prefix;
+                safe->selectedNotes.clear();
+                safe->selectedNotes.insert(prefix.toStdString());
+                if (safe->onNoteSelected) safe->onNoteSelected(prefix);
+                safe->repaint();
                 return;
             }
             if (result != 1 && result != 2) return;
@@ -2580,6 +2673,69 @@ void PianoRollComponent::showGapDialog(const juce::String& noteId)
                     if (units > 0)
                         safe->model.insertGapBeforeNote(noteId, units * unit);
                 }
+                delete dialog;
+            }), false);
+}
+
+double PianoRollComponent::effectiveUtauOverlapFor(const juce::String& noteId) const
+{
+    const auto* note = findNote(noteId);
+    if (note == nullptr) return 0.0;
+    if (note->utauOverlapOverrideEnabled) return note->utauOverlapSeconds;
+    for (const auto& track : snapshot.tracks)
+    {
+        if (track.pitchAlgorithm != PitchAlgorithm::utau) continue;
+        for (const auto& clip : track.clips)
+            for (const auto& candidate : clip.notes)
+            {
+                if (candidate.id != noteId) continue;
+                const auto velocity = note->utauConsonantVelocity
+                        != inheritedUtauConsonantVelocity
+                    ? note->utauConsonantVelocity : track.utauConsonantVelocity;
+                if (const auto timing = backend::UtauRenderer::sampleTiming(
+                        track.voicebankDirectory, note->label, note->midiNote,
+                        velocity, utauModeUsesRegions(track.utauMode),
+                        track.utauMode == UtauMode::mou))
+                    return timing->overlapSeconds;
+                return 0.0;
+            }
+    }
+    return 0.0;
+}
+
+void PianoRollComponent::showEnvelopeBaseDialog(const juce::String& noteId)
+{
+    const auto* note = findNote(noteId);
+    if (note == nullptr) return;
+    const auto targets = chosenNoteIds(noteId);
+    auto* dialog = new juce::AlertWindow(
+        juce::String::fromUTF8("包络基础值"),
+        juce::String::fromUTF8(
+            "把这个音符的整条响度包络按比例整体升降，不改变它的形状。\n"
+            "100 是包络本身，200 是两倍高（更响），110 是 1.1 倍，0 是静音。\n"
+            "没有画过包络的音符，隐含的那条 100% 平线一样会被抬起来。"),
+        juce::MessageBoxIconType::NoIcon);
+    dialog->addTextEditor("base",
+                          juce::String(note->amplitudeEnvelopeBasePercent, 1),
+                          juce::String::fromUTF8("基础值，% （0–200）："));
+    if (auto* editor = dialog->getTextEditor("base"))
+    {
+        editor->setInputRestrictions(0, "0123456789.");
+        editor->setSelectAllWhenFocused(true);
+    }
+    dialog->addButton(juce::String::fromUTF8("应用"), 1,
+                      juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton(juce::String::fromUTF8("取消"), 0,
+                      juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<PianoRollComponent> safe(this);
+    dialog->enterModalState(true,
+        juce::ModalCallbackFunction::create(
+            [safe, dialog, targets](int result)
+            {
+                if (safe != nullptr && result == 1)
+                    safe->model.setNotesAmplitudeEnvelopeBase(targets,
+                        static_cast<float>(
+                            dialog->getTextEditorContents("base").getDoubleValue()));
                 delete dialog;
             }), false);
 }
@@ -4489,10 +4645,20 @@ void PianoRollComponent::finishInlineAliasEdit(bool accept)
     repaint();
 }
 
+void PianoRollComponent::lookAndFeelChanged()
+{
+    // The inline alias editor caches Palette colours; re-apply them so a theme
+    // switch does not leave it on the previous theme's (unreadable) colours.
+    inlineAliasEditor.setColour(juce::TextEditor::backgroundColourId,
+                                Palette::panelRaised.withAlpha(0.98f));
+    inlineAliasEditor.setColour(juce::TextEditor::textColourId, Palette::text);
+    inlineAliasEditor.setColour(juce::TextEditor::outlineColourId, Palette::accentLight);
+    inlineAliasEditor.setColour(juce::TextEditor::focusedOutlineColourId, Palette::noteLight);
+    repaint();
+}
+
 void PianoRollComponent::paint(juce::Graphics& g)
 {
-    g.fillAll(Palette::graphBackground);
-    regionHandleHits.clear();
     // Only the exposed strip is worth drawing.  At ordinary zoom the canvas
     // runs twenty times the width of the window, so anything that walked the
     // whole piece -- notes, grid lines, bar marks -- spent almost all of its
@@ -5430,6 +5596,23 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     const auto foldVibrato = note.vibratoEnabled && note.vibratoRealLine
                         && tool != Tool::points && note.durationSeconds > 1.0e-9;
                     const auto shownVibrato = effectiveVibrato(note);
+                    // A connected note glides its head out of the previous
+                    // note's tail pitch; drawing that here keeps the pitch line
+                    // continuous across the seam, matching the render.  UTAU
+                    // adjacency draws its own crossfade bridge below instead.
+                    const auto joinGlide = dataIsUtau ? std::nullopt
+                                                      : incomingJoinGlideFor(note);
+                    const auto glideAt = [&](double time, float natural)
+                    {
+                        if (!joinGlide || joinGlide->joinSeconds <= 1.0e-9
+                            || time >= joinGlide->joinSeconds)
+                            return natural;
+                        const auto u = static_cast<float>(
+                            juce::jlimit(0.0, 1.0, time / joinGlide->joinSeconds));
+                        const auto shaped = u * u * (3.0f - 2.0f * u);
+                        return static_cast<float>(joinGlide->leadMidi)
+                            + (natural - static_cast<float>(joinGlide->leadMidi)) * shaped;
+                    };
                     juce::Path controlLine;
                     auto controlLineOpen = false;
                     for (std::size_t index = 1; index < anchors.size(); ++index)
@@ -5442,13 +5625,16 @@ void PianoRollComponent::paint(juce::Graphics& g)
                         if (foldVibrato)
                             steps = std::max(steps,
                                 static_cast<int>(std::ceil(pixelWidth / 2.0f)));
+                        if (joinGlide && startTime < joinGlide->joinSeconds)
+                            steps = std::max(steps,
+                                static_cast<int>(std::ceil(pixelWidth / 2.0f)));
                         for (int step = 0; step <= steps; ++step)
                         {
                             if (controlLineOpen && step == 0) continue;
                             const auto amount = static_cast<double>(step) / steps;
                             const auto time = startTime + (endTime - startTime) * amount;
                             const auto curveX = x + static_cast<float>(time) * pixelsPerSecond;
-                            auto midi = pitchAt(anchors, time);
+                            auto midi = glideAt(time, pitchAt(anchors, time));
                             if (foldVibrato)
                                 midi += static_cast<float>(
                                     vibratoCentsAt(shownVibrato, time) / 100.0);

@@ -881,7 +881,12 @@ std::optional<MelodyneImportResult> MelodyneImporter::importProject(
             if (note.label.isEmpty()) note.label = graph.stringField(item, "label");
             note.startSeconds = 0.0;
             note.durationSeconds = duration;
-            note.consonantSeconds = std::clamp(graph.number(element, "attackDuration").value_or(0.0), 0.0, duration);
+            // On Melodyne import the consonant line defaults to the note's
+            // preutterance (which is zero for a fresh import), so it sits on the
+            // note start rather than at Melodyne's attackDuration; the start and
+            // cutoff region lines default to zero (no trim).  The user tunes
+            // these by hand afterwards.  UTAU import/timing is untouched.
+            note.consonantSeconds = std::max(0.0, note.utauPreutteranceSeconds);
             const auto targetCenter = static_cast<float>(graph.numberAlias(
                 element, { "pitchCenter", "targetPitchCenter" }).value_or(6000.0));
             auto sourceCenter = static_cast<float>(graph.number(item, "pitchCenter").value_or(targetCenter));
