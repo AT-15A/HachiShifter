@@ -58,3 +58,7 @@ juce/build-dsh/
 build-dsh/
 juce/build/
 todo.md
+/CMakeLists.txt
+/main.cpp
+reverse/
+cmake-build-*/
