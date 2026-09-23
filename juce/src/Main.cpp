@@ -9088,6 +9088,76 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 2 && arguments[0] == "--smoke-oto-hjm-discipline")
+        {
+            // OTO/HJM authority and write-back discipline (D01-D05):
+            //   D02 registering a UTAU bank writes no HJM sidecar
+            //   D04 HJM->OTO cutoff round-trips (exact region end)
+            //   D05 exporting one sample into a shared oto.ini keeps other rows
+            const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-oto-" + juce::Uuid().toDashedString());
+            root.createDirectory();
+            constexpr auto rate = 44100.0;
+            const auto writeTone = [&](const juce::File& f, double seconds)
+            {
+                juce::AudioBuffer<float> tone(1, static_cast<int>(rate * seconds));
+                for (int i = 0; i < tone.getNumSamples(); ++i)
+                    tone.setSample(0, i, static_cast<float>(0.2 * std::sin(
+                        2.0 * juce::MathConstants<double>::pi * 200.0 * i / rate)));
+                f.deleteFile();
+                juce::WavAudioFormat wav;
+                if (auto s = f.createOutputStream())
+                    if (auto w = std::unique_ptr<juce::AudioFormatWriter>(
+                            wav.createWriterFor(s.release(), rate, 1, 16, {}, 0)))
+                        w->writeFromAudioSampleBuffer(tone, 0, tone.getNumSamples());
+            };
+            const auto a = root.getChildFile("a.wav");
+            const auto b = root.getChildFile("b.wav");
+            writeTone(a, 1.0);
+            writeTone(b, 1.0);
+            const auto oto = root.getChildFile("oto.ini");
+            oto.replaceWithText(juce::String("a.wav=a,100.000,80.000,200.000,50.000,20.000\n")
+                + "b.wav=b,120.000,90.000,150.000,60.000,25.000\n", false, false, "\n");
+
+            // D02: registering writes no HJM sidecar.
+            juce::StringArray importedAudio;
+            int sidecarsWritten = 0, regionsWritten = 0;
+            juce::StringArray importWarnings;
+            SampleSettings::importVoicebank(root, importedAudio,
+                sidecarsWritten, regionsWritten, importWarnings);
+            const auto noHjmAfterRegister = !SampleSettings::sidecarFor(a).existsAsFile()
+                && !SampleSettings::sidecarFor(b).existsAsFile()
+                && sidecarsWritten == 0;
+
+            // D04/D05: import a's entry, export it back into the shared oto.ini,
+            // and confirm b survives and a's region end round-trips.
+            std::vector<SampleRegionSetting> aRows;
+            juce::String impErr;
+            SampleSettings::importOto(oto, a, 1.0, aRows, impErr);
+            const auto beforeEnd = aRows.empty() ? -1.0 : aRows.front().regionEndSeconds;
+            juce::String expErr;
+            const auto exported = SampleSettings::exportOto(oto, a, aRows, 1.0, expErr);
+            const auto otoText = oto.loadFileAsString();
+            const auto keptA = otoText.contains("a.wav=");
+            const auto keptB = otoText.contains("b.wav=");
+            std::vector<SampleRegionSetting> aRows2;
+            SampleSettings::importOto(oto, a, 1.0, aRows2, impErr);
+            const auto afterEnd = aRows2.empty() ? -2.0 : aRows2.front().regionEndSeconds;
+            const auto cutoffRoundTrips = beforeEnd > 0.0
+                && std::abs(beforeEnd - afterEnd) < 1.0e-4;
+
+            root.deleteRecursively();
+            const auto ok = noHjmAfterRegister && exported && keptA && keptB
+                && cutoffRoundTrips;
+            std::cout << "register_writes_no_hjm=" << (noHjmAfterRegister ? 1 : 0)
+                      << "|export_kept_other_entry=" << ((keptA && keptB) ? 1 : 0)
+                      << "|cutoff_round_trips=" << (cutoffRoundTrips ? 1 : 0)
+                      << "|before_end=" << beforeEnd << "|after_end=" << afterEnd
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 2 && arguments[0] == "--smoke-asset-register-dir")
         {
             // Register an existing on-disk folder as a material folder (the

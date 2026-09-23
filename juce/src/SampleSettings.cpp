@@ -769,20 +769,47 @@ bool SampleSettings::exportOto(const juce::File& oto, const juce::File& audio,
                                const std::vector<SampleRegionSetting>& rows,
                                double audioDuration, juce::String& error)
 {
-    juce::String output;
+    // Rows for this one audio file, as oto.ini lines.
+    juce::StringArray mine;
     for (const auto& row : rows)
     {
         // Import interprets negative cutoff as a length from offset. Export a
         // positive tail trim instead so the exact region end round-trips.
         const auto cutoff = std::max(0.0, audioDuration - row.regionEndSeconds) * 1000.0;
-        output += audio.getFileName() + "=" + row.name + ","
+        mine.add(audio.getFileName() + "=" + row.name + ","
             + juce::String(row.regionStartSeconds * 1000.0, 3) + ","
             + juce::String(row.fixedDurationSeconds * 1000.0, 3) + ","
             + juce::String(cutoff, 3) + ","
             + juce::String((row.alignmentSeconds - row.regionStartSeconds) * 1000.0, 3)
-            + "," + juce::String(row.overlapSeconds * 1000.0, 3) + "\n";
+            + "," + juce::String(row.overlapSeconds * 1000.0, 3));
     }
-    if (!oto.replaceWithText(output, false, false, "\n"))
+
+    // Merge, never clobber: exporting one sample into a shared voicebank
+    // oto.ini must preserve every other sample's entries.  Existing lines that
+    // describe THIS audio file are replaced; all other lines are kept in place,
+    // and this file's new rows take the position of its first old row (or the
+    // end when it had none).
+    juce::StringArray out;
+    const auto prefix = audio.getFileName() + "=";
+    auto inserted = false;
+    if (oto.existsAsFile())
+    {
+        const auto existing = juce::StringArray::fromLines(oto.loadFileAsString());
+        for (auto line : existing)
+        {
+            if (line.trimStart().startsWithIgnoreCase(prefix))
+            {
+                if (!inserted) { out.addArray(mine); inserted = true; }
+                continue; // drop the old rows for this audio
+            }
+            out.add(line);
+        }
+    }
+    if (!inserted) out.addArray(mine);
+    while (out.size() > 0 && out[out.size() - 1].trim().isEmpty())
+        out.remove(out.size() - 1);
+
+    if (!oto.replaceWithText(out.joinIntoString("\n") + "\n", false, false, "\n"))
     {
         error = "Could not write " + oto.getFullPathName();
         return false;
