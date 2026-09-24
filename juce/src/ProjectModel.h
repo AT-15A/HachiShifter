@@ -700,7 +700,9 @@ public:
                     UstImportMode mode = UstImportMode::addTrack,
                     juce::String* importedTrackId = nullptr);
     void setTempo(double bpm, int numerator, int denominator = 4);
-    void setTempoChange(double quarterPosition, double bpm);
+    // Keep the existing musical-time remapping by default. With false, only
+    // the tempo map changes; clips, notes and their curves keep their seconds.
+    void setTempoChange(double quarterPosition, double bpm, bool synchronizeNotes = true);
     // Digest of everything the project serialiser writes.  Use this to ask
     // "has anything changed?" -- it cannot miss a field the way a
     // hand-maintained projection of the project can.

@@ -399,10 +399,16 @@ void TimelineComponent::showTempoDialog(double quarterPosition)
     const auto initialTempo = snapshot.tempoAtQuarterPosition(quarterPosition);
     auto* dialog = new juce::AlertWindow(
         juce::String::fromUTF8("改变曲速"),
-        juce::String::fromUTF8("从当前四分之一小节开始使用新的曲速。"),
+        juce::String::fromUTF8("从当前四分之一小节开始使用新的曲速。\n"
+            "同步修改音符：按曲速调整音符位置和长度。\n"
+            "不修改音符：保留音符位置和长度，只修改曲速。"),
         juce::MessageBoxIconType::NoIcon);
     dialog->addTextEditor("bpm", juce::String(initialTempo, 2),
                           juce::String::fromUTF8("BPM（20–400）"));
+    dialog->addComboBox("noteTiming", { juce::String::fromUTF8("同步修改音符"),
+        juce::String::fromUTF8("不修改音符") }, juce::String::fromUTF8("音符处理"));
+    dialog->getComboBoxComponent("noteTiming")->setSelectedItemIndex(0,
+        juce::dontSendNotification);
     dialog->addButton(juce::String::fromUTF8("确定"), 1);
     dialog->addButton(juce::String::fromUTF8("取消"), 0,
                       juce::KeyPress(juce::KeyPress::escapeKey));
@@ -415,7 +421,8 @@ void TimelineComponent::showTempoDialog(double quarterPosition)
                 {
                     const auto bpm = dialog->getTextEditorContents("bpm").getDoubleValue();
                     if (bpm >= 20.0 && bpm <= 400.0)
-                        safe->model.setTempoChange(quarterPosition, bpm);
+                        safe->model.setTempoChange(quarterPosition, bpm,
+                            dialog->getComboBoxComponent("noteTiming")->getSelectedItemIndex() == 0);
                 }
                 delete dialog;
             }), false);

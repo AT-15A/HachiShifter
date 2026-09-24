@@ -126,6 +126,14 @@ jobs:
           name: windows-link-map
           path: build-windows/**/*.map
 
+      - name: Verify local tempo editing modes
+        shell: pwsh
+        run: |
+          $env:HACHI_TEST_SETTINGS_DIR = "$env:RUNNER_TEMP/hachi-tempo-settings"
+          $exe = "HachiShifterNext-windows-x64/HachiShifterNext.exe"
+          & $exe --smoke-tempo-change | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "Tempo editing smoke failed: $LASTEXITCODE" }
+
       - name: Probe Melodyne provider
         # Informational only: the runner has no Melodyne installation, so this
         # reports "not detected" rather than proving the VST3 host path.

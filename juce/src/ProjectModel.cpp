@@ -1904,7 +1904,7 @@ void ProjectModel::setTempo(double bpm, int numerator, int denominator)
     sendChangeMessage();
 }
 
-void ProjectModel::setTempoChange(double quarterPosition, double bpm)
+void ProjectModel::setTempoChange(double quarterPosition, double bpm, bool synchronizeNotes)
 {
     const auto position = std::max(0.0, quarterPosition);
     const auto tempo = juce::jlimit(20.0, 400.0, bpm);
@@ -1946,7 +1946,7 @@ void ProjectModel::setTempoChange(double quarterPosition, double bpm)
         for (std::size_t trackIndex = 0; trackIndex < project.tracks.size(); ++trackIndex)
         {
             auto& track = project.tracks[trackIndex];
-            if (!track.compose || trackIndex >= before.tracks.size()) continue;
+            if (!synchronizeNotes || !track.compose || trackIndex >= before.tracks.size()) continue;
             const auto& oldTrack = before.tracks[trackIndex];
             for (std::size_t clipIndex = 0;
                  clipIndex < track.clips.size() && clipIndex < oldTrack.clips.size();

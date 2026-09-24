@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(HachiShifterNext VERSION 0.2.1 LANGUAGES C CXX)
+project(HachiShifterNext VERSION 0.2.2 LANGUAGES C CXX)
 
 option(HACHI_ENABLE_ASAN "Enable AddressSanitizer for native crash diagnosis" OFF)
 

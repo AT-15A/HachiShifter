@@ -41,6 +41,7 @@ public:
     [[nodiscard]] int diagnosticRowHeight() const { return rowHeight; }
     // Takes the model's current state, as a change message would.
     void diagnosticRefresh() { snapshot = model.snapshot(); }
+    void diagnosticShowTempoDialog(double quarterPosition) { showTempoDialog(quarterPosition); }
     std::function<void(double)> onSeek;
     // A right-click on empty lane space, in screen coordinates.
     std::function<void(juce::Point<int>)> onEmptyAreaMenu;

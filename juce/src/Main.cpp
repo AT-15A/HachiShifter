@@ -1,4 +1,5 @@
 #include "tests/IntegratedSmoke.h"
+#include "tests/TempoChangeSmoke.h"
 #include "MainComponent.h"
 #include "Pinyin.h"
 #include "StartupLog.h"
@@ -41,6 +42,15 @@ public:
     {
         startupLog("Application: initialise " + getApplicationVersion());
         auto arguments = juce::StringArray::fromTokens(commandLine, true);
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-tempo-change")
+        {
+            runTempoChangeSmoke([this](bool ok)
+            {
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }, arguments.size() > 1 ? juce::File(arguments[1].unquoted()) : juce::File());
+            return;
+        }
         if (!arguments.isEmpty() && arguments[0] == "--smoke-timeline-pit")
         {
             setApplicationReturnValue(timelinePitchSmoke() ? 0 : 4);
