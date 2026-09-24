@@ -567,7 +567,8 @@ namespace
 // the cache key, and hashed by the waveform display to ask whether the note
 // under a drawn waveform is still the note that produced it -- one list, so
 // the two can never disagree about what counts as an edit.
-void writeNoteRenderFields(juce::MemoryOutputStream& stream, const NoteData& note)
+void writeNoteRenderFields(juce::MemoryOutputStream& stream, const NoteData& note,
+                           bool withAmplitudeEnvelope = true)
 {
     const auto label = note.label.toUTF8();
     stream.write(label.getAddress(), label.sizeInBytes());
@@ -579,6 +580,19 @@ void writeNoteRenderFields(juce::MemoryOutputStream& stream, const NoteData& not
     stream.writeBool(note.utauOverlapOverrideEnabled);
     stream.writeDouble(note.utauOverlapSeconds);
     stream.writeDouble(note.utauStpSeconds);
+    // A note's own oto decides what it sounds, so it is part of what counts as
+    // an edit -- for the render cache and for the waveform drawn under it.
+    stream.writeBool(note.utauOto.enabled);
+    stream.writeDouble(note.utauOto.offsetMs);
+    stream.writeDouble(note.utauOto.consonantMs);
+    stream.writeDouble(note.utauOto.cutoffMs);
+    stream.writeDouble(note.utauOto.preutteranceMs);
+    stream.writeDouble(note.utauOto.overlapMs);
+    stream.writeDouble(note.utauOto.onsetMs);
+    stream.writeDouble(note.utauOto.glideMs);
+    stream.writeDouble(note.utauOto.nucleusMs);
+    stream.writeBool(note.utauOto.hasRegions);
+    stream.writeString(note.utauOto.classes);
     stream.writeBool(note.vibratoEnabled);
     stream.writeDouble(note.vibratoLengthPercent);
     stream.writeDouble(note.vibratoCycleMs);
@@ -587,6 +601,7 @@ void writeNoteRenderFields(juce::MemoryOutputStream& stream, const NoteData& not
     stream.writeDouble(note.vibratoFadeOutPercent);
     stream.writeDouble(note.vibratoPhasePercent);
     stream.writeDouble(note.vibratoOffsetPercent);
+    stream.writeDouble(note.vibratoEndPercent);
     stream.writeBool(note.utauFlagSplit);
     stream.writeBool(note.utauFlagCurveEnabled);
     for (const auto& curve : note.utauFlagCurves)
@@ -603,6 +618,7 @@ void writeNoteRenderFields(juce::MemoryOutputStream& stream, const NoteData& not
         }
     }
     stream.writeBool(note.utauSplice);
+    stream.writeBool(note.utauAutoPitchTransition);
     for (const auto& text : { note.utauRegionFlags1, note.utauRegionFlags2,
                               note.utauRegionFlags3, note.utauRegionFlags4 })
     {
@@ -628,11 +644,16 @@ void writeNoteRenderFields(juce::MemoryOutputStream& stream, const NoteData& not
     stream.writeFloat(note.breath);
     stream.writeFloat(note.formantSemitones);
     stream.writeFloat(note.gain);
-    stream.writeInt64(static_cast<juce::int64>(note.amplitudeEnvelope.size()));
-    for (const auto& point : note.amplitudeEnvelope)
+    if (withAmplitudeEnvelope)
     {
-        stream.writeDouble(point.timeSeconds);
-        stream.writeFloat(point.gainDb);
+        stream.writeFloat(note.amplitudeEnvelopeBasePercent);
+        stream.writeInt64(static_cast<juce::int64>(note.amplitudeEnvelope.size()));
+        for (const auto& point : note.amplitudeEnvelope)
+        {
+            stream.writeDouble(point.timeSeconds);
+            stream.writeFloat(point.gainDb);
+            stream.writeBool(point.linearToNext);
+        }
     }
     for (const auto& point : note.contour)
     {
@@ -664,10 +685,10 @@ std::uint64_t noteRenderHash(const NoteData& note)
     return AudioEngine::utauNoteRenderHash(note);
 }
 
-std::uint64_t noteRenderHashImpl(const NoteData& note)
+std::uint64_t noteRenderHashImpl(const NoteData& note, bool withAmplitudeEnvelope = true)
 {
     juce::MemoryOutputStream stream;
-    writeNoteRenderFields(stream, note);
+    writeNoteRenderFields(stream, note, withAmplitudeEnvelope);
     // FNV-1a: no dependency, and collisions here cost a waveform that is drawn
     // when it should not be, not audio that is wrong.
     std::uint64_t hash = 1469598103934665603ull;
@@ -689,6 +710,21 @@ std::string renderKey(const ClipData& clip, const TrackData& track,
     // The render order reaches the per-clip render through matchNsfSourceLevel,
     // so two orders are two different buffers and must not share a cache entry.
     stream.writeInt(static_cast<int>(track.renderOrder));
+    if (track.pitchAlgorithm == PitchAlgorithm::utau)
+    {
+        // A selected note can read a curve edited on an unselected neighbour
+        // or another clip. The clip cache must include those dependencies too.
+        stream.writeInt(20260921);
+        stream.writeDouble(clip.startSeconds);
+        stream.writeInt64(static_cast<juce::int64>(track.clips.size()));
+        for (const auto& neighbourClip : track.clips)
+        {
+            stream.writeDouble(neighbourClip.startSeconds);
+            stream.writeInt64(static_cast<juce::int64>(neighbourClip.notes.size()));
+            for (const auto& neighbour : neighbourClip.notes)
+                writeNoteRenderFields(stream, neighbour);
+        }
+    }
     const auto path = clip.sourceFile.getFullPathName().toUTF8();
     stream.write(path.getAddress(), path.sizeInBytes());
     stream.writeInt64(clip.sourceFile.getLastModificationTime().toMilliseconds());
@@ -779,100 +815,100 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
     request.targetDurationSeconds = clip.durationSeconds;
     request.bpm = project.bpm;
     request.notes.reserve(clip.notes.size());
-    for (const auto& note : clip.notes)
+    // Read over the whole track, not this request: a render is of the notes
+    // selected, and the point that bends a selected note's tail may belong to
+    // a note that was not.
+    const auto sharedLines = sharedPitchLines(track);
+    // A note's pitch before any transition is laid over it: the curve it is
+    // sung along, and where its own line runs from and to -- which is where
+    // the roll hands it over to the transition: its own outermost points when
+    // it has points of its own, and the inset the automatic curve is drawn
+    // with when it has none.
+    struct PlannedPitch
     {
-        backend::UtauNoteRenderSpec renderedNote;
-        renderedNote.alias = note.label;
-        // The engine parses flags first-wins, so the note has to come first
-        // for its own settings to override the track's rather than the other
-        // way round.  This is also the order UTAU itself concatenates in.
-        renderedNote.flags = note.utauFlags + track.utauGlobalFlags;
-        renderedNote.splice = note.utauSplice;
-        renderedNote.flagCurve = note.utauFlagCurveEnabled;
-        // The engine reads a curve as straight lines between the points it is
-        // given, so a curved segment is sampled into enough of them to follow.
-        // Its store holds 64 per curve and drops the rest silently, so the
-        // budget is spent here rather than losing the tail of a long curve.
-        constexpr int flagCurvePointLimit = 60;
-        for (const auto& curve : note.utauFlagCurves)
-        {
-            const auto& drawn = curve.points;
-            if (drawn.empty()) continue;
-            auto curved = 0;
-            for (std::size_t index = 1; index < drawn.size(); ++index)
-                if (drawn[index].shape != PitchCurveShape::linear) ++curved;
-            const auto perSegment = curved > 0
-                ? juce::jlimit(2, 12,
-                    (flagCurvePointLimit - static_cast<int>(drawn.size())) / curved)
-                : 0;
-            std::vector<std::pair<double, double>> sampled;
-            for (std::size_t index = 0; index < drawn.size(); ++index)
-            {
-                if (index > 0 && drawn[index].shape != PitchCurveShape::linear)
-                    for (auto step = 1; step <= perSegment; ++step)
-                    {
-                        const auto at = drawn[index - 1].timeSeconds
-                            + (drawn[index].timeSeconds - drawn[index - 1].timeSeconds)
-                                * step / static_cast<double>(perSegment + 1);
-                        sampled.emplace_back(at, flagCurveValueAt(drawn, at));
-                    }
-                sampled.emplace_back(drawn[index].timeSeconds, drawn[index].value);
-            }
-            renderedNote.flagCurves.emplace_back(curve.flag, std::move(sampled));
-        }
-        renderedNote.startSeconds = note.startSeconds;
+        backend::UtauNoteRenderSpec spec;   // its pitch only; startSeconds absolute
+        bool automaticTransition = false;
+        bool sharesPrevious = false;
+        bool sharesNext = false;
+        bool ownPointsPlaced = false;
+        double ownFirst = 0.0;
+        double ownLast = 0.0;
+    };
+    const auto planPitch = [&sharedLines](const NoteData& note, double absoluteStart)
+    {
+        PlannedPitch planned;
+        auto& renderedNote = planned.spec;
+        renderedNote.startSeconds = absoluteStart;
         renderedNote.durationSeconds = note.durationSeconds;
         renderedNote.midiNote = note.midiNote;
-        renderedNote.gain = note.gain;
-        // The base value scales the whole envelope, and a note with no
-        // envelope of its own still has an implied flat 0 dB line the base
-        // raises just the same -- write one out so UTAU rendering honours it.
-        auto shapedEnvelope = note.amplitudeEnvelope;
-        if (shapedEnvelope.empty()
-            && std::abs(note.amplitudeEnvelopeBasePercent - 100.0f) > 1.0e-6f)
-            shapedEnvelope = { { 0.0, 0.0f },
-                               { std::max(0.01, note.durationSeconds), 0.0f } };
-        shapedEnvelope = scaledAmplitudeEnvelope(shapedEnvelope,
-                                                 note.amplitudeEnvelopeBasePercent);
-        renderedNote.amplitudeEnvelope.reserve(shapedEnvelope.size());
-        for (const auto& point : shapedEnvelope)
-            renderedNote.amplitudeEnvelope.push_back({ point.timeSeconds, point.gainDb });
-        // Fitting the envelope to the note it is now is left to the mixer,
-        // which is where the note's real lead-in is known.  Carrying only the
-        // closing point out to the end here stretched the fall that belongs to
-        // it, so a note twice as long faded for twice as long -- a shape
-        // nobody chose, and not the one the roll was drawing.
-        renderedNote.consonantVelocity =
-            note.utauConsonantVelocity != inheritedUtauConsonantVelocity
-            ? note.utauConsonantVelocity : track.utauConsonantVelocity;
-        renderedNote.preutteranceOverrideEnabled =
-            note.utauPreutteranceOverrideEnabled;
-        renderedNote.preutteranceSeconds = note.utauPreutteranceSeconds;
-        renderedNote.overlapOverrideEnabled = note.utauOverlapOverrideEnabled;
-        renderedNote.overlapSeconds = note.utauOverlapSeconds;
-        renderedNote.stpSeconds = note.utauStpSeconds;
-        renderedNote.jieSplitSet = note.utauJieSplitSet;
-        renderedNote.jieSplit = { note.utauJieSplit1, note.utauJieSplit2,
-                                  note.utauJieSplit3 };
-        renderedNote.flagSplit = note.utauFlagSplit;
-        renderedNote.regionFlags = { note.utauRegionFlags1, note.utauRegionFlags2,
-                                     note.utauRegionFlags3, note.utauRegionFlags4 };
-        renderedNote.bpm = project.tempoAtSeconds(
-            clip.startSeconds + note.startSeconds);
-        if (!note.pitchControlPoints.empty())
+        planned.automaticTransition = note.utauAutoPitchTransition;
+        const auto* sharedMember = sharedLines.memberFor(note.id);
+        planned.sharesPrevious = sharedMember != nullptr && sharedMember->joinsPrevious;
+        planned.sharesNext = sharedMember != nullptr && sharedMember->joinsNext;
+        if (sharedMember != nullptr)
+        {
+            // The renderer queries the immutable line at its actual sounding
+            // times. The sampled vector below is only a preview/test view, not
+            // a limit on the lead-in or tail that PIT is allowed to read.
+            const auto line = sharedMember->line;
+            const auto centsAt = [line, absoluteStart, note](double time)
+            {
+                return (line->midiAt(absoluteStart + time) - note.midiNote) * 100.0f
+                    + static_cast<float>(vibratoCentsAt(note,
+                          juce::jlimit(0.0, note.durationSeconds, time)));
+            };
+            renderedNote.timelinePitchCents = centsAt;
+            constexpr auto before = 0.6;
+            constexpr auto after = 0.3;
+            const auto last = note.durationSeconds + after;
+            // Every five milliseconds, on the grid a note's own curve has always
+            // been sampled on -- from its first point, stepping exactly as it
+            // always stepped -- so inside its own stretch a note is sent the
+            // very same samples as before; the grid is only carried further,
+            // back over its consonant and on past its end.
+            const auto origin = note.pitchControlPoints.empty()
+                ? 0.0 : std::min(0.0, note.pitchControlPoints.front().timeSeconds);
+            std::vector<double> times;
+            times.reserve(static_cast<std::size_t>(std::ceil((last + before) / 0.005)) + 16);
+            for (auto time = origin - 0.005; time >= -before; time -= 0.005) times.push_back(time);
+            for (auto time = origin; time < note.durationSeconds; time += 0.005) times.push_back(time);
+            times.push_back(note.durationSeconds);
+            for (auto time = note.durationSeconds + 0.005; time < last; time += 0.005)
+                times.push_back(time);
+            times.push_back(last);
+            for (const auto corner : line->cornersBetween(absoluteStart - before, absoluteStart + last))
+                times.push_back(corner - absoluteStart);
+            std::sort(times.begin(), times.end());
+            times.erase(std::unique(times.begin(), times.end(), [](double left, double right)
+            {
+                return std::abs(left - right) < 1.0e-7;
+            }), times.end());
+            renderedNote.pitchCurve.reserve(times.size());
+            for (const auto time : times)
+                renderedNote.pitchCurve.push_back({ time, centsAt(time) });
+        }
+        else if (!note.pitchControlPoints.empty())
         {
             const auto firstTime = std::min(0.0,
                 note.pitchControlPoints.front().timeSeconds);
+            // Up to its last point, even where that is past its own end: a
+            // point drawn out there shapes the note's tail under whatever
+            // follows, and stopping at the note's end dropped it entirely.
+            auto lastTime = note.durationSeconds;
+            for (const auto& point : note.pitchControlPoints)
+                lastTime = std::max(lastTime, point.timeSeconds);
             renderedNote.pitchCurve.reserve(static_cast<std::size_t>(
-                std::ceil((note.durationSeconds - firstTime) / 0.005)) + 2);
-            for (auto time = firstTime; time < note.durationSeconds; time += 0.005)
-                renderedNote.pitchCurve.push_back({ time,
-                    (evaluatePitchCurve(note.pitchControlPoints, time) - note.midiNote)
-                        * 100.0f + static_cast<float>(vibratoCentsAt(note, time)) });
-            renderedNote.pitchCurve.push_back({ note.durationSeconds,
-                (evaluatePitchCurve(note.pitchControlPoints, note.durationSeconds)
-                    - note.midiNote) * 100.0f
-                    + static_cast<float>(vibratoCentsAt(note, note.durationSeconds)) });
+                std::ceil((lastTime - firstTime) / 0.005)) + 2);
+            const auto centsAt = [note](double time)
+            {
+                return (evaluatePitchCurve(note.pitchControlPoints, time) - note.midiNote)
+                    * 100.0f + static_cast<float>(vibratoCentsAt(note,
+                        juce::jlimit(0.0, note.durationSeconds, time)));
+            };
+            renderedNote.timelinePitchCents = centsAt;
+            for (auto time = firstTime; time < lastTime; time += 0.005)
+                renderedNote.pitchCurve.push_back({ time, centsAt(time) });
+            renderedNote.pitchCurve.push_back({ lastTime, centsAt(lastTime) });
         }
         else
         {
@@ -921,57 +957,36 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
                                                         renderedPitchCents(note, point) });
             }
         }
-        // A continuous, unclamped native pitch evaluator, shared by the UTAU
-        // resampler PIT and (via contourAt) the native backends: cents from the
-        // note's own MIDI at any local time, so a seam's lead-in and tail read
-        // the true contour instead of a clamped flat hold.  Captures a copy of
-        // the note so it stays valid for the whole async render.
-        renderedNote.timelinePitchCents =
-            [note, baseMidi = note.midiNote](double time) -> float
+        const auto own = ownPitchPoints(note);
+        auto first = 0.0;
+        auto last = note.durationSeconds;
+        if (!note.pitchControlPoints.empty() && !own.empty())
         {
-            const auto vib = static_cast<float>(vibratoCentsAt(note,
-                juce::jlimit(0.0, note.durationSeconds, time)));
-            if (!note.pitchControlPoints.empty())
-                return (evaluatePitchCurve(note.pitchControlPoints, time) - baseMidi)
-                    * 100.0f + vib;
-            if (note.contour.empty()) return vib;
-            const auto sampleContour = [&](double t) -> float
+            first = own.front().timeSeconds;
+            last = own.front().timeSeconds;
+            for (const auto& point : own)
             {
-                if (t <= note.contour.front().timeSeconds)
-                    return renderedPitchCents(note, note.contour.front());
-                if (t >= note.contour.back().timeSeconds)
-                    return renderedPitchCents(note, note.contour.back());
-                for (std::size_t i = 1; i < note.contour.size(); ++i)
-                {
-                    const auto& l = note.contour[i - 1];
-                    const auto& r = note.contour[i];
-                    if (t > r.timeSeconds) continue;
-                    const auto w = r.timeSeconds - l.timeSeconds;
-                    const auto a = w > 1.0e-9
-                        ? static_cast<float>((t - l.timeSeconds) / w) : 0.0f;
-                    return renderedPitchCents(note, l)
-                        + (renderedPitchCents(note, r) - renderedPitchCents(note, l)) * a;
-                }
-                return renderedPitchCents(note, note.contour.back());
-            };
-            return sampleContour(time) + vib;
-        };
-        request.notes.push_back(std::move(renderedNote));
-    }
+                first = std::min(first, point.timeSeconds);
+                last = std::max(last, point.timeSeconds);
+            }
+        }
+        planned.ownFirst = first;
+        planned.ownLast = last;
+        planned.ownPointsPlaced = !note.pitchControlPoints.empty();
+        return planned;
+    };
 
-    // Adjacent notes retain independent tail/head pitches.  A short automatic
-    // S transition occupies the interval around their nominal boundary:
-    // previous tail at -inset -> following head at +inset.  The identical
-    // absolute-pitch bridge is written into both resampler requests so their
-    // overlap/crossfade cannot produce two contradictory pitch trajectories.
-    std::vector<std::size_t> order(request.notes.size());
-    for (std::size_t index = 0; index < order.size(); ++index) order[index] = index;
-    std::stable_sort(order.begin(), order.end(), [&](auto left, auto right)
-    {
-        return request.notes[left].startSeconds < request.notes[right].startSeconds;
-    });
+    // Adjacent notes retain independent tail/head pitches, and the automatic
+    // S transition carries the pitch from where one note's own line ends to
+    // where the next one's begins -- the very stretch the roll draws it over.
+    // With points of their own those are the points themselves, so dragging
+    // them moves the transition; the automatic curve hands over an inset in
+    // from each end instead, as it is drawn.  The identical absolute-pitch
+    // bridge is written into both resampler requests so their overlap /
+    // crossfade cannot produce two contradictory pitch trajectories.
     const auto centsAt = [](const backend::UtauNoteRenderSpec& note, double time)
     {
+        if (note.timelinePitchCents) return note.timelinePitchCents(time);
         if (note.pitchCurve.empty()) return 0.0f;
         const auto right = std::lower_bound(note.pitchCurve.begin(), note.pitchCurve.end(), time,
             [](const backend::UtauPitchPoint& point, double value)
@@ -990,6 +1005,19 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
                                       double start, double end,
                                       float startMidi, float endMidi)
     {
+        if (note.timelinePitchCents)
+        {
+            const auto existing = note.timelinePitchCents;
+            note.timelinePitchCents = [existing, start, end, startMidi, endMidi,
+                                      baseMidi = note.midiNote](double time)
+            {
+                if (time < start || time > end) return existing(time);
+                const auto u = static_cast<float>(juce::jlimit(0.0, 1.0,
+                    (time - start) / std::max(1.0e-6, end - start)));
+                return (startMidi + (endMidi - startMidi) * u * u * (3.0f - 2.0f * u)
+                        - baseMidi) * 100.0f;
+            };
+        }
         note.pitchCurve.erase(std::remove_if(note.pitchCurve.begin(), note.pitchCurve.end(),
             [&](const auto& point)
             {
@@ -1014,25 +1042,213 @@ backend::UtauRenderRequest makeUtauRequest(const ClipData& clip, const TrackData
                 return left.timeSeconds < right.timeSeconds;
             });
     };
-    for (std::size_t index = 1; index < order.size(); ++index)
+    const auto layTransition = [&](PlannedPitch& previousPlan, PlannedPitch& nextPlan)
     {
-        auto& previous = request.notes[order[index - 1]];
-        auto& next = request.notes[order[index]];
+        auto& previous = previousPlan.spec;
+        auto& next = nextPlan.spec;
         const auto previousEnd = previous.startSeconds + previous.durationSeconds;
-        if (std::abs(previousEnd - next.startSeconds) > 0.002) continue;
+        if (std::abs(previousEnd - next.startSeconds) > 0.002) return;
+        // Only between two notes that both take the editor's transition: a
+        // note from a UST is sung at the pitch its file gives it.
+        if (!previousPlan.automaticTransition || !nextPlan.automaticTransition) return;
+        // Nor between two that share a line: the line already says how one
+        // turns into the other, and a bridge laid over it would sing
+        // something else at the very points being dragged.
+        if (previousPlan.sharesNext && nextPlan.sharesPrevious) return;
         const auto inset = automaticUtauPitchTransitionInset(
             previous.durationSeconds, next.durationSeconds);
-        const auto previousTailTime = previous.durationSeconds - inset;
-        const auto nextHeadTime = inset;
+        auto previousTailTime = previousPlan.ownPointsPlaced
+            ? previousPlan.ownLast : previous.durationSeconds - inset;
+        auto nextHeadTime = nextPlan.ownPointsPlaced ? nextPlan.ownFirst : inset;
+        if (previous.durationSeconds + nextHeadTime <= previousTailTime + 1.0e-6)
+        {
+            // Their own lines already meet, or cross: there is no stretch
+            // between them for the transition to carry, so it stays where it
+            // has always been, an inset in from each side of the boundary.
+            previousTailTime = previous.durationSeconds - inset;
+            nextHeadTime = inset;
+        }
         const auto startMidi = previous.midiNote
             + centsAt(previous, previousTailTime) / 100.0f;
         const auto endMidi = next.midiNote
             + centsAt(next, nextHeadTime) / 100.0f;
         replaceCurveRange(previous, previousTailTime,
-                          previous.durationSeconds + inset, startMidi, endMidi);
-        replaceCurveRange(next, -inset, nextHeadTime, startMidi, endMidi);
+                          previous.durationSeconds + nextHeadTime, startMidi, endMidi);
+        replaceCurveRange(next, previousTailTime - previous.durationSeconds,
+                          nextHeadTime, startMidi, endMidi);
+    };
+
+    // Planned over the whole track, as the roll draws them, and not over this
+    // request.  A render holds only the notes selected, and pairing just
+    // those left a note selected on its own with no transition into it or
+    // out of it at all: sung at its first point from its very start, however
+    // the line was drawn into it.  A transition only forms between touching
+    // notes, so each run of touching notes that holds a note being sent is
+    // planned whole, and a note is sung the same whatever else was selected
+    // with it.
+    std::vector<std::pair<double, const NoteData*>> timeline;   // absolute start
+    for (const auto& trackClip : track.clips)
+        for (const auto& note : trackClip.notes)
+            timeline.emplace_back(trackClip.startSeconds + note.startSeconds, &note);
+    // In the order the roll takes them in.
+    std::stable_sort(timeline.begin(), timeline.end(), [](const auto& left, const auto& right)
+    {
+        if (std::abs(left.first - right.first) > 1.0e-9) return left.first < right.first;
+        return left.first + left.second->durationSeconds
+            < right.first + right.second->durationSeconds;
+    });
+    std::unordered_set<std::string> sent;
+    for (const auto& note : clip.notes) sent.insert(note.id.toStdString());
+    std::unordered_map<std::string, PlannedPitch> planned;
+    for (std::size_t first = 0; first < timeline.size();)
+    {
+        auto last = first;
+        auto holdsSent = sent.contains(timeline[first].second->id.toStdString());
+        while (last + 1 < timeline.size()
+               && std::abs(timeline[last].first + timeline[last].second->durationSeconds
+                           - timeline[last + 1].first) <= 0.002)
+        {
+            ++last;
+            holdsSent = holdsSent || sent.contains(timeline[last].second->id.toStdString());
+        }
+        if (holdsSent && last > first)
+        {
+            std::vector<PlannedPitch> run;
+            run.reserve(last - first + 1);
+            for (auto index = first; index <= last; ++index)
+                run.push_back(planPitch(*timeline[index].second, timeline[index].first));
+            for (std::size_t index = 1; index < run.size(); ++index)
+                layTransition(run[index - 1], run[index]);
+            for (auto index = first; index <= last; ++index)
+                if (const auto id = timeline[index].second->id.toStdString(); sent.contains(id))
+                    planned.emplace(id, std::move(run[index - first]));
+        }
+        first = last + 1;
     }
+
+    for (const auto& note : clip.notes)
+    {
+        backend::UtauNoteRenderSpec renderedNote;
+        renderedNote.alias = note.label;
+        // The engine parses flags first-wins, so the note has to come first
+        // for its own settings to override the track's rather than the other
+        // way round.  This is also the order UTAU itself concatenates in.
+        renderedNote.flags = note.utauFlags + track.utauGlobalFlags;
+        renderedNote.splice = note.utauSplice;
+        renderedNote.flagCurve = note.utauFlagCurveEnabled;
+        // The engine reads a curve as straight lines between the points it is
+        // given, so a curved segment is sampled into enough of them to follow.
+        // Its store holds 64 per curve and drops the rest silently, so the
+        // budget is spent here rather than losing the tail of a long curve.
+        constexpr int flagCurvePointLimit = 60;
+        for (const auto& curve : note.utauFlagCurves)
+        {
+            const auto& drawn = curve.points;
+            if (drawn.empty()) continue;
+            auto curved = 0;
+            for (std::size_t index = 1; index < drawn.size(); ++index)
+                if (drawn[index].shape != PitchCurveShape::linear) ++curved;
+            const auto perSegment = curved > 0
+                ? juce::jlimit(2, 12,
+                    (flagCurvePointLimit - static_cast<int>(drawn.size())) / curved)
+                : 0;
+            std::vector<std::pair<double, double>> sampled;
+            for (std::size_t index = 0; index < drawn.size(); ++index)
+            {
+                if (index > 0 && drawn[index].shape != PitchCurveShape::linear)
+                    for (auto step = 1; step <= perSegment; ++step)
+                    {
+                        const auto at = drawn[index - 1].timeSeconds
+                            + (drawn[index].timeSeconds - drawn[index - 1].timeSeconds)
+                                * step / static_cast<double>(perSegment + 1);
+                        sampled.emplace_back(at, flagCurveValueAt(drawn, at));
+                    }
+                sampled.emplace_back(drawn[index].timeSeconds, drawn[index].value);
+            }
+            renderedNote.flagCurves.emplace_back(curve.flag, std::move(sampled));
+        }
+        renderedNote.startSeconds = note.startSeconds;
+        renderedNote.durationSeconds = note.durationSeconds;
+        renderedNote.midiNote = note.midiNote;
+        renderedNote.gain = note.gain;
+        {
+            // A note with no envelope of its own still has one: a flat 100%.
+            // Written out here so a base value raises it like any other.
+            auto shaped = note.amplitudeEnvelope;
+            const auto base = juce::jlimit(0.0f, 200.0f, note.amplitudeEnvelopeBasePercent);
+            if (shaped.empty() && std::abs(base - 100.0f) > 1.0e-6f)
+                shaped = { { 0.0, 0.0f, true },
+                           { std::max(0.01, note.durationSeconds), 0.0f, true } };
+            shaped = scaledAmplitudeEnvelope(shaped, base);
+            renderedNote.amplitudeEnvelope.reserve(shaped.size());
+            for (const auto& point : shaped)
+                renderedNote.amplitudeEnvelope.push_back({ point.timeSeconds, point.gainDb,
+                                                          point.linearToNext });
+        }
+        // Fitting the envelope to the note it is now is left to the mixer,
+        // which is where the note's real lead-in is known.  Carrying only the
+        // closing point out to the end here stretched the fall that belongs to
+        // it, so a note twice as long faded for twice as long -- a shape
+        // nobody chose, and not the one the roll was drawing.
+        renderedNote.consonantVelocity =
+            note.utauConsonantVelocity != inheritedUtauConsonantVelocity
+            ? note.utauConsonantVelocity : track.utauConsonantVelocity;
+        renderedNote.preutteranceOverrideEnabled =
+            note.utauPreutteranceOverrideEnabled;
+        renderedNote.preutteranceSeconds = note.utauPreutteranceSeconds;
+        renderedNote.overlapOverrideEnabled = note.utauOverlapOverrideEnabled;
+        renderedNote.overlapSeconds = note.utauOverlapSeconds;
+        renderedNote.stpSeconds = note.utauStpSeconds;
+        renderedNote.oto = note.utauOto;
+        renderedNote.jieSplitSet = note.utauJieSplitSet;
+        renderedNote.jieSplit = { note.utauJieSplit1, note.utauJieSplit2,
+                                  note.utauJieSplit3 };
+        renderedNote.flagSplit = note.utauFlagSplit;
+        renderedNote.regionFlags = { note.utauRegionFlags1, note.utauRegionFlags2,
+                                     note.utauRegionFlags3, note.utauRegionFlags4 };
+        renderedNote.bpm = project.tempoAtSeconds(
+            clip.startSeconds + note.startSeconds);
+        auto pitch = [&]
+        {
+            if (const auto found = planned.find(note.id.toStdString()); found != planned.end())
+                return std::move(found->second);
+            return planPitch(note, clip.startSeconds + note.startSeconds);
+        }();
+        renderedNote.pitchCurve = std::move(pitch.spec.pitchCurve);
+        renderedNote.timelinePitchCents = std::move(pitch.spec.timelinePitchCents);
+        request.notes.push_back(std::move(renderedNote));
+    }
+
     return request;
+}
+
+// A render of a selection holds only the notes selected, and starts a second
+// ahead of the first of them rather than at the clip's start: enough lead-in
+// for an ordinary oto.ini preutterance without a song-length buffer for a
+// small marquee selection.  Each note keeps its time on the track -- the clip
+// moves by what its notes do -- and the offset is returned.
+double startRequestAtSelection(ClipData& requestClip)
+{
+    if (requestClip.notes.empty()) return 0.0;
+    const auto first = std::min_element(requestClip.notes.begin(), requestClip.notes.end(),
+        [](const auto& left, const auto& right)
+        {
+            return left.startSeconds < right.startSeconds;
+        });
+    const auto last = std::max_element(requestClip.notes.begin(), requestClip.notes.end(),
+        [](const auto& left, const auto& right)
+        {
+            return left.startSeconds + left.durationSeconds
+                < right.startSeconds + right.durationSeconds;
+        });
+    const auto offset = std::max(0.0, first->startSeconds - 1.0);
+    const auto selectedEnd = last->startSeconds + last->durationSeconds + 0.25;
+    requestClip.durationSeconds = std::max(0.03,
+        std::min(requestClip.durationSeconds, selectedEnd) - offset);
+    for (auto& note : requestClip.notes)
+        note.startSeconds -= offset;
+    requestClip.startSeconds += offset;
+    return offset;
 }
 }
 
@@ -1193,7 +1409,10 @@ namespace
 // without the whole rendered buffer being kept around to be re-read.
 UtauNoteWaveform measureNoteWaveform(const juce::AudioBuffer<float>& buffer,
                                      double sampleRate, double startInBuffer,
-                                     double durationSeconds)
+                                     double durationSeconds,
+                                     const std::function<float(double)>& gainAt = {},
+                                     double leadInSeconds = 0.0,
+                                     const std::function<float(double)>& fadesAt = {})
 {
     UtauNoteWaveform waveform;
     waveform.durationSeconds = durationSeconds;
@@ -1202,6 +1421,8 @@ UtauNoteWaveform measureNoteWaveform(const juce::AudioBuffer<float>& buffer,
     const auto buckets = std::max(1, static_cast<int>(std::ceil(durationSeconds * 1000.0)));
     waveform.minima.assign(static_cast<std::size_t>(buckets), 0.0f);
     waveform.maxima.assign(static_cast<std::size_t>(buckets), 0.0f);
+    waveform.unshapedMinima.assign(static_cast<std::size_t>(buckets), 0.0f);
+    waveform.unshapedMaxima.assign(static_cast<std::size_t>(buckets), 0.0f);
     const auto first = static_cast<juce::int64>(std::llround(startInBuffer * sampleRate));
     const auto samples = static_cast<juce::int64>(std::llround(durationSeconds * sampleRate));
     for (int bucket = 0; bucket < buckets; ++bucket)
@@ -1210,16 +1431,32 @@ UtauNoteWaveform measureNoteWaveform(const juce::AudioBuffer<float>& buffer,
         const auto to = first + samples * (bucket + 1) / buckets;
         auto low = 0.0f;
         auto high = 0.0f;
+        auto bareLow = 0.0f;
+        auto bareHigh = 0.0f;
         for (auto index = std::max<juce::int64>(0, from);
              index < std::min<juce::int64>(to, buffer.getNumSamples()); ++index)
             for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
             {
-                const auto value = buffer.getSample(channel, static_cast<int>(index));
+                const auto sample = buffer.getSample(channel, static_cast<int>(index));
+                // Read where this sample is: the piece begins a lead-in before
+                // the note, and both gains are measured from the note.
+                const auto localSeconds = static_cast<double>(index) / sampleRate
+                    - leadInSeconds;
+                // The piece before the envelope, but with the fades the mix
+                // puts on it regardless: what the envelope lane's line acts
+                // on, which stops where the next note takes over.
+                const auto bare = fadesAt ? sample * fadesAt(localSeconds) : sample;
+                bareLow = std::min(bareLow, bare);
+                bareHigh = std::max(bareHigh, bare);
+                // And with everything, envelope included: what is heard of it.
+                const auto value = gainAt ? sample * gainAt(localSeconds) : sample;
                 low = std::min(low, value);
                 high = std::max(high, value);
             }
         waveform.minima[static_cast<std::size_t>(bucket)] = low;
         waveform.maxima[static_cast<std::size_t>(bucket)] = high;
+        waveform.unshapedMinima[static_cast<std::size_t>(bucket)] = bareLow;
+        waveform.unshapedMaxima[static_cast<std::size_t>(bucket)] = bareHigh;
     }
     return waveform;
 }
@@ -1228,6 +1465,41 @@ UtauNoteWaveform measureNoteWaveform(const juce::AudioBuffer<float>& buffer,
 std::uint64_t AudioEngine::utauNoteRenderHash(const NoteData& note)
 {
     return noteRenderHashImpl(note);
+}
+
+std::uint64_t AudioEngine::utauNoteAudioHash(const NoteData& note)
+{
+    return noteRenderHashImpl(note, false);
+}
+
+std::vector<backend::UtauNoteRenderSpec> AudioEngine::diagnosticUtauRequestNotes(
+    const ProjectData& project, const juce::String& clipId,
+    const std::vector<juce::String>& selection)
+{
+    for (const auto& track : project.tracks)
+        for (const auto& clip : track.clips)
+            if (clip.id == clipId)
+            {
+                if (selection.empty()) return makeUtauRequest(clip, track, {}, project).notes;
+                auto requestClip = clip;
+                std::erase_if(requestClip.notes, [&selection](const auto& note)
+                {
+                    return std::find(selection.begin(), selection.end(), note.id)
+                        == selection.end();
+                });
+                startRequestAtSelection(requestClip);
+                return makeUtauRequest(requestClip, track, {}, project).notes;
+            }
+    return {};
+}
+
+std::string AudioEngine::diagnosticUtauRenderKey(const ProjectData& project,
+                                               const juce::String& clipId)
+{
+    for (const auto& track : project.tracks)
+        for (const auto& clip : track.clips)
+            if (clip.id == clipId) return renderKey(clip, track, {}, {}, {});
+    return {};
 }
 
 std::shared_ptr<const std::vector<UtauNoteWaveform>>
@@ -1671,6 +1943,14 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                 {
                     if (left.startSeconds != right.startSeconds)
                         return left.startSeconds < right.startSeconds;
+                    // On the same beat, the shorter note leads into the longer
+                    // one: a note with no length of its own is nothing but a
+                    // lead-in to the note beside it.  Deciding this by id, as
+                    // the last resort below does, decides it by a uuid -- so
+                    // which of the two crossfaded into the other came out
+                    // differently from one note to the next.
+                    if (left.durationSeconds != right.durationSeconds)
+                        return left.durationSeconds < right.durationSeconds;
                     if (left.midiNote != right.midiNote) return left.midiNote < right.midiNote;
                     return left.id < right.id;
                 });
@@ -1689,30 +1969,8 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
             if (utauTrack && !anythingSounds)
                 loaded->fallbackRendered.reset();
             auto requestClip = renderClip;
-            auto renderTimelineOffset = 0.0;
-            if (hasUtauSelection && !requestClip.notes.empty())
-            {
-                const auto first = std::min_element(requestClip.notes.begin(), requestClip.notes.end(),
-                    [](const auto& left, const auto& right)
-                    {
-                        return left.startSeconds < right.startSeconds;
-                    });
-                const auto last = std::max_element(requestClip.notes.begin(), requestClip.notes.end(),
-                    [](const auto& left, const auto& right)
-                    {
-                        return left.startSeconds + left.durationSeconds
-                            < right.startSeconds + right.durationSeconds;
-                    });
-                // Keep enough lead-in for ordinary oto.ini preutterance while
-                // avoiding a song-length buffer for a small marquee selection.
-                renderTimelineOffset = std::max(0.0, first->startSeconds - 1.0);
-                const auto selectedEnd = last->startSeconds + last->durationSeconds + 0.25;
-                requestClip.durationSeconds = std::max(0.03,
-                    std::min(clip.durationSeconds, selectedEnd) - renderTimelineOffset);
-                for (auto& note : requestClip.notes)
-                    note.startSeconds -= renderTimelineOffset;
-                requestClip.startSeconds += renderTimelineOffset;
-            }
+            const auto renderTimelineOffset = hasUtauSelection
+                ? startRequestAtSelection(requestClip) : 0.0;
             // Every compose path must use a duration-preserving, formant-preserving render.
             // Until a selected external engine is present, the native mld5 renderer is the
             // deterministic model-free fallback rather than device-rate resampling, which
@@ -1798,8 +2056,10 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                         // back, and what the note looked like when it was sent.
                         struct PendingNote
                         {
+                            std::size_t requestIndex;
                             juce::String id;
                             std::uint64_t hash;
+                            std::uint64_t audio;
                             double startInBuffer;
                             double durationSeconds;
                             double timelineStart;
@@ -1818,24 +2078,27 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                             const auto& sent = requestClip.notes[index];
                             const auto& asHeld = renderClip.notes[index];
                             if (backend::isRestLyric(sent.label)) continue;
-                            pending->push_back({ asHeld.id, noteRenderHash(asHeld),
+                            pending->push_back({ index, asHeld.id, noteRenderHash(asHeld),
+                                                 utauNoteAudioHash(asHeld),
                                                  sent.startSeconds, sent.durationSeconds,
                                                  clip.startSeconds + asHeld.startSeconds });
                         }
-                        const auto measure = [state, pending, engine = this]
+                        // Each note's own audio is measured as the renderer
+                        // hands it over, one at a time and before any of it is
+                        // mixed.  Measuring the finished mix instead read a
+                        // stretch that holds two notes wherever they overlap,
+                        // and put a note's consonant -- which sounds ahead of
+                        // the beat -- in the row of the note before it.
+                        auto pieces = std::make_shared<std::vector<UtauNoteWaveform>>();
+                        auto pieceLock = std::make_shared<juce::CriticalSection>();
+                        const auto measure = [state, pieces, pieceLock, engine = this]
                             (backend::RenderedAudio result)
                         {
+                            juce::ignoreUnused(result);
                             std::vector<UtauNoteWaveform> measured;
-                            measured.reserve(pending->size());
-                            for (const auto& note : *pending)
                             {
-                                auto waveform = measureNoteWaveform(
-                                    result.buffer, result.sampleRate,
-                                    note.startInBuffer, note.durationSeconds);
-                                waveform.noteId = note.id;
-                                waveform.renderHash = note.hash;
-                                waveform.startSeconds = note.timelineStart;
-                                measured.push_back(std::move(waveform));
+                                const juce::ScopedLock pieceGuard(*pieceLock);
+                                measured = *pieces;
                             }
                             {
                                 const juce::ScopedLock sliceGuard(state->sliceLock);
@@ -1846,6 +2109,31 @@ void AudioEngine::rebuildLoadedClips(const ProjectData& project)
                         };
                         auto request = makeUtauRequest(requestClip, track,
                             utauResamplerFile, project);
+                        request.notePiece = [pending, pieces, pieceLock]
+                            (std::size_t index, const juce::AudioBuffer<float>& piece,
+                             double sampleRate, double leadInSeconds,
+                             const std::function<float(double)>& gainAt,
+                             const std::function<float(double)>& fadesAt)
+                        {
+                            for (const auto& note : *pending)
+                            {
+                                if (note.requestIndex != index) continue;
+                                const auto seconds = sampleRate > 0.0
+                                    ? piece.getNumSamples() / sampleRate : 0.0;
+                                auto waveform = measureNoteWaveform(piece, sampleRate,
+                                                                    0.0, seconds,
+                                                                    gainAt, leadInSeconds,
+                                                                    fadesAt);
+                                waveform.noteId = note.id;
+                                waveform.renderHash = note.hash;
+                                waveform.audioHash = note.audio;
+                                waveform.startSeconds = note.timelineStart;
+                                waveform.leadInSeconds = leadInSeconds;
+                                const juce::ScopedLock pieceGuard(*pieceLock);
+                                pieces->push_back(std::move(waveform));
+                                return;
+                            }
+                        };
                         std::weak_ptr<RenderedClip> weakState(state);
                         request.progress = [weakState](double value)
                         {

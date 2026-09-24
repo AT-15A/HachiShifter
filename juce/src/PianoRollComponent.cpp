@@ -1,6 +1,7 @@
 #include "PianoRollComponent.h"
 #include "Theme.h"
 #include "backend/UtauRenderer.h"
+#include "backend/AmplitudeEnvelopeCurve.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -457,9 +458,83 @@ void PianoRollComponent::ensureDefaultEnvelope(const juce::String& noteId)
     }
 }
 
-int PianoRollComponent::applyEnvelopePreset(double attackSeconds,
-                                            double releaseSeconds,
-                                            float plateauEndDb)
+const std::vector<PianoRollComponent::EnvelopePreset>& PianoRollComponent::envelopePresets()
+{
+    using From = EnvelopePresetPoint::From;
+    // A share of the note's own level, in the dB a point holds.
+    const auto percent = [](double value)
+    {
+        return static_cast<float>(20.0 * std::log10(value / 100.0));
+    };
+    const auto text = [](const char* utf8) { return juce::String::fromUTF8(utf8); };
+    // Onsets first, then endings.  标准 and 柔起 are exactly the shapes they
+    // have always been -- UTAU's 5 and 35, and the softer start every lyric
+    // is given -- both straight in dB.  The rest run straight in amplitude, the
+    // way UTAU and OpenUtau read an envelope, so each ramp is as long to the
+    // ear as its tooltip says.
+    static const std::vector<EnvelopePreset> presets {
+        { text("标准"), text("起音 5 ms，释放 35 ms（UTAU 默认）"),
+          { { From::soundStart, 0.005, 0.0f }, { From::soundEnd, 0.035, 0.0f } } },
+        { text("柔起"), text("起音 15 ms，释放 35 ms"),
+          { { From::soundStart, 0.015, 0.0f }, { From::soundEnd, 0.035, 0.0f } } },
+        // A soft vowel onset, the way OpenUtau's attack works: the consonant
+        // comes in at 60% and the level climbs to full 50 ms into the vowel,
+        // however long the consonant in front of it is.
+        { text("缓起"), text("辅音以 60% 进入，拍点后 50 ms 升到满音量；释放 35 ms（按音量线性）"),
+          { { From::soundStart, 0.005, percent(60.0), true },
+            { From::beat, 0.050, 0.0f, true },
+            { From::soundEnd, 0.035, 0.0f, true } }, true },
+        { text("渐弱"), text("起音 5 ms，平台末尾降到 80%，释放 35 ms（按音量线性）"),
+          { { From::soundStart, 0.005, 0.0f, true },
+            { From::soundEnd, 0.035, percent(80.0), true } }, true },
+        // A phrase ending.  Tuners fade the last note of a phrase over 70 to
+        // 100 ms rather than UTAU's 35: down to half over the last 150 ms, then
+        // out over the final 60.
+        { text("句尾"), text("起音 5 ms；最后 150 ms 先降到 50%，再用 60 ms 淡出（按音量线性）"),
+          { { From::soundStart, 0.005, 0.0f, true },
+            { From::soundEnd, 0.150, 0.0f, true },
+            { From::soundEnd, 0.060, percent(50.0), true } }, true },
+        // A short tail that does not click.  5 ms straight in dB fell to half
+        // level in half a millisecond, which is a cut; 10 ms straight in
+        // amplitude is still short to the ear.
+        { text("短收"), text("起音 5 ms，释放 10 ms（按音量线性，不爆音）"),
+          { { From::soundStart, 0.005, 0.0f, true },
+            { From::soundEnd, 0.010, 0.0f, true } }, true }
+    };
+    return presets;
+}
+
+std::vector<AmplitudeEnvelopePoint> PianoRollComponent::envelopePresetPoints(
+    const EnvelopePreset& preset, double first, double last)
+{
+    using From = EnvelopePresetPoint::From;
+    std::vector<AmplitudeEnvelopePoint> points;
+    points.reserve(preset.points.size() + 2);
+    points.push_back({ first, -60.0f, preset.linearRise });
+    for (const auto& point : preset.points)
+        points.push_back({ point.from == From::soundStart ? first + point.seconds
+                               : point.from == From::beat ? point.seconds
+                                                          : last - point.seconds,
+                           point.gainDb, point.linearToNext });
+    points.push_back({ last, -60.0f });
+    // A note too short to hold the shape would have its points cross.  It
+    // gets the first of them a third of the way in and the last a third from
+    // the end instead -- the fallback the default shape uses too.
+    auto fits = true;
+    for (std::size_t index = 2; index + 1 < points.size(); ++index)
+        if (points[index].timeSeconds <= points[index - 1].timeSeconds + 0.005)
+            fits = false;
+    if (fits || preset.points.empty()) return points;
+    const auto span = last - first;
+    return { { first, -60.0f, preset.linearRise },
+             { first + span / 3.0, preset.points.front().gainDb,
+               preset.points.front().linearToNext },
+             { first + span * 2.0 / 3.0, preset.points.back().gainDb,
+               preset.points.back().linearToNext },
+             { last, -60.0f } };
+}
+
+int PianoRollComponent::applyEnvelopePreset(const EnvelopePreset& preset)
 {
     const auto selected = selectedNoteIds();
     if (selected.empty()) return 0;
@@ -481,24 +556,47 @@ int PianoRollComponent::applyEnvelopePreset(double attackSeconds,
                     first = std::min(0.0, span->second.first - absoluteStart);
                     last = std::max(first + 0.02, span->second.second - absoluteStart);
                 }
-                auto attackEnd = first + attackSeconds;
-                auto releaseStart = last - releaseSeconds;
-                // Same fallback the default shape uses: a note too short to
-                // hold both ramps gets thirds rather than crossed points.
-                if (releaseStart <= attackEnd + 0.005)
-                {
-                    const auto span = last - first;
-                    attackEnd = first + span / 3.0;
-                    releaseStart = first + span * 2.0 / 3.0;
-                }
-                edits.emplace_back(note.id, std::vector<AmplitudeEnvelopePoint> {
-                    { first, -60.0f }, { attackEnd, 0.0f },
-                    { releaseStart, plateauEndDb }, { last, -60.0f } });
+                edits.emplace_back(note.id, envelopePresetPoints(preset, first, last));
             }
     }
     const auto count = static_cast<int>(edits.size());
     if (count > 0) model.setNotesAmplitudeEnvelopes(std::move(edits));
     return count;
+}
+
+int PianoRollComponent::applyEnvelopePreset(double attackSeconds, double releaseSeconds,
+                                            float plateauEndDb)
+{
+    EnvelopePreset preset;
+    preset.points = { { EnvelopePresetPoint::From::soundStart, attackSeconds, 0.0f },
+                      { EnvelopePresetPoint::From::soundEnd, releaseSeconds, plateauEndDb } };
+    return applyEnvelopePreset(preset);
+}
+
+std::vector<AmplitudeEnvelopePoint> PianoRollComponent::envelopeWithPointAt(
+    std::vector<AmplitudeEnvelopePoint> envelope, double timeSeconds)
+{
+    // On the line where it already runs, and the stretch it lands in keeps its
+    // shape on both sides of it: a point added to a ramp straight in amplitude
+    // leaves both halves of that ramp straight in amplitude.
+    const auto after = std::upper_bound(envelope.begin(), envelope.end(), timeSeconds,
+        [](double value, const AmplitudeEnvelopePoint& point)
+        {
+            return value < point.timeSeconds;
+        });
+    const auto linear = after != envelope.begin() && after != envelope.end()
+        && std::prev(after)->linearToNext;
+    const AmplitudeEnvelopePoint added { timeSeconds, amplitudeDbAt(envelope, timeSeconds),
+                                         linear };
+    envelope.insert(after, added);
+    return envelope;
+}
+
+std::vector<AmplitudeEnvelopePoint> PianoRollComponent::diagnosticMapAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& source, const juce::String& sourceNoteId,
+    const juce::String& targetNoteId) const
+{
+    return mapAmplitudeEnvelopeToNote(source, sourceNoteId, targetNoteId);
 }
 
 void PianoRollComponent::setShowNoteRange(bool enabled)
@@ -604,7 +702,8 @@ PianoRollComponent::positionedUtauNotesFor(const juce::String& noteId) const
             for (const auto& note : clip.notes)
             {
                 const auto start = clip.startSeconds + note.startSeconds;
-                result.push_back({ note.id, start, start + note.durationSeconds });
+                result.push_back({ note.id, start, start + note.durationSeconds,
+                                   note.utauAutoPitchTransition });
             }
         break;
     }
@@ -640,7 +739,10 @@ PianoRollComponent::nextUtauNoteFor(const juce::String& noteId) const
 bool PianoRollComponent::formsAdjacentPitchBoundary(const PositionedUtauNote& left,
                                                      const PositionedUtauNote& right)
 {
-    return std::abs(left.endSeconds - right.startSeconds) <= 0.002;
+    // The same rule the renderer bridges by: touching, and both taking the
+    // editor's transition.  A UST's notes meet at the pitch their file gives.
+    return std::abs(left.endSeconds - right.startSeconds) <= 0.002
+        && left.automaticTransition && right.automaticTransition;
 }
 
 std::optional<PianoRollComponent::IncomingJoinGlide>
@@ -715,6 +817,15 @@ std::vector<AmplitudeEnvelopePoint> PianoRollComponent::diagnosticDrawnEnvelope(
 std::vector<AmplitudeEnvelopePoint> PianoRollComponent::amplitudeEnvelopeFor(
     const NoteData& note, double absoluteStart) const
 {
+    // Everything that reads a note's envelope comes through here, so the base
+    // value is applied in this one place: the lane's line, its handles, the
+    // waveform behind it and the note's own row all show what will be heard.
+    // commitAmplitudeEnvelopeToSelection takes it back off before storing, so
+    // dragging a point still moves the point rather than the base.
+    const auto withBase = [&note](std::vector<AmplitudeEnvelopePoint> points)
+    {
+        return scaledAmplitudeEnvelope(points, note.amplitudeEnvelopeBasePercent);
+    };
     if (!note.amplitudeEnvelope.empty())
     {
         auto points = note.amplitudeEnvelope;
@@ -783,9 +894,7 @@ std::vector<AmplitudeEnvelopePoint> PianoRollComponent::amplitudeEnvelopeFor(
                 }
             }
         }
-        // The base value scales the whole envelope for display, so the roll
-        // shows what will be heard.  The stored shape stays unscaled.
-        return scaledAmplitudeEnvelope(points, note.amplitudeEnvelopeBasePercent);
+        return withBase(points);
     }
     auto firstTime = 0.0;
     auto lastTime = std::max(0.02, note.durationSeconds);
@@ -835,10 +944,8 @@ std::vector<AmplitudeEnvelopePoint> PianoRollComponent::amplitudeEnvelopeFor(
         attackEnd = firstTime + spanSeconds / 3.0;
         releaseStart = firstTime + spanSeconds * 2.0 / 3.0;
     }
-    return scaledAmplitudeEnvelope(
-        { { firstTime, -60.0f }, { attackEnd, 0.0f },
-          { releaseStart, 0.0f }, { lastTime, -60.0f } },
-        note.amplitudeEnvelopeBasePercent);
+    return withBase({ { firstTime, -60.0f }, { attackEnd, 0.0f },
+                      { releaseStart, 0.0f }, { lastTime, -60.0f } });
 }
 
 float PianoRollComponent::amplitudeDbAt(
@@ -857,7 +964,7 @@ float PianoRollComponent::amplitudeDbAt(
     const auto amount = span > 1.0e-9
         ? static_cast<float>(juce::jlimit(0.0, 1.0,
             (timeSeconds - left.timeSeconds) / span)) : 0.0f;
-    return left.gainDb + (right->gainDb - left.gainDb) * amount;
+    return backend::envelopeDbBetween(left.gainDb, right->gainDb, amount, left.linearToNext);
 }
 
 float PianoRollComponent::amplitudeY(float midi, float gainDb) const
@@ -1088,10 +1195,12 @@ std::pair<double, double> PianoRollComponent::flagLaneSpanFor(
     juce::ignoreUnused(whole);
     const auto velocity = note.utauConsonantVelocity != inheritedUtauConsonantVelocity
         ? note.utauConsonantVelocity : track->utauConsonantVelocity;
-    const auto timing = backend::UtauRenderer::sampleTiming(
-        track->voicebankDirectory, note.label, note.midiNote, velocity,
-        utauModeUsesRegions(track->utauMode),
-        track->utauMode == UtauMode::mou);
+    const auto timing = voicebankReadFor(*track)
+        ? backend::UtauRenderer::sampleTiming(
+              track->voicebankDirectory, note.label, note.midiNote, velocity,
+              utauModeUsesRegions(track->utauMode),
+              track->utauMode == UtauMode::mou, note.ownOto())
+        : std::nullopt;
     if (leadIn <= 1.0e-4 && timing) leadIn = timing->preutteranceSeconds;
     if (leadIn <= 1.0e-4 && note.utauPreutteranceOverrideEnabled)
         leadIn = note.utauPreutteranceSeconds;
@@ -1124,12 +1233,29 @@ std::vector<juce::String> PianoRollComponent::chosenNoteIds(
     return ids;
 }
 
+bool PianoRollComponent::ownOtoRestoreAvailable(
+    const std::vector<juce::String>& noteIds) const
+{
+    for (const auto& id : noteIds)
+        if (const auto* note = findNote(id); note != nullptr && note->utauOto.enabled)
+            return true;
+    return false;
+}
+
+bool PianoRollComponent::flagCurveActiveFor(const juce::String& noteId) const
+{
+    const auto* note = findNote(noteId);
+    if (note == nullptr || !note->utauFlagCurveEnabled) return false;
+    const auto* track = trackForNote(noteId);
+    return track != nullptr && trackTakesFlagCurves(*track);
+}
+
 bool PianoRollComponent::flagResetAvailable(
     const std::vector<juce::String>& noteIds) const
 {
     for (const auto& id : noteIds)
         if (const auto* note = findNote(id); note != nullptr
-            && note->utauFlagCurveEnabled && !note->utauFlagCurves.empty())
+            && flagCurveActiveFor(id) && !note->utauFlagCurves.empty())
             return true;
     return false;
 }
@@ -1175,7 +1301,7 @@ void PianoRollComponent::showFlagLaneSwitchContextMenu(juce::Point<int> screenPo
 bool PianoRollComponent::flagResetAvailableForNote(const juce::String& noteId) const
 {
     const auto* note = findNote(noteId);
-    return note != nullptr && note->utauFlagCurveEnabled
+    return note != nullptr && flagCurveActiveFor(noteId)
         && !flagCurvePointsFor(*note, laneFlag).empty();
 }
 
@@ -1586,7 +1712,7 @@ void PianoRollComponent::drawFlagLane(juce::Graphics& g) const
     {
         bool utau = false;
         const auto* note = findNote(hit.id, &utau);
-        if (note == nullptr || !utau || !note->utauFlagCurveEnabled) continue;
+        if (note == nullptr || !utau || !flagCurveActiveFor(note->id)) continue;
         const auto absoluteStart = hit.startSeconds + hit.clipStartSeconds;
         const auto dragging = dragMode == DragMode::flagPoint && note->id == draggedNote;
         const auto points = dragging ? flagStroke : flagLaneCurveFor(*note);
@@ -1673,7 +1799,7 @@ void PianoRollComponent::drawFlagLane(juce::Graphics& g) const
         g.setColour(Palette::textMuted);
         g.setFont(12.0f);
         g.drawText(juce::String::fromUTF8("先选中音符并开启「线性flag」，这里才有曲线可画"
-                                           "（开启后每个 flag 都会有一条可拖的水平线）"),
+                                           "（仅界•UTAU 与谋•UTAU 有此功能）"),
                    plot.toNearestInt(), juce::Justification::centred, false);
     }
 }
@@ -1761,7 +1887,7 @@ std::vector<AmplitudeEnvelopePoint> PianoRollComponent::mapAmplitudeEnvelopeToNo
     {
         const auto fraction = juce::jlimit(0.0, 1.0,
             (point.timeSeconds - sourceFirst) / sourceSpan);
-        mapped.push_back({ targetFirst + fraction * targetSpan, point.gainDb });
+        mapped.push_back({ targetFirst + fraction * targetSpan, point.gainDb, point.linearToNext });
     }
     return mapped;
 }
@@ -1785,10 +1911,9 @@ void PianoRollComponent::commitAmplitudeEnvelopeToSelection(
         if (findNote(id, &utau) == nullptr || !utau) continue;
         auto mapped = mapAmplitudeEnvelopeToNote(source, sourceNoteId, id);
         // What was dragged is the shape with the base already in it; the note
-        // stores the shape without it, or the base would be multiplied twice.
+        // stores the shape without it, or the base would be multiplied in twice.
         if (const auto* target = findNote(id); target != nullptr)
-            mapped = unscaledAmplitudeEnvelope(mapped,
-                                               target->amplitudeEnvelopeBasePercent);
+            mapped = unscaledAmplitudeEnvelope(mapped, target->amplitudeEnvelopeBasePercent);
         if (mapped.size() >= 2) edits.emplace_back(id, std::move(mapped));
     }
     model.setNotesAmplitudeEnvelopes(std::move(edits));
@@ -1849,10 +1974,11 @@ juce::PopupMenu PianoRollComponent::buildPitchCurveShapeMenu(
 namespace
 {
 // The ids in a menu, in the order they are offered.
-std::vector<int> menuIds(const juce::PopupMenu& menu, bool enabledOnly)
+std::vector<int> menuIds(const juce::PopupMenu& menu, bool enabledOnly,
+                         bool searchSubMenus = false)
 {
     std::vector<int> ids;
-    juce::PopupMenu::MenuItemIterator walk(menu);
+    juce::PopupMenu::MenuItemIterator walk(menu, searchSubMenus);
     while (walk.next())
     {
         const auto& item = walk.getItem();
@@ -1861,6 +1987,35 @@ std::vector<int> menuIds(const juce::PopupMenu& menu, bool enabledOnly)
         ids.push_back(item.itemID);
     }
     return ids;
+}
+
+// A menu as it is laid out, one row at a time: an item as its id, a submenu as
+// its name with the ids inside it in brackets, a separator as "-".  Section
+// headers are left out, since nothing is chosen from them.
+std::vector<juce::String> menuLayout(const juce::PopupMenu& menu)
+{
+    std::vector<juce::String> rows;
+    juce::PopupMenu::MenuItemIterator walk(menu);
+    while (walk.next())
+    {
+        const auto& item = walk.getItem();
+        if (item.isSectionHeader) continue;
+        if (item.isSeparator)
+        {
+            rows.push_back("-");
+            continue;
+        }
+        if (item.subMenu != nullptr)
+        {
+            juce::StringArray inside;
+            for (const auto id : menuIds(*item.subMenu, false))
+                inside.add(juce::String(id));
+            rows.push_back(item.text + "[" + inside.joinIntoString(",") + "]");
+            continue;
+        }
+        if (item.itemID != 0) rows.push_back(juce::String(item.itemID));
+    }
+    return rows;
 }
 }
 
@@ -1942,6 +2097,8 @@ void PianoRollComponent::flattenPitchLine(const juce::String& noteId)
     model.flattenNotePitch(chosenNoteIds(noteId));
     // The cached anchors were derived from the old line.
     pitchAnchorCache.clear();
+    sharedLineCache.clear();
+    draggedSharedKey = 0;
     repaint();
 }
 
@@ -2007,22 +2164,25 @@ namespace
 enum class NoteMenuScope { both, utauOnly, plainOnly };
 struct NoteMenuEntry { int id; NoteMenuScope scope; };
 using Scope = NoteMenuScope;
-const std::array<NoteMenuEntry, 22> noteMenuEntries {{
+const std::array<NoteMenuEntry, 24> noteMenuEntries {{
     {  1, Scope::both      },   // 分割音符
     {  2, Scope::both      },   // 合并音符
-    { 20, Scope::both      },   // 强制连接（保留各音符数据）
-    { 23, Scope::both      },   // 包络基础值… -- 缩放整条响度包络，任意轨道可用
-    { 24, Scope::utauOnly  },   // 添加拼字音符 -- 前置一个只有引导声的音符
+    { 20, Scope::utauOnly  },   // 添加拼字音符    -- a lead-in and nothing else
+    { 24, Scope::both      },   // Connect native notes without merging
     {  3, Scope::utauOnly  },   // 时序…             -- from the voicebank entry
-    { 19, Scope::utauOnly  },   // 修改 STP…         -- moves that entry in the wav
     {  4, Scope::utauOnly  },   // 区域编辑器…       -- refuses off UTAU anyway
-    {  5, Scope::both      },   // 颤音…             -- target pitch layer for every track
+    // 高级 opens here, one level down, and holds the next four.
+    { 19, Scope::utauOnly  },   // 修改 STP…         -- moves that entry in the wav
+    { 21, Scope::utauOnly  },   // 单独OTO编辑…      -- this note's own entry
+    { 22, Scope::utauOnly  },   // 恢复为音源OTO     -- and back to the voicebank's
+    {  9, Scope::utauOnly  },   // flag 拆分…        -- needs the four regions
+    {  5, Scope::both      },   // 颤音…             -- only makeUtauRequest applies it
     {  6, Scope::both      },   // 改为真实颤音线
     {  7, Scope::both      },   // 退回为标准颤音模式
     {  8, Scope::both      },   // 修改颤音为音高标点… -- bakes into the anchor line
-    {  9, Scope::utauOnly  },   // flag 拆分…        -- needs the four regions
-    { 14, Scope::utauOnly  },   // 重置线性flag
+    { 14, Scope::utauOnly  },   // 重置线性flag    -- greyed off 界/谋
     { 12, Scope::utauOnly  },   // 辅音强制重置      -- a pinned preutterance is UTAU's
+    { 23, Scope::both      },   // 包络基础值…       -- the envelope is a UTAU-mode thing
     { 13, Scope::both      },   // 时序删除          -- removes notes and closes the gap
     { 15, Scope::utauOnly  },   // 添加空格
     { 16, Scope::utauOnly  },   // 添加指定长度空格…
@@ -2071,7 +2231,7 @@ PianoRollComponent::NoteMenu PianoRollComponent::buildNoteMenu(
         noteTiming = backend::UtauRenderer::sampleTiming(
             track.voicebankDirectory, note->label, note->midiNote, velocity,
             utauModeUsesRegions(track.utauMode),
-            track.utauMode == UtauMode::mou);
+            track.utauMode == UtauMode::mou, note->ownOto());
         if (noteTiming)
         {
             if (note->utauPreutteranceOverrideEnabled)
@@ -2130,25 +2290,57 @@ PianoRollComponent::NoteMenu PianoRollComponent::buildNoteMenu(
         menu.addItem(1, juce::String::fromUTF8("分割音符"), canSplit, false);
     if (wanted(2))
         menu.addItem(2, juce::String::fromUTF8("合并音符"), allInOneClip, false);
-    if (wanted(20))
-        menu.addItem(20, juce::String::fromUTF8("强制连接（保留音符数据）"),
-                     selectedNotes.size() >= 2, false);
-    if (wanted(23))
-        menu.addItem(23, juce::String::fromUTF8("包络基础值…"), true, false);
     if (wanted(24))
-        menu.addItem(24, juce::String::fromUTF8("添加拼字音符"),
-                     selectedNotes.size() == 1, false);
+        menu.addItem(24, juce::String::fromUTF8("强制连接（保留音符数据）"),
+                     selectedNotes.size() >= 2, false);
     const auto canEditTiming = noteTiming.has_value() && selectedNotes.size() == 1;
+    // A lead-in reaches back before the beat, so a note that begins at the
+    // very start of its clip has nowhere to put one.
+    const auto roomInFront = note->startSeconds > 1.0e-9;
+    if (wanted(20))
+        menu.addItem(20, juce::String::fromUTF8("添加拼字音符"), roomInFront, false);
     if (wanted(3))
         menu.addItem(3, juce::String::fromUTF8("时序…"), canEditTiming, false);
+    if (wanted(4))
+        menu.addItem(4, juce::String::fromUTF8("区域编辑器…  Ctrl+G"),
+                     onOpenRegionEditor != nullptr && selectedNotes.size() == 1, false);
+
+    // 高级: the tools that reach into the entry a note is sung from, or split
+    // what it carries, one level down -- hovering 高级 opens them.  Their ids
+    // are unchanged, so choosing one reaches applyNoteMenuChoice as before.
+    juce::PopupMenu advanced;
     // Offered whether or not the lyric resolves to an entry: a note may be
     // carrying an STP from a lyric it used to have, and refusing to open
     // would be the only thing standing between the user and clearing it.
     if (wanted(19))
-        menu.addItem(19, juce::String::fromUTF8("修改 STP…"), true, false);
-    if (wanted(4))
-        menu.addItem(4, juce::String::fromUTF8("区域编辑器…  Ctrl+G"),
-                     onOpenRegionEditor != nullptr && selectedNotes.size() == 1, false);
+        advanced.addItem(19, juce::String::fromUTF8("修改 STP…"), true, false);
+    // Its own copy of the entry, for this note alone: the oto files are not
+    // touched.  Every UTAU mode, since every one of them reads an entry.
+    if (wanted(21))
+        advanced.addItem(21, juce::String::fromUTF8("单独OTO编辑…"),
+                         onOpenNoteOtoEditor != nullptr && selectedNotes.size() == 1, false);
+    // And back to the voicebank's entry, which only a note with an oto of its
+    // own has to go back to.
+    if (wanted(22))
+        advanced.addItem(22, juce::String::fromUTF8("恢复为音源OTO"),
+                         ownOtoRestoreAvailable(chosenNoteIds(noteId)), false);
+    // Splitting flags only means anything where the note has four regions.
+    auto fourRegionTrack = false;
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& candidate : clip.notes)
+                if (candidate.id == noteId)
+                    fourRegionTrack = track.pitchAlgorithm == PitchAlgorithm::utau
+                        && utauModeUsesRegions(track.utauMode);
+    const auto* flagNote = findNote(noteId);
+    if (wanted(9))
+        advanced.addItem(9, juce::String::fromUTF8("flag 拆分…"), fourRegionTrack,
+                         flagNote != nullptr && flagNote->utauFlagSplit);
+    // Only when something is in it: off UTAU none of these is offered, and an
+    // empty 高级 would open onto nothing.
+    if (advanced.getNumItems() > 0)
+        menu.addSubMenu(juce::String::fromUTF8("高级"), advanced);
+
     const auto* vibratoNote = findNote(noteId);
     const auto hasVibrato = vibratoNote != nullptr && vibratoNote->vibratoEnabled;
     if (wanted(5))
@@ -2163,23 +2355,16 @@ PianoRollComponent::NoteMenu PianoRollComponent::buildNoteMenu(
     }
     if (wanted(8))
         menu.addItem(8, juce::String::fromUTF8("修改颤音为音高标点…"), hasVibrato, false);
-    // Splitting flags only means anything where the note has four regions.
-    auto fourRegionTrack = false;
-    for (const auto& track : snapshot.tracks)
-        for (const auto& clip : track.clips)
-            for (const auto& candidate : clip.notes)
-                if (candidate.id == noteId)
-                    fourRegionTrack = track.pitchAlgorithm == PitchAlgorithm::utau
-                        && utauModeUsesRegions(track.utauMode);
-    const auto* flagNote = findNote(noteId);
-    if (wanted(9))
-        menu.addItem(9, juce::String::fromUTF8("flag 拆分…"), fourRegionTrack,
-                     flagNote != nullptr && flagNote->utauFlagSplit);
     if (wanted(14))
         menu.addItem(14, juce::String::fromUTF8("重置线性flag"),
                      flagResetAvailable(chosenNoteIds(noteId)), false);
     if (wanted(12))
         menu.addItem(12, juce::String::fromUTF8("辅音强制重置"), true, false);
+    // The envelope's height as a whole.  It belongs beside the envelope lane
+    // rather than in 高级: raising or lowering a note is an ordinary edit, and
+    // the lane is where the result is seen.
+    if (wanted(23))
+        menu.addItem(23, juce::String::fromUTF8("包络基础值…"), true, false);
     if (wanted(13))
         menu.addItem(13, juce::String::fromUTF8("时序删除"), true, false);
     // A silence opened in front of the note, on UTAU tracks in every mode.
@@ -2207,12 +2392,19 @@ PianoRollComponent::NoteMenu PianoRollComponent::buildNoteMenu(
 std::vector<int> PianoRollComponent::diagnosticNoteMenuIds(
     const juce::String& noteId) const
 {
-    std::vector<int> ids;
-    auto built = buildNoteMenu(noteId);
-    juce::PopupMenu::MenuItemIterator walk(built.menu);
-    while (walk.next())
-        if (walk.getItem().itemID != 0) ids.push_back(walk.getItem().itemID);
-    return ids;
+    return menuIds(buildNoteMenu(noteId).menu, false, true);
+}
+
+std::vector<int> PianoRollComponent::diagnosticEnabledNoteMenuIds(
+    const juce::String& noteId) const
+{
+    return menuIds(buildNoteMenu(noteId).menu, true, true);
+}
+
+std::vector<juce::String> PianoRollComponent::diagnosticNoteMenuLayout(
+    const juce::String& noteId) const
+{
+    return menuLayout(buildNoteMenu(noteId).menu);
 }
 
 void PianoRollComponent::showNoteContextMenu(const juce::String& noteId,
@@ -2221,130 +2413,153 @@ void PianoRollComponent::showNoteContextMenu(const juce::String& noteId,
     auto built = buildNoteMenu(noteId);
     const auto split = built.splitSeconds;
     auto mergeIds = std::move(built.mergeIds);
-    juce::Component::SafePointer<PianoRollComponent> safe(this);
+    juce::Component::SafePointer<PianoRollComponent> keep(this);
     built.menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(
         { screenPosition.x, screenPosition.y, 1, 1 }),
-        [safe, noteId, split, mergeIds = std::move(mergeIds)](int result)
+        [keep, noteId, split, mergeIds = std::move(mergeIds)](int result)
         {
-            if (safe == nullptr) return;
-            if (result == 3)
-            {
-                safe->showNoteTimingDialog(noteId);
-                return;
-            }
-            if (result == 19)
-            {
-                safe->showStpDialog(noteId);
-                return;
-            }
-            if (result == 4)
-            {
-                if (safe->onOpenRegionEditor) safe->onOpenRegionEditor(noteId);
-                return;
-            }
-            if (result == 5)
-            {
-                safe->showVibratoDialog(noteId);
-                return;
-            }
-            if (result == 6 || result == 7)
-            {
-                safe->model.setNotesVibratoRealLine(safe->chosenNoteIds(noteId),
-                                                    result == 6);
-                return;
-            }
-            if (result == 8)
-            {
-                safe->confirmBakeVibrato(noteId);
-                return;
-            }
-            if (result == 14)
-            {
-                safe->model.resetNotesUtauFlagCurves(safe->chosenNoteIds(noteId));
-                return;
-            }
-            if (result == 17)
-            {
-                safe->showBatchLyricDialog(noteId);
-                return;
-            }
-            if (result == 12)
-            {
-                safe->resetConsonant(noteId);
-                return;
-            }
-            if (result == 13)
-            {
-                safe->deleteSelectedNotesRippling(noteId);
-                return;
-            }
-            if (result == 9)
-            {
-                safe->showRegionFlagDialog(noteId);
-                return;
-            }
-            if (result == 18)
-            {
-                safe->flattenPitchLine(noteId);
-                return;
-            }
-            if (result == 11)
-            {
-                safe->showTransposeDialog(noteId);
-                return;
-            }
-            if (result == 15)
-            {
-                safe->model.insertGapBeforeNote(noteId,
-                    safe->quarterBarSecondsAt(
-                        std::max(0.0, safe->absoluteStartOf(noteId))));
-                return;
-            }
-            if (result == 16)
-            {
-                safe->showGapDialog(noteId);
-                return;
-            }
-            if (result == 10)
-            {
-                // Right-clicking already put this note in the selection, so
-                // this removes exactly what Delete would have.
-                safe->deleteSelectedNotes();
-                return;
-            }
-            if (result == 20)
-            {
-                safe->model.setNotesConnection(safe->chosenNoteIds(noteId), true);
-                return;
-            }
-            if (result == 23)
-            {
-                safe->showEnvelopeBaseDialog(noteId);
-                return;
-            }
-            if (result == 24)
-            {
-                const auto prefix = safe->model.insertPrefixNote(noteId,
-                    safe->effectiveUtauOverlapFor(noteId));
-                if (prefix.isEmpty()) return;
-                safe->selectedNote = prefix;
-                safe->selectedNotes.clear();
-                safe->selectedNotes.insert(prefix.toStdString());
-                if (safe->onNoteSelected) safe->onNoteSelected(prefix);
-                safe->repaint();
-                return;
-            }
-            if (result != 1 && result != 2) return;
-            const auto resultingId = result == 1
-                ? safe->model.splitNote(noteId, split)
-                : safe->model.mergeNotes(mergeIds);
-            if (resultingId.isEmpty()) return;
-            safe->selectedNote = resultingId;
-            safe->selectedNotes.clear();
-            safe->selectedNotes.insert(resultingId.toStdString());
-            if (safe->onNoteSelected) safe->onNoteSelected(resultingId);
-            safe->repaint();
+            if (keep == nullptr) return;
+            keep->applyNoteMenuChoice(noteId, result, split, mergeIds);
         });
+}
+
+// What choosing an item does.  Out of the popup's callback so a check can ask
+// it directly: inside one, every item in this menu was reachable only through
+// a modal window, and an entry added to the table but not here would appear,
+// accept a click and do nothing at all.
+void PianoRollComponent::applyNoteMenuChoice(
+    const juce::String& noteId, int result, double split,
+    const std::vector<juce::String>& mergeIds)
+{
+    if (result == 3)
+    {
+        showNoteTimingDialog(noteId);
+        return;
+    }
+    if (result == 19)
+    {
+        showStpDialog(noteId);
+        return;
+    }
+    if (result == 23)
+    {
+        showEnvelopeBaseDialog(noteId);
+        return;
+    }
+    if (result == 24)
+    {
+        model.setNotesConnection(chosenNoteIds(noteId), true);
+        return;
+    }
+    if (result == 20)
+    {
+        const auto prefix = model.insertPrefixNote(noteId,
+            effectiveUtauOverlapFor(noteId));
+        if (prefix.isEmpty()) return;
+        // Selected, because the next thing anyone does with it is give
+        // it a lyric of its own.
+        selectedNote = prefix;
+        selectedNotes.clear();
+        selectedNotes.insert(prefix.toStdString());
+        if (onNoteSelected) onNoteSelected(prefix);
+        repaint();
+        return;
+    }
+    if (result == 4)
+    {
+        if (onOpenRegionEditor) onOpenRegionEditor(noteId);
+        return;
+    }
+    if (result == 21)
+    {
+        if (onOpenNoteOtoEditor) onOpenNoteOtoEditor(noteId);
+        return;
+    }
+    if (result == 22)
+    {
+        model.clearNotesUtauOto(chosenNoteIds(noteId));
+        return;
+    }
+    if (result == 5)
+    {
+        showVibratoDialog(noteId);
+        return;
+    }
+    if (result == 6 || result == 7)
+    {
+        model.setNotesVibratoRealLine(chosenNoteIds(noteId),
+                                            result == 6);
+        return;
+    }
+    if (result == 8)
+    {
+        confirmBakeVibrato(noteId);
+        return;
+    }
+    if (result == 14)
+    {
+        model.resetNotesUtauFlagCurves(chosenNoteIds(noteId));
+        return;
+    }
+    if (result == 17)
+    {
+        showBatchLyricDialog(noteId);
+        return;
+    }
+    if (result == 12)
+    {
+        resetConsonant(noteId);
+        return;
+    }
+    if (result == 13)
+    {
+        deleteSelectedNotesRippling(noteId);
+        return;
+    }
+    if (result == 9)
+    {
+        showRegionFlagDialog(noteId);
+        return;
+    }
+    if (result == 18)
+    {
+        flattenPitchLine(noteId);
+        return;
+    }
+    if (result == 11)
+    {
+        showTransposeDialog(noteId);
+        return;
+    }
+    if (result == 15)
+    {
+        model.insertGapBeforeNote(noteId,
+            quarterBarSecondsAt(
+                std::max(0.0, absoluteStartOf(noteId))));
+        return;
+    }
+    if (result == 16)
+    {
+        showGapDialog(noteId);
+        return;
+    }
+    if (result == 10)
+    {
+        // Right-clicking already put this note in the selection, so
+        // this removes exactly what Delete would have.
+        deleteSelectedNotes();
+        return;
+    }
+    if (result != 1 && result != 2) return;
+    const auto resultingId = result == 1
+        ? model.splitNote(noteId, split)
+        : model.mergeNotes(mergeIds);
+    if (resultingId.isEmpty()) return;
+    selectedNote = resultingId;
+    selectedNotes.clear();
+    selectedNotes.insert(resultingId.toStdString());
+    if (onNoteSelected) onNoteSelected(resultingId);
+    repaint();
 }
 
 std::vector<PianoRollComponent::RegionFlagField>
@@ -2372,7 +2587,7 @@ PianoRollComponent::regionFlagFieldsFor(const juce::String& noteId) const
                         ? note.utauConsonantVelocity : track.utauConsonantVelocity;
                     const auto timing = backend::UtauRenderer::sampleTiming(
                         track.voicebankDirectory, note.label, note.midiNote,
-                        velocity, true, true);
+                        velocity, true, true, note.ownOto());
                     if (timing)
                         count = SampleSettings::mouRegionCount(timing->mouClasses);
                 }
@@ -2695,49 +2910,12 @@ double PianoRollComponent::effectiveUtauOverlapFor(const juce::String& noteId) c
                 if (const auto timing = backend::UtauRenderer::sampleTiming(
                         track.voicebankDirectory, note->label, note->midiNote,
                         velocity, utauModeUsesRegions(track.utauMode),
-                        track.utauMode == UtauMode::mou))
+                        track.utauMode == UtauMode::mou, note->ownOto()))
                     return timing->overlapSeconds;
                 return 0.0;
             }
     }
     return 0.0;
-}
-
-void PianoRollComponent::showEnvelopeBaseDialog(const juce::String& noteId)
-{
-    const auto* note = findNote(noteId);
-    if (note == nullptr) return;
-    const auto targets = chosenNoteIds(noteId);
-    auto* dialog = new juce::AlertWindow(
-        juce::String::fromUTF8("包络基础值"),
-        juce::String::fromUTF8(
-            "把这个音符的整条响度包络按比例整体升降，不改变它的形状。\n"
-            "100 是包络本身，200 是两倍高（更响），110 是 1.1 倍，0 是静音。\n"
-            "没有画过包络的音符，隐含的那条 100% 平线一样会被抬起来。"),
-        juce::MessageBoxIconType::NoIcon);
-    dialog->addTextEditor("base",
-                          juce::String(note->amplitudeEnvelopeBasePercent, 1),
-                          juce::String::fromUTF8("基础值，% （0–200）："));
-    if (auto* editor = dialog->getTextEditor("base"))
-    {
-        editor->setInputRestrictions(0, "0123456789.");
-        editor->setSelectAllWhenFocused(true);
-    }
-    dialog->addButton(juce::String::fromUTF8("应用"), 1,
-                      juce::KeyPress(juce::KeyPress::returnKey));
-    dialog->addButton(juce::String::fromUTF8("取消"), 0,
-                      juce::KeyPress(juce::KeyPress::escapeKey));
-    juce::Component::SafePointer<PianoRollComponent> safe(this);
-    dialog->enterModalState(true,
-        juce::ModalCallbackFunction::create(
-            [safe, dialog, targets](int result)
-            {
-                if (safe != nullptr && result == 1)
-                    safe->model.setNotesAmplitudeEnvelopeBase(targets,
-                        static_cast<float>(
-                            dialog->getTextEditorContents("base").getDoubleValue()));
-                delete dialog;
-            }), false);
 }
 
 void PianoRollComponent::showStpDialog(const juce::String& noteId)
@@ -2773,6 +2951,43 @@ void PianoRollComponent::showStpDialog(const juce::String& noteId)
                     safe->model.setNotesUtauStp(targets,
                         dialog->getTextEditorContents("stp").getDoubleValue()
                             / 1000.0);
+                delete dialog;
+            }), false);
+}
+
+void PianoRollComponent::showEnvelopeBaseDialog(const juce::String& noteId)
+{
+    const auto* note = findNote(noteId);
+    if (note == nullptr) return;
+    const auto targets = chosenNoteIds(noteId);
+    auto* dialog = new juce::AlertWindow(
+        juce::String::fromUTF8("包络基础值"),
+        juce::String::fromUTF8(
+            "把这个音符的整条响度包络按比例整体升降，不改变它的形状。\n"
+            "100 是包络本身，200 是两倍高（更响），110 是 1.1 倍，0 是静音。\n"
+            "没有画过包络的音符，隐含的那条 100% 平线一样会被抬起来。"),
+        juce::MessageBoxIconType::NoIcon);
+    dialog->addTextEditor("base",
+                          juce::String(note->amplitudeEnvelopeBasePercent, 1),
+                          juce::String::fromUTF8("基础值，% （0–200）："));
+    if (auto* editor = dialog->getTextEditor("base"))
+    {
+        editor->setInputRestrictions(0, "0123456789.");
+        editor->setSelectAllWhenFocused(true);
+    }
+    dialog->addButton(juce::String::fromUTF8("应用"), 1,
+                      juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton(juce::String::fromUTF8("取消"), 0,
+                      juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<PianoRollComponent> safe(this);
+    dialog->enterModalState(true,
+        juce::ModalCallbackFunction::create(
+            [safe, dialog, targets](int result)
+            {
+                if (safe != nullptr && result == 1)
+                    safe->model.setNotesAmplitudeEnvelopeBase(targets,
+                        static_cast<float>(
+                            dialog->getTextEditorContents("base").getDoubleValue()));
                 delete dialog;
             }), false);
 }
@@ -2957,7 +3172,7 @@ void PianoRollComponent::showVibratoDialog(const juce::String& noteId)
 
     auto* dialog = new juce::AlertWindow(
         juce::String::fromUTF8("颤音"),
-        juce::String::fromUTF8("以该音的音高线为基准上下颤动；长度从音符末尾往前算。"),
+        juce::String::fromUTF8("以该音的音高线为基准上下颤动；长度从颤音终止处往前算。"),
         juce::MessageBoxIconType::NoIcon);
     struct Field { const char* key; const char* label; double value; };
     // Same order as vibratoFieldKeys, which is the order a preset lists them.
@@ -2979,6 +3194,15 @@ void PianoRollComponent::showVibratoDialog(const juce::String& noteId)
             editor->setSelectAllWhenFocused(true);
             editor->setInputRestrictions(0, "-0123456789.");
         }
+    }
+    // Not one of UTAU's seven, so not part of a preset either: where the
+    // swing stops.  100 is the note's end, where UTAU always stops it.
+    dialog->addTextEditor("end", juce::String(note->vibratoEndPercent, 3),
+                          juce::String::fromUTF8("终止位置 (% 于音符，100 = 末尾)："));
+    if (auto* editor = dialog->getTextEditor("end"))
+    {
+        editor->setSelectAllWhenFocused(true);
+        editor->setInputRestrictions(0, "0123456789.");
     }
     auto* presets = new VibratoPresetBar(*dialog,
         onLoadVibratoPresets ? onLoadVibratoPresets() : juce::String(),
@@ -3012,6 +3236,7 @@ void PianoRollComponent::showVibratoDialog(const juce::String& noteId)
                     parameters.vibratoFadeOutPercent = number("fadeout", 20.0);
                     parameters.vibratoPhasePercent = number("phase", 0.0);
                     parameters.vibratoOffsetPercent = number("offset", 0.0);
+                    parameters.vibratoEndPercent = number("end", 100.0);
                     safe->model.setNotesVibrato(targets, parameters, result == 1);
                 }
                 dialog->removeCustomComponent(0);
@@ -3041,7 +3266,7 @@ void PianoRollComponent::showNoteTimingDialog(const juce::String& noteId)
         timing = backend::UtauRenderer::sampleTiming(
             track.voicebankDirectory, note->label, note->midiNote, velocity,
             utauModeUsesRegions(track.utauMode),
-            track.utauMode == UtauMode::mou);
+            track.utauMode == UtauMode::mou, note->ownOto());
         break;
     }
     // No entry for this lyric: the note cannot sound, but it may still be
@@ -3246,6 +3471,217 @@ void PianoRollComponent::showAnchorFrequencyDialog(const juce::String& noteId,
             }), false);
 }
 
+const TrackData* PianoRollComponent::trackOf(const juce::String& noteId) const
+{
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == noteId) return &track;
+    return nullptr;
+}
+
+const SharedPitchLines& PianoRollComponent::sharedLinesFor(const TrackData& track,
+                                                           bool followDrag) const
+{
+    if (followDrag && dragMode == DragMode::pointPitch && !pitchStroke.empty()
+        && draggedNote.isNotEmpty())
+    {
+        auto holdsDragged = false;
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                holdsDragged = holdsDragged || note.id == draggedNote;
+        if (holdsDragged)
+        {
+            // Once per stroke, not once per note painted: the key is the
+            // stroke itself.
+            auto key = static_cast<std::uint64_t>(draggedNote.hashCode64());
+            for (const auto& point : pitchStroke)
+            {
+                key = key * 1099511628211ull
+                    ^ static_cast<std::uint64_t>(std::llround(point.timeSeconds * 1.0e7));
+                key = key * 1099511628211ull
+                    ^ static_cast<std::uint64_t>(std::llround(point.targetMidi * 1.0e4));
+                key = key * 1099511628211ull ^ static_cast<std::uint64_t>(point.shape);
+                for (const auto handle : { point.bezierX1, point.bezierY1,
+                                            point.bezierX2, point.bezierY2 })
+                    key = key * 1099511628211ull
+                        ^ static_cast<std::uint64_t>(std::llround(handle * 1.0e7));
+            }
+            if (key != draggedSharedKey)
+            {
+                draggedSharedLines = sharedPitchLines(track, draggedNote, &pitchStroke);
+                draggedSharedKey = key;
+            }
+            return draggedSharedLines;
+        }
+    }
+    const auto found = sharedLineCache.find(track.id);
+    if (found != sharedLineCache.end()) return found->second;
+    return sharedLineCache.emplace(track.id, sharedPitchLines(track)).first->second;
+}
+
+std::optional<PianoRollComponent::TransitionBridge> PianoRollComponent::transitionBridge(
+    const TrackData& track, const NoteData& note, double absoluteStart)
+{
+    const PositionedUtauNote positioned {
+        note.id, absoluteStart, absoluteStart + note.durationSeconds,
+        note.utauAutoPitchTransition
+    };
+    const auto& anchors = draggedNote == note.id && dragMode == DragMode::pointPitch
+            && !pitchStroke.empty()
+        ? pitchStroke : pitchAnchorsFor(note);
+    if (anchors.empty()) return std::nullopt;
+    // Two notes sharing a line are joined by the line itself.
+    if (const auto* member = sharedLinesFor(track).memberFor(note.id);
+        member != nullptr && member->joinsNext)
+        return std::nullopt;
+    const auto next = nextUtauNoteFor(note.id);
+    if (!next || !formsAdjacentPitchBoundary(positioned, *next)) return std::nullopt;
+    const auto* nextNote = findNote(next->id);
+    if (nextNote == nullptr) return std::nullopt;
+    const auto& nextAnchors = draggedNote == nextNote->id
+            && dragMode == DragMode::pointPitch && !pitchStroke.empty()
+        ? pitchStroke : pitchAnchorsFor(*nextNote);
+    if (nextAnchors.empty()) return std::nullopt;
+    TransitionBridge bridge;
+    bridge.startSeconds = absoluteStart + anchors.back().timeSeconds;
+    bridge.endSeconds = next->startSeconds + nextAnchors.front().timeSeconds;
+    bridge.startMidi = anchors.back().targetMidi;
+    bridge.endMidi = nextAnchors.front().targetMidi;
+    if (bridge.endSeconds <= bridge.startSeconds + 1.0e-6) return std::nullopt;
+    return bridge;
+}
+
+std::optional<PianoRollComponent::TransitionBridge>
+PianoRollComponent::diagnosticTransitionBridge(const juce::String& id)
+{
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == id)
+                    return transitionBridge(track, note, clip.startSeconds + note.startSeconds);
+    return std::nullopt;
+}
+
+std::vector<double> PianoRollComponent::pitchLineBreaks(const TrackData& track,
+                                                        const NoteData& note,
+                                                        double absoluteStart)
+{
+    std::vector<double> breaks;
+    if (const auto* member = sharedLinesFor(track).memberFor(note.id))
+    {
+        // Its part of the line it shares: its own stretch and the turn after
+        // it, through every corner of the line in between.  Nothing, when a
+        // later note's bend has taken the whole of it over.
+        if (member->drawTo <= member->drawFrom + 1.0e-9) return breaks;
+        for (const auto corner : member->line->cornersBetween(member->drawFrom, member->drawTo))
+            breaks.push_back(corner - absoluteStart);
+        return breaks;
+    }
+    const auto& anchors = draggedNote == note.id && dragMode == DragMode::pointPitch
+            && !pitchStroke.empty()
+        ? pitchStroke : pitchAnchorsFor(note);
+    for (const auto& anchor : anchors) breaks.push_back(anchor.timeSeconds);
+    return breaks;
+}
+
+float PianoRollComponent::pitchLineMidiAt(const TrackData& track, const NoteData& note,
+                                          double absoluteStart, double time)
+{
+    if (const auto* member = sharedLinesFor(track).memberFor(note.id))
+        return member->line->midiAt(absoluteStart + time);
+    const auto& anchors = draggedNote == note.id && dragMode == DragMode::pointPitch
+            && !pitchStroke.empty()
+        ? pitchStroke : pitchAnchorsFor(note);
+    return pitchAt(anchors, time);
+}
+
+bool PianoRollComponent::pitchHandleOffered(const NoteData& note, double absoluteSeconds) const
+{
+    const auto* track = trackOf(note.id);
+    if (track == nullptr) return true;
+    // As the lines stood before any drag in progress: dragging a point must
+    // not make another appear or disappear.
+    const auto* member = sharedLinesFor(*track, false).memberFor(note.id);
+    return member == nullptr || member->owns(absoluteSeconds);
+}
+
+std::optional<double> PianoRollComponent::lastShownPitchPoint(const juce::String& noteId,
+                                                              double absoluteStart)
+{
+    const auto* note = findNote(noteId);
+    if (note == nullptr) return std::nullopt;
+    std::optional<double> last;
+    for (const auto& anchor : pitchAnchorsFor(*note))
+    {
+        const auto at = absoluteStart + anchor.timeSeconds;
+        if (pitchHandleOffered(*note, at) && (!last || at > *last)) last = at;
+    }
+    return last;
+}
+
+std::optional<double> PianoRollComponent::firstShownPitchPoint(const juce::String& noteId,
+                                                               double absoluteStart)
+{
+    const auto* note = findNote(noteId);
+    if (note == nullptr) return std::nullopt;
+    std::optional<double> first;
+    for (const auto& anchor : pitchAnchorsFor(*note))
+    {
+        const auto at = absoluteStart + anchor.timeSeconds;
+        if (pitchHandleOffered(*note, at) && (!first || at < *first)) first = at;
+    }
+    return first;
+}
+
+std::vector<PitchCurveEditPoint> PianoRollComponent::diagnosticOfferedPitchAnchors(
+    const juce::String& id)
+{
+    std::vector<PitchCurveEditPoint> offered;
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == id)
+                {
+                    const auto start = clip.startSeconds + note.startSeconds;
+                    for (const auto& anchor : pitchAnchorsFor(note))
+                        if (pitchHandleOffered(note, start + anchor.timeSeconds))
+                            offered.push_back(anchor);
+                    return offered;
+                }
+    return offered;
+}
+
+std::optional<float> PianoRollComponent::diagnosticPitchLineAt(const juce::String& id,
+                                                               double absoluteSeconds)
+{
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == id)
+                {
+                    const auto start = clip.startSeconds + note.startSeconds;
+                    return pitchLineMidiAt(track, note, start, absoluteSeconds - start);
+                }
+    return std::nullopt;
+}
+
+std::optional<std::pair<double, double>> PianoRollComponent::diagnosticPitchLineSpan(
+    const juce::String& id)
+{
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == id)
+                {
+                    const auto start = clip.startSeconds + note.startSeconds;
+                    const auto breaks = pitchLineBreaks(track, note, start);
+                    if (breaks.empty()) return std::nullopt;
+                    return std::make_pair(start + breaks.front(), start + breaks.back());
+                }
+    return std::nullopt;
+}
+
 std::vector<PitchCurveEditPoint>& PianoRollComponent::pitchAnchorsFor(const NoteData& note)
 {
     const auto key = note.id.toStdString();
@@ -3317,9 +3753,13 @@ std::vector<PitchCurveEditPoint>& PianoRollComponent::pitchAnchorsFor(const Note
     const auto positioned = positionedUtauNotesFor(note.id);
     const auto current = std::find_if(positioned.begin(), positioned.end(),
         [&](const auto& value) { return value.id == note.id; });
+    const auto* noteTrack = trackOf(note.id);
+    const auto* sharedMember = noteTrack != nullptr
+        ? sharedLinesFor(*noteTrack).memberFor(note.id) : nullptr;
     if (derived && anchors.size() >= 2 && current != positioned.end())
     {
-        if (current != positioned.begin())
+        if (current != positioned.begin()
+            && !(sharedMember != nullptr && sharedMember->joinsPrevious))
         {
             const auto& previous = *std::prev(current);
             if (formsAdjacentPitchBoundary(previous, *current))
@@ -3331,7 +3771,8 @@ std::vector<PitchCurveEditPoint>& PianoRollComponent::pitchAnchorsFor(const Note
                 anchors.front().timeSeconds = inset;
             }
         }
-        if (std::next(current) != positioned.end())
+        if (std::next(current) != positioned.end()
+            && !(sharedMember != nullptr && sharedMember->joinsNext))
         {
             const auto& next = *std::next(current);
             if (formsAdjacentPitchBoundary(*current, next))
@@ -3352,6 +3793,8 @@ std::vector<PitchCurveEditPoint>& PianoRollComponent::pitchAnchorsFor(const Note
 void PianoRollComponent::diagnosticRefresh()
 {
     pitchAnchorCache.clear();
+    sharedLineCache.clear();
+    draggedSharedKey = 0;
     rebuildLayout();
 }
 
@@ -3696,6 +4139,7 @@ void PianoRollComponent::rebuildUtauSoundSpans()
         std::optional<backend::UtauSampleTiming> timing;
     };
 
+    auto previousSpans = std::move(utauSoundSpans);
     utauSoundSpans.clear();
     utauNeighbours.clear();
     if (sourceEditMode) return;
@@ -3704,6 +4148,17 @@ void PianoRollComponent::rebuildUtauSoundSpans()
         if (!track.compose || track.pitchAlgorithm != PitchAlgorithm::utau
             || !track.voicebankDirectory.isDirectory())
             continue;
+        if (!voicebankReadFor(track))
+        {
+            // Asking sampleTiming now would read the bank here, on the
+            // message thread, which is the wait this exists to avoid.
+            for (const auto& clip : track.clips)
+                for (const auto& note : clip.notes)
+                    if (const auto kept = previousSpans.find(note.id.toStdString());
+                        kept != previousSpans.end())
+                        utauSoundSpans.insert(*kept);
+            continue;
+        }
         std::vector<DisplayNote> notes;
         // sampleTiming stats the voicebank folder, builds a cache key and
         // scans every oto entry by name, so asking it once per note made an
@@ -3722,8 +4177,16 @@ void PianoRollComponent::rebuildUtauSoundSpans()
                     ? note.utauConsonantVelocity : track.utauConsonantVelocity;
                 const auto timingKey = std::make_tuple(note.label, note.midiNote,
                                                        consonantVelocity);
-                const auto cached = timings.find(timingKey);
-                display.timing = cached != timings.end()
+                // A note with its own oto is its own case: this cache is keyed
+                // by what an entry is looked up by, which says nothing of it.
+                const auto cached = note.utauOto.enabled ? timings.end()
+                                                         : timings.find(timingKey);
+                display.timing = note.utauOto.enabled
+                    ? backend::UtauRenderer::sampleTiming(
+                          track.voicebankDirectory, note.label, note.midiNote,
+                          consonantVelocity, utauModeUsesRegions(track.utauMode),
+                          track.utauMode == UtauMode::mou, note.ownOto())
+                    : cached != timings.end()
                     ? cached->second
                     : timings.emplace(timingKey, backend::UtauRenderer::sampleTiming(
                           track.voicebankDirectory, note.label, note.midiNote,
@@ -3765,13 +4228,10 @@ void PianoRollComponent::rebuildUtauSoundSpans()
                 if (next.timing && backend::UtauRenderer::crossfadesInto(
                         nextSoundStart, note.end))
                 {
-                    const auto reach = backend::UtauRenderer::crossfadeEnd(
+                    // Splicing is not an exception here either: it changes
+                    // the shape of the crossfade and not where it happens.
+                    soundingEnd = backend::UtauRenderer::crossfadeEnd(
                         nextSoundStart, next.timing->overlapSeconds, next.end);
-                    // Splicing is the exception: it crossfades only the
-                    // stretch the two notes already share and leaves both
-                    // spans where they were, so there the tail does stop at
-                    // this note's end.
-                    soundingEnd = next.spliced ? std::min(note.end, reach) : reach;
                 }
             }
             const auto soundingStart = note.start - leadIn;
@@ -3786,6 +4246,25 @@ void PianoRollComponent::rebuildUtauSoundSpans()
             utauSoundSpans[note.id.toStdString()] = { soundingStart, soundingEnd };
         }
     }
+}
+
+bool PianoRollComponent::voicebankReadFor(const TrackData& track) const
+{
+    if (!readsVoicebankInBackground) return true;
+    std::function<void()> whenReady;
+    if (!awaitingVoicebank)
+        whenReady = [safe = juce::Component::SafePointer<PianoRollComponent>(
+                         const_cast<PianoRollComponent*>(this))]
+        {
+            if (safe == nullptr) return;
+            safe->awaitingVoicebank = false;
+            safe->rebuildLayout();
+        };
+    const auto ready = backend::UtauRenderer::voicebankIndexReady(
+        track.voicebankDirectory, utauModeUsesRegions(track.utauMode),
+        track.utauMode == UtauMode::mou, std::move(whenReady));
+    if (!ready) awaitingVoicebank = true;
+    return ready;
 }
 
 void PianoRollComponent::updateCanvasSize()
@@ -3828,6 +4307,226 @@ void PianoRollComponent::setUtauNoteWaveforms(
     if (showUtauWaveforms) repaint();
 }
 
+namespace
+{
+// The piece's own span, in the note's own row: it starts a lead-in before the
+// note, because that is where the consonant is sung, and it lasts as long as
+// the engine made it.  Drawn from the note's own start and length instead, a
+// note's consonant landed in the row of the note before it.
+std::pair<double, double> waveformSpan(double noteStartSeconds,
+                                       const UtauNoteWaveform& waveform)
+{
+    return { noteStartSeconds - waveform.leadInSeconds, waveform.durationSeconds };
+}
+}
+
+std::optional<std::pair<double, double>> PianoRollComponent::diagnosticWaveformSpan(
+    const juce::String& noteId) const
+{
+    if (utauWaveforms == nullptr) return std::nullopt;
+    for (const auto& waveform : *utauWaveforms)
+    {
+        if (waveform.noteId != noteId) continue;
+        for (const auto& track : snapshot.tracks)
+            for (const auto& clip : track.clips)
+                for (const auto& note : clip.notes)
+                    if (note.id == noteId)
+                        return waveformSpan(clip.startSeconds + note.startSeconds, waveform);
+    }
+    return std::nullopt;
+}
+
+std::vector<AmplitudeEnvelopePoint> PianoRollComponent::displayAmplitudeEnvelope(
+    const NoteData& note, double absoluteStart) const
+{
+    auto envelope = amplitudeEnvelopeFor(note, absoluteStart);
+    // Mid-drag the project still holds the old shape: what is on screen is the
+    // stroke under the pointer, and that is what the audio has to follow.
+    const auto participates = note.id == draggedNote
+        || selectedNotes.contains(note.id.toStdString())
+        || (selectedNotes.empty() && note.id == selectedNote);
+    if (dragMode == DragMode::amplitudePoint && !amplitudeStroke.empty() && participates)
+        if (auto mapped = mapAmplitudeEnvelopeToNote(amplitudeStroke, draggedNote, note.id);
+            mapped.size() >= 2)
+            envelope = std::move(mapped);
+    return envelope;
+}
+
+bool PianoRollComponent::withinEnvelope(const UtauNoteWaveform& waveform,
+                                        const std::vector<AmplitudeEnvelopePoint>& envelope,
+                                        std::size_t bucket)
+{
+    if (envelope.size() < 2) return false;
+    // Buckets are a millisecond each, so the middle of one is near enough the
+    // moment to read the envelope at.
+    const auto seconds = (static_cast<double>(bucket) + 0.5) / 1000.0
+        - waveform.leadInSeconds;
+    return seconds >= envelope.front().timeSeconds
+        && seconds <= envelope.back().timeSeconds;
+}
+
+float PianoRollComponent::notePictureAt(const UtauNoteWaveform& waveform,
+                                        const std::vector<AmplitudeEnvelopePoint>& envelope,
+                                        std::size_t bucket, bool high)
+{
+    // The envelope on screen, not the one the piece was rendered with.  The
+    // two agree in the song, but a render is only ever of the notes selected:
+    // the last of them was rendered with no note after it, sang on to its
+    // own end, and was drawn doing so -- past the point where, in the song,
+    // the next note takes over and the envelope on screen ends.  The line is
+    // the note as it will be heard in the song, so the picture follows it,
+    // past its ends too, where it holds the gain it ends on.
+    const auto value = high ? waveform.unshapedMaxima[bucket]
+                            : waveform.unshapedMinima[bucket];
+    const auto seconds = (static_cast<double>(bucket) + 0.5) / 1000.0
+        - waveform.leadInSeconds;
+    const auto db = amplitudeDbAt(envelope, seconds);
+    return db <= -59.9f ? 0.0f : value * std::pow(10.0f, db / 20.0f);
+}
+
+float PianoRollComponent::noteGhostAt(const UtauNoteWaveform& waveform,
+                                      const std::vector<AmplitudeEnvelopePoint>& envelope,
+                                      std::size_t bucket)
+{
+    // Between the envelope's first and last points its shape is left out:
+    // that is what the lane's line is there to change.  Past them the
+    // envelope holds the gain it ends on, and no point in the lane can move
+    // that, so it stays -- a note ending in silence is silence there, however
+    // far the render of a selection let it run on.
+    if (withinEnvelope(waveform, envelope, bucket))
+        return std::max(waveform.unshapedMaxima[bucket], -waveform.unshapedMinima[bucket]);
+    return std::max(notePictureAt(waveform, envelope, bucket, true),
+                    -notePictureAt(waveform, envelope, bucket, false));
+}
+
+std::optional<PianoRollComponent::DrawnNoteWaveform>
+PianoRollComponent::diagnosticDrawnNoteWaveform(const juce::String& noteId) const
+{
+    if (utauWaveforms == nullptr) return std::nullopt;
+    for (const auto& waveform : *utauWaveforms)
+    {
+        if (waveform.noteId != noteId) continue;
+        for (const auto& track : snapshot.tracks)
+            for (const auto& clip : track.clips)
+                for (const auto& note : clip.notes)
+                {
+                    if (note.id != noteId) continue;
+                    if (waveform.audioHash != AudioEngine::utauNoteAudioHash(note)
+                        || waveform.unshapedMaxima.empty())
+                        return std::nullopt;
+                    const auto envelope = displayAmplitudeEnvelope(
+                        note, clip.startSeconds + note.startSeconds);
+                    DrawnNoteWaveform drawn;
+                    drawn.leadInSeconds = waveform.leadInSeconds;
+                    for (std::size_t bucket = 0; bucket < waveform.unshapedMaxima.size(); ++bucket)
+                    {
+                        drawn.picture.push_back(std::max(
+                            notePictureAt(waveform, envelope, bucket, true),
+                            -notePictureAt(waveform, envelope, bucket, false)));
+                        drawn.ghost.push_back(noteGhostAt(waveform, envelope, bucket));
+                    }
+                    return drawn;
+                }
+    }
+    return std::nullopt;
+}
+
+int PianoRollComponent::drawAmplitudeLaneWaveforms(juce::Graphics& g)
+{
+    // What the envelope is being drawn over.  Without it the lane is a curve
+    // against an empty grid: where the consonant ends, where the tail dies
+    // away, whether a point sits on sound or on silence -- none of it is
+    // visible, and those are the moments an envelope is placed by.
+    //
+    // Two layers, because the lane has two questions to answer.  The solid
+    // one is the audio as the envelope now shapes it -- drag a point and it
+    // follows, which is the whole reason to draw audio here.  Behind it, faint,
+    // is the piece before the envelope: what the line is acting on, so a
+    // stretch pulled to silence still shows the sound being silenced rather
+    // than an empty lane that says nothing about why.
+    if (!showUtauWaveforms || utauWaveforms == nullptr || utauWaveforms->empty()) return 0;
+    const auto plot = amplitudeLanePlotBounds();
+    const auto baseline = amplitudeLaneY(amplitudeDbFromPercent(0.0f));
+    const auto fullScale = amplitudeLaneY(amplitudeDbFromPercent(100.0f));
+    if (plot.getWidth() <= 1.0f || baseline - fullScale <= 1.0f) return 0;
+
+    std::unordered_map<std::string, const UtauNoteWaveform*> byId;
+    byId.reserve(utauWaveforms->size());
+    for (const auto& waveform : *utauWaveforms)
+        byId.emplace(waveform.noteId.toStdString(), &waveform);
+
+    auto drawn = 0;
+    for (const auto& hit : noteHits)
+    {
+        const auto found = byId.find(hit.id.toStdString());
+        if (found == byId.end()) continue;
+        const auto& waveform = *found->second;
+        if (waveform.unshapedMaxima.empty() || waveform.durationSeconds <= 0.0) continue;
+        bool utau = false;
+        const auto* note = findNote(hit.id, &utau);
+        if (note == nullptr || !utau) continue;
+        // The note has to still be the note that was rendered, exactly as in
+        // the roll above: an edit moves the hash and the audio stops being
+        // drawn until the new audio arrives.
+        // The audio hash, not the render hash: the lane draws the piece
+        // before the envelope, and an envelope edit leaves that piece alone.
+        if (waveform.audioHash != AudioEngine::utauNoteAudioHash(*note)) continue;
+
+        // Its own peak reaches the 100% line, so the envelope's 100% and the
+        // sound's natural level are the same height and a point at half the
+        // line reads as half the sound.
+        auto peak = 0.0f;
+        for (const auto value : waveform.unshapedMaxima) peak = std::max(peak, value);
+        for (const auto value : waveform.unshapedMinima) peak = std::max(peak, -value);
+        if (peak <= 1.0e-4f) continue;
+
+        const auto span = waveformSpan(hit.startSeconds + hit.clipStartSeconds, waveform);
+        const auto left = timeToX(span.first);
+        const auto width = static_cast<float>(span.second) * pixelsPerSecond;
+        if (width < 1.0f) continue;
+        const auto buckets = static_cast<int>(waveform.unshapedMaxima.size());
+        const auto columns = juce::jlimit(1, buckets, static_cast<int>(std::ceil(width)));
+        const auto selected = selectedNotes.contains(hit.id.toStdString())
+            || (selectedNotes.empty() && hit.id == selectedNote);
+        // The envelope on screen, which during a drag is the one under the
+        // pointer rather than the one the project still holds.
+        const auto envelope = displayAmplitudeEnvelope(*note,
+            hit.startSeconds + hit.clipStartSeconds);
+        const auto ghostColour = Palette::noteLight.withAlpha(selected ? 0.16f : 0.09f);
+        const auto shapedColour = Palette::noteLight.withAlpha(selected ? 0.46f : 0.26f);
+        for (int column = 0; column < columns; ++column)
+        {
+            const auto from = buckets * column / columns;
+            const auto to = std::max(from + 1, buckets * (column + 1) / columns);
+            auto loudest = 0.0f;
+            auto shaped = 0.0f;
+            for (auto bucket = from; bucket < to && bucket < buckets; ++bucket)
+            {
+                const auto index = static_cast<std::size_t>(bucket);
+                loudest = std::max(loudest, noteGhostAt(waveform, envelope, index));
+                shaped = std::max({ shaped, notePictureAt(waveform, envelope, index, true),
+                                    -notePictureAt(waveform, envelope, index, false) });
+            }
+            const auto x = left + width * static_cast<float>(column)
+                                  / static_cast<float>(columns);
+            if (x + 1.0f < plot.getX() || x > plot.getRight()) continue;
+            // Level, not a wave: the lane's floor is silence and its axis runs
+            // one way, so what belongs here is how loud it is at that moment.
+            const auto columnWidth = std::max(1.0f, width / static_cast<float>(columns));
+            const auto ghostHeight = (baseline - fullScale) * loudest / peak;
+            const auto shapedHeight = (baseline - fullScale) * shaped / peak;
+            g.setColour(ghostColour);
+            g.fillRect(x, baseline - ghostHeight, columnWidth,
+                       std::max(1.0f, ghostHeight));
+            g.setColour(shapedColour);
+            g.fillRect(x, baseline - shapedHeight, columnWidth,
+                       std::max(1.0f, shapedHeight));
+        }
+        ++drawn;
+    }
+    return drawn;
+}
+
 void PianoRollComponent::drawUtauNoteWaveforms(juce::Graphics& g)
 {
     if (utauWaveforms == nullptr || utauWaveforms->empty()) return;
@@ -3851,16 +4550,35 @@ void PianoRollComponent::drawUtauNoteWaveforms(juce::Graphics& g)
                 // The note has to still be the note that was rendered.  Edit
                 // it and the hash moves, and the waveform stops being drawn
                 // until the new audio arrives to replace it.
-                if (waveform.renderHash != AudioEngine::utauNoteRenderHash(note)) continue;
-                if (waveform.maxima.empty() || waveform.durationSeconds <= 0.0) continue;
+                //
+                // The audio hash and not the render hash: an envelope decides
+                // how loud the audio is and nothing else about it, so the
+                // piece already rendered is still the right piece after an
+                // envelope edit, and only its shape has to be redrawn.
+                if (waveform.audioHash != AudioEngine::utauNoteAudioHash(note)) continue;
+                if (waveform.unshapedMaxima.empty() || waveform.durationSeconds <= 0.0) continue;
+                // Always the piece shaped by the envelope on screen -- which
+                // during a drag is the stroke under the pointer, so the picture
+                // follows the point being dragged.  Never the audio as this
+                // render shaped it: a render is of the selected notes only, and
+                // the last of them sang on with no note after it, drawn past
+                // the end of the envelope it will have in the song.
+                const auto envelope = displayAmplitudeEnvelope(
+                    note, clip.startSeconds + note.startSeconds);
+                const auto shapeAt = [&](std::size_t bucket, bool high)
+                {
+                    return notePictureAt(waveform, envelope, bucket, high);
+                };
 
-                const auto left = timeToX(clip.startSeconds + note.startSeconds);
-                const auto width = static_cast<float>(note.durationSeconds) * pixelsPerSecond;
+                const auto span = waveformSpan(clip.startSeconds + note.startSeconds,
+                                               waveform);
+                const auto left = timeToX(span.first);
+                const auto width = static_cast<float>(span.second) * pixelsPerSecond;
                 if (width < 1.0f) continue;
                 const auto height = rowHeight * 6.0f;
                 const auto centre = midiToY(note.midiNote) + rowHeight * 0.5f;
                 g.setColour(Palette::textMuted.withAlpha(track.muted ? 0.12f : 0.34f));
-                const auto buckets = static_cast<int>(waveform.maxima.size());
+                const auto buckets = static_cast<int>(waveform.unshapedMaxima.size());
                 const auto columns = juce::jlimit(1, buckets,
                                                   static_cast<int>(std::ceil(width)));
                 for (int column = 0; column < columns; ++column)
@@ -3873,8 +4591,9 @@ void PianoRollComponent::drawUtauNoteWaveforms(juce::Graphics& g)
                     auto high = 0.0f;
                     for (auto bucket = from; bucket < to && bucket < buckets; ++bucket)
                     {
-                        low = std::min(low, waveform.minima[static_cast<std::size_t>(bucket)]);
-                        high = std::max(high, waveform.maxima[static_cast<std::size_t>(bucket)]);
+                        const auto index = static_cast<std::size_t>(bucket);
+                        low = std::min(low, shapeAt(index, false));
+                        high = std::max(high, shapeAt(index, true));
                     }
                     const auto x = left + width * static_cast<float>(column)
                                           / static_cast<float>(columns);
@@ -3951,6 +4670,8 @@ void PianoRollComponent::changeListenerCallback(juce::ChangeBroadcaster* source)
         // freehand/line edits, note resizing, and project loading.  The
         // simplifier prevents these rebuilds from exposing dense 5 ms frames.
         pitchAnchorCache.clear();
+        sharedLineCache.clear();
+        draggedSharedKey = 0;
         rebuildLayout();
     }
     else
@@ -3976,6 +4697,7 @@ void PianoRollComponent::diagnosticBeginConsonantDrag(const juce::String& noteId
     draggedNote = noteId;
     dragMode = DragMode::consonantLeadIn;
     previewConsonantPreutterance = previewPreutterance;
+    consonantDragTravelled = true;
 }
 
 bool PianoRollComponent::diagnosticGrabConsonantHandle(std::size_t index)
@@ -4001,6 +4723,7 @@ bool PianoRollComponent::diagnosticGrabConsonantHandle(std::size_t index)
                 previewConsonantVelocity = handle->currentVelocity;
                 consonantSetsPin = handle->setsPin;
                 consonantOverlapSeconds = handle->overlapSeconds;
+                consonantDragTravelled = false;
                 dragMode = DragMode::consonantLeadIn;
                 return true;
             }
@@ -4210,6 +4933,7 @@ NoteData PianoRollComponent::effectiveVibrato(const NoteData& note) const
         preview.vibratoFadeOutPercent = previewVibrato.vibratoFadeOutPercent;
         preview.vibratoPhasePercent = previewVibrato.vibratoPhasePercent;
         preview.vibratoOffsetPercent = previewVibrato.vibratoOffsetPercent;
+        preview.vibratoEndPercent = previewVibrato.vibratoEndPercent;
         return preview;
     }
     return note;
@@ -4218,15 +4942,18 @@ NoteData PianoRollComponent::effectiveVibrato(const NoteData& note) const
 PianoRollComponent::VibratoHandlePlace PianoRollComponent::vibratoHandlePlace(
     const NoteData& note, VibratoHandle which)
 {
-    const auto duration = std::max(1.0e-6, note.durationSeconds);
-    const auto span = duration * juce::jlimit(0.0, 100.0, note.vibratoLengthPercent) / 100.0;
-    const auto start = duration - span;
+    const auto swing = vibratoSpanOf(note);
+    const auto start = swing.start;
+    const auto end = swing.end;
+    const auto span = end - start;
     const auto cycle = std::max(0.01, note.vibratoCycleMs) / 1000.0;
     constexpr auto minimumHandleCents = 25.0;
     switch (which)
     {
         case VibratoHandle::length:
             return { start, 0.0, 0.0 };
+        case VibratoHandle::end:
+            return { end, 0.0, 0.0 };
         case VibratoHandle::offset:
             // Vertically it marks where the swing is centred, so dragging it
             // slides the whole vibrato up or down.
@@ -4236,7 +4963,7 @@ PianoRollComponent::VibratoHandlePlace PianoRollComponent::vibratoHandlePlace(
             return { start + span * juce::jlimit(0.0, 100.0,
                         note.vibratoFadeInPercent) / 100.0, 0.0, 0.0 };
         case VibratoHandle::fadeOut:
-            return { duration - span * juce::jlimit(0.0, 100.0,
+            return { end - span * juce::jlimit(0.0, 100.0,
                         note.vibratoFadeOutPercent) / 100.0, 0.0, 0.0 };
         case VibratoHandle::cycle:
             // On the first trough, and the depth handle on the first crest.
@@ -4244,14 +4971,57 @@ PianoRollComponent::VibratoHandlePlace PianoRollComponent::vibratoHandlePlace(
             // even when the swing is shallower than that, because otherwise
             // they collapse onto the three handles that live on the line and
             // become impossible to tell apart, let alone grab.
-            return { std::min(duration, start + cycle * 0.75),
+            return { std::min(end, start + cycle * 0.75),
                      -std::max(note.vibratoDepthCents, minimumHandleCents), 0.0 };
         case VibratoHandle::depth:
-            return { std::min(duration, start + cycle * 0.25),
+            return { std::min(end, start + cycle * 0.25),
                      std::max(note.vibratoDepthCents, minimumHandleCents), 0.0 };
         case VibratoHandle::none: break;
     }
     return { start, 0.0, 0.0 };
+}
+
+juce::Point<float> PianoRollComponent::vibratoHandleCentre(const NoteData& shown,
+                                                          VibratoHandle which,
+                                                          double absoluteStart) const
+{
+    const auto place = vibratoHandlePlace(shown, which);
+    const auto baseY = midiToY(shown.midiNote) + rowHeight * 0.5f;
+    juce::Point<float> centre(
+        timeToX(absoluteStart + place.timeSeconds) + static_cast<float>(place.pixelOffsetX),
+        baseY - static_cast<float>(place.cents / 100.0) * rowHeight);
+    // With little or no fade-out the fade-out handle sits right on the end:
+    // two dots in one place, and only one of them could ever be taken hold
+    // of.  The end steps just below the line there instead.
+    if (which == VibratoHandle::end)
+    {
+        const auto fadeOut = vibratoHandlePlace(shown, VibratoHandle::fadeOut);
+        const auto fadeOutX = timeToX(absoluteStart + fadeOut.timeSeconds);
+        if (std::abs(fadeOutX - centre.x) < 9.0f) centre.y += 9.0f;
+    }
+    return centre;
+}
+
+std::optional<juce::Point<float>> PianoRollComponent::diagnosticVibratoHandle(
+    const juce::String& noteId, const juce::String& which) const
+{
+    const std::array<std::pair<const char*, VibratoHandle>, 7> names {{
+        { "length", VibratoHandle::length }, { "end", VibratoHandle::end },
+        { "fadeIn", VibratoHandle::fadeIn }, { "fadeOut", VibratoHandle::fadeOut },
+        { "depth", VibratoHandle::depth }, { "cycle", VibratoHandle::cycle },
+        { "offset", VibratoHandle::offset }
+    }};
+    auto handle = VibratoHandle::none;
+    for (const auto& [name, value] : names)
+        if (which == name) handle = value;
+    if (handle == VibratoHandle::none) return std::nullopt;
+    for (const auto& track : snapshot.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == noteId && note.vibratoEnabled)
+                    return vibratoHandleCentre(effectiveVibrato(note), handle,
+                                               clip.startSeconds + note.startSeconds);
+    return std::nullopt;
 }
 
 std::optional<PianoRollComponent::VibratoHandleInfo>
@@ -4275,18 +5045,14 @@ PianoRollComponent::vibratoHandleAt(juce::Point<float> position) const
                     continue;
                 const auto shown = effectiveVibrato(note);
                 const auto absoluteStart = clip.startSeconds + note.startSeconds;
-                const auto baseY = midiToY(note.midiNote) + rowHeight * 0.5f;
-                const std::array<VibratoHandle, 6> order {
+                const std::array<VibratoHandle, 7> order {
                     VibratoHandle::offset, VibratoHandle::depth, VibratoHandle::cycle,
-                    VibratoHandle::fadeIn, VibratoHandle::fadeOut, VibratoHandle::length
+                    VibratoHandle::fadeIn, VibratoHandle::fadeOut, VibratoHandle::end,
+                    VibratoHandle::length
                 };
                 for (const auto which : order)
                 {
-                    const auto place = vibratoHandlePlace(shown, which);
-                    const juce::Point<float> centre(
-                        timeToX(absoluteStart + place.timeSeconds)
-                            + static_cast<float>(place.pixelOffsetX),
-                        baseY - static_cast<float>(place.cents / 100.0) * rowHeight);
+                    const auto centre = vibratoHandleCentre(shown, which, absoluteStart);
                     if (centre.getDistanceFrom(position) <= radius)
                         return VibratoHandleInfo { note.id, which, absoluteStart };
                 }
@@ -4358,10 +5124,18 @@ std::optional<std::array<double, 3>> PianoRollComponent::jieFractionsFor(
     // it says.  Read without that flag the roll never saw the annotation at
     // all and drew four boundaries into a note the entry splits in three.
     const auto mou = track.utauMode == UtauMode::mou;
+    // Drawn on every paint: a bank still being read leaves the lines out for
+    // now rather than holding the window until it is in.
+    if (!voicebankReadFor(track)) return std::nullopt;
     const auto timing = backend::UtauRenderer::sampleTiming(
-        track.voicebankDirectory, note.label, note.midiNote, velocity, true, mou);
-    const auto regions = timing && mou
-        ? SampleSettings::mouRegionCount(timing->mouClasses) : 4;
+        track.voicebankDirectory, note.label, note.midiNote, velocity, true, mou,
+        note.ownOto());
+    // A 拼字 note in 界 has two, whatever its entry says: the renderer reads
+    // nothing past the glide, and the lines drawn in it have to agree.
+    const auto spelling = backend::UtauRenderer::readsOnlyFirstTwoRegions(true, mou,
+        note.durationSeconds);
+    const auto regions = spelling ? 2
+        : timing && mou ? SampleSettings::mouRegionCount(timing->mouClasses) : 4;
     if (regionsOut != nullptr) *regionsOut = regions;
     // The lead-in this note really has.  A pinned one outranks the oto's, and
     // the block on screen is drawn against it -- read the oto's instead and
@@ -4412,8 +5186,11 @@ std::optional<std::array<double, 3>> PianoRollComponent::jieFractionsFor(
     const auto leadIn = std::min(leadInOverride.value_or(settledLeadIn), spanSeconds);
     // The same classes the renderer will use, so the lines on the roll are
     // where the regions really end up.
+    const auto sourceRegions = spelling
+        ? backend::UtauRenderer::firstTwoRegions(timing->regionSeconds)
+        : timing->regionSeconds;
     const auto split = backend::UtauRenderer::regionSplit(
-        timing->regionSeconds, spanSeconds, velocity, leadIn, nullptr,
+        sourceRegions, spanSeconds, velocity, leadIn, nullptr,
         mou && timing->mouClasses.isNotEmpty() ? &timing->mouClasses : nullptr);
     if (!split.valid) return std::nullopt;
     std::array<double, 3> fractions {};
@@ -4493,6 +5270,8 @@ std::optional<PianoRollComponent::ConsonantHandleInfo>
 PianoRollComponent::consonantHandleAt(juce::Point<float> position) const
 {
     constexpr auto handleRadius = 7.0f;
+    std::optional<ConsonantHandleInfo> best;
+    auto bestDistance = std::numeric_limits<float>::max();
     for (const auto& track : snapshot.tracks)
     {
         if (!track.compose || track.pitchAlgorithm != PitchAlgorithm::utau
@@ -4510,22 +5289,31 @@ PianoRollComponent::consonantHandleAt(juce::Point<float> position) const
                     midiToY(note.midiNote) + 2.0f,
                     handleRadius * 2.0f, std::max(6.0f, rowHeight - 4.0f));
                 if (!handle.contains(position)) continue;
+                // Nearest wins where two handles overlap.  A 拼字 note sits on
+                // the beat of the note it leads into and is listed first, so
+                // taking the first handle that contained the pointer handed
+                // out its handle every time, and the note behind it could not
+                // be taken hold of at all.  On an exact tie the later note
+                // wins: the one listed first is the one put in front of it.
+                const auto distance = std::abs(position.x
+                                               - timeToX(span->second.first));
+                if (distance > bestDistance) continue;
                 const auto currentVelocity =
                     note.utauConsonantVelocity != inheritedUtauConsonantVelocity
                     ? note.utauConsonantVelocity : track.utauConsonantVelocity;
                 const auto base = backend::UtauRenderer::sampleTiming(
                     track.voicebankDirectory, note.label, note.midiNote, 100,
                     utauModeUsesRegions(track.utauMode),
-            track.utauMode == UtauMode::mou);
+                    track.utauMode == UtauMode::mou, note.ownOto());
                 const auto current = backend::UtauRenderer::sampleTiming(
                     track.voicebankDirectory, note.label, note.midiNote,
                     currentVelocity, utauModeUsesRegions(track.utauMode),
-                    track.utauMode == UtauMode::mou);
+                    track.utauMode == UtauMode::mou, note.ownOto());
                 const auto slowest = backend::UtauRenderer::sampleTiming(
                     track.voicebankDirectory, note.label, note.midiNote,
                     std::numeric_limits<int>::min() + 1,
                     utauModeUsesRegions(track.utauMode),
-                    track.utauMode == UtauMode::mou);
+                    track.utauMode == UtauMode::mou, note.ownOto());
                 if (!base || !current || !slowest) continue;
                 // A first region 谋 does not call a consonant: the consonant
                 // velocity does not reach it, so a drag converted into one
@@ -4575,7 +5363,8 @@ PianoRollComponent::consonantHandleAt(juce::Point<float> position) const
                 const auto settled = note.utauPreutteranceOverrideEnabled
                     ? std::max(0.0, note.utauPreutteranceSeconds)
                     : current->preutteranceSeconds;
-                return ConsonantHandleInfo {
+                bestDistance = distance;
+                best = ConsonantHandleInfo {
                     note.id, absoluteStart, scaledPart, unscaledPart,
                     minimum, maximum,
                     juce::jlimit(minimum, maximum, settled),
@@ -4583,7 +5372,7 @@ PianoRollComponent::consonantHandleAt(juce::Point<float> position) const
                 };
             }
     }
-    return std::nullopt;
+    return best;
 }
 
 int PianoRollComponent::noteEditDivision() const
@@ -4631,17 +5420,111 @@ void PianoRollComponent::finishInlineAliasEdit(bool accept)
     if (inlineAliasNoteId.isEmpty()) return;
     const auto noteId = inlineAliasNoteId;
     inlineAliasNoteId.clear();
-    auto alias = inlineAliasEditor.getText().trim();
+    const auto alias = inlineAliasEditor.getText();
+    inlineAliasEditor.setVisible(false);
+    if (accept) commitInlineAlias(noteId, alias);
+    repaint();
+}
+
+void PianoRollComponent::commitInlineAlias(const juce::String& noteId, juce::String alias)
+{
+    alias = alias.trim();
     if (alias.endsWithIgnoreCase(".wav"))
         alias = alias.dropLastCharacters(4).trim();
-    inlineAliasEditor.setVisible(false);
-    if (accept)
+    model.setNoteLabel(noteId, alias);
+    ensureDefaultEnvelope(noteId);
+    if (onNoteAliasCommitted) onNoteAliasCommitted(noteId);
+    if (onNoteSelected) onNoteSelected(noteId);
+}
+
+juce::String PianoRollComponent::adjacentNoteOnTrack(const juce::String& noteId,
+                                                     bool forward) const
+{
+    struct Placed
     {
-        model.setNoteLabel(noteId, alias);
-        ensureDefaultEnvelope(noteId);
-        if (onNoteAliasCommitted) onNoteAliasCommitted(noteId);
-        if (onNoteSelected) onNoteSelected(noteId);
+        double startSeconds = 0.0;
+        juce::String id;
+    };
+    for (const auto& track : snapshot.tracks)
+    {
+        std::vector<Placed> order;
+        auto owns = false;
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+            {
+                order.push_back({ clip.startSeconds + note.startSeconds, note.id });
+                owns = owns || note.id == noteId;
+            }
+        if (!owns) continue;
+        // Across clips too: the track is what is being sung through, and the
+        // clips are only how it happens to be cut up.
+        std::stable_sort(order.begin(), order.end(), [](const Placed& left, const Placed& right)
+        {
+            return left.startSeconds < right.startSeconds;
+        });
+        const auto at = std::find_if(order.begin(), order.end(),
+            [&noteId](const Placed& placed) { return placed.id == noteId; });
+        if (forward)
+            return std::next(at) == order.end() ? juce::String() : std::next(at)->id;
+        return at == order.begin() ? juce::String() : std::prev(at)->id;
     }
+    return {};
+}
+
+void PianoRollComponent::revealInViewport(juce::Rectangle<float> area)
+{
+    auto* viewport = findParentComponentOfClass<juce::Viewport>();
+    if (viewport == nullptr) return;
+    const auto view = viewport->getViewArea();
+    const auto box = area.getSmallestIntegerContainer();
+    auto x = view.getX();
+    auto y = view.getY();
+    // The keyboard strip covers the left of whatever is in view, and only the
+    // start of the box has to show -- that is where the typing goes.
+    constexpr auto keyboardWidth = 58;
+    constexpr auto boxWidth = 84;
+    if (box.getX() < view.getX() + keyboardWidth || box.getX() + boxWidth > view.getRight())
+        x = box.getX() - keyboardWidth - view.getWidth() / 4;
+    if (box.getY() < view.getY() || box.getBottom() > view.getBottom())
+        y = box.getCentreY() - view.getHeight() / 2;
+    if (x != view.getX() || y != view.getY())
+        viewport->setViewPosition(std::max(0, x), std::max(0, y));
+}
+
+void PianoRollComponent::advanceInlineAliasEdit(bool forward)
+{
+    if (inlineAliasNoteId.isEmpty()) return;
+    const auto noteId = inlineAliasNoteId;
+    const auto nextId = adjacentNoteOnTrack(noteId, forward);
+    if (nextId.isEmpty())
+    {
+        // Past the end of the track there is nowhere to go on to, so Tab
+        // ends it the way Return does.
+        finishInlineAliasEdit(true);
+        return;
+    }
+    // The box stays up the whole way through.  Hidden even for a moment it
+    // would lose focus, and the editor reports that later, by message -- by
+    // when it would be sitting on the next note, and would close itself there.
+    inlineAliasNoteId.clear();
+    commitInlineAlias(noteId, inlineAliasEditor.getText());
+    const auto found = std::find_if(noteHits.begin(), noteHits.end(),
+        [&nextId](const NoteHit& hit) { return hit.id == nextId; });
+    if (found == noteHits.end())
+    {
+        inlineAliasEditor.setVisible(false);
+        repaint();
+        return;
+    }
+    // A copy: the window answers a selection by refocusing the track, which
+    // rebuilds the hit list underneath any reference into it.
+    const auto target = *found;
+    selectedNote = nextId;
+    selectedNotes.clear();
+    selectedNotes.insert(nextId.toStdString());
+    if (onNoteSelected) onNoteSelected(nextId);
+    revealInViewport(target.bounds);
+    beginInlineAliasEdit(target);
     repaint();
 }
 
@@ -5184,12 +6067,18 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     // two are the same line seen through different tools
                     // rather than two pictures of one envelope; the tool draws
                     // its own, so the shape steps aside there.
+                    // Read once: the shape is drawn from it, and the number
+                    // below is placed clear of the shape, which rises above the
+                    // note whenever the gain goes over unity.
+                    std::vector<AmplitudeEnvelopePoint> shownEnvelope;
                     if (showEnvelope && tool != Tool::amplitude)
-                    {
-                        const auto envelope = draggedNote == note.id
+                        shownEnvelope = draggedNote == note.id
                                 && dragMode == DragMode::amplitudePoint
                                 && !amplitudeStroke.empty()
                             ? amplitudeStroke : amplitudeEnvelopeFor(note, absoluteStart);
+                    if (showEnvelope && tool != Tool::amplitude)
+                    {
+                        const auto& envelope = shownEnvelope;
                         if (envelope.size() >= 2)
                         {
                             const auto floorY = amplitudeY(effectiveMidi, -200.0f);
@@ -5234,8 +6123,59 @@ void PianoRollComponent::paint(juce::Graphics& g)
                         }
                     }
 
-                    // Keep a narrow warm baseline for the nominal note extent;
-                    // the note body itself remains the shared blue-green style.
+                    // The envelope's base value, small, at the note's top left
+                    // corner: part of the envelope display, so it comes and
+                    // goes with it.  Only when it is not 100 -- a number on
+                    // every note would say nothing and cover the roll.
+                    if (showEnvelope
+                        && std::abs(note.amplitudeEnvelopeBasePercent - 100.0f) > 0.05f)
+                    {
+                        const auto text = juce::String(
+                            note.amplitudeEnvelopeBasePercent, 0) + "%";
+                        const auto left = displayBounds.getX();
+                        const auto right = left + 44.0f;
+                        // A base value over 100 is exactly what lifts the
+                        // shape above the note, so the number rides up with it
+                        // instead of being written through the line.  Only the
+                        // stretch the number covers counts: a peak further
+                        // along the note would leave it floating over nothing.
+                        auto ceiling = displayBounds.getY();
+                        for (std::size_t index = 0; index + 1 < shownEnvelope.size(); ++index)
+                        {
+                            const auto x0 = timeToX(absoluteStart
+                                + shownEnvelope[index].timeSeconds);
+                            const auto x1 = timeToX(absoluteStart
+                                + shownEnvelope[index + 1].timeSeconds);
+                            if (std::max(x0, x1) < left || std::min(x0, x1) > right) continue;
+                            const auto y0 = amplitudeY(effectiveMidi, shownEnvelope[index].gainDb);
+                            const auto y1 = amplitudeY(effectiveMidi,
+                                                       shownEnvelope[index + 1].gainDb);
+                            // The shape is drawn as straight lines between
+                            // these points, so the highest pixel over the
+                            // number's own span is at one of its two ends.
+                            const auto span = x1 - x0;
+                            auto from = 0.0f, to = 1.0f;
+                            if (std::abs(span) > 1.0e-3f)
+                            {
+                                from = juce::jlimit(0.0f, 1.0f, (left - x0) / span);
+                                to = juce::jlimit(0.0f, 1.0f, (right - x0) / span);
+                            }
+                            ceiling = std::min({ ceiling, y0 + (y1 - y0) * from,
+                                                 y0 + (y1 - y0) * to });
+                        }
+                        g.setFont(10.0f);
+                        // The lane's own orange, so the number reads as
+                        // belonging to the envelope rather than to the note.
+                        g.setColour(juce::Colour(0xffffa94d).withAlpha(0.92f));
+                        g.drawText(text, static_cast<int>(left),
+                                   std::max(0, static_cast<int>(ceiling) - 11),
+                                   44, 10, juce::Justification::centredLeft, false);
+                    }
+
+                    // Keep the MIDI note's nominal range visible independently
+                    // from oto.ini preutterance, overlap and consonant timing.
+                    // The hollow outline above is the actual sounding range;
+                    // this heavier baseline is always exactly [note start, end].
                     const auto nominalBar = juce::Rectangle<float>(
                         bounds.getX(), bounds.getBottom() - 2.0f,
                         bounds.getWidth(), 3.5f);
@@ -5372,7 +6312,8 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     // stray horizontal stub hanging off the front of the curve,
                     // so it is not drawn.
                     const PositionedUtauNote here {
-                        note.id, absoluteStart, absoluteStart + note.durationSeconds
+                        note.id, absoluteStart, absoluteStart + note.durationSeconds,
+                        note.utauAutoPitchTransition
                     };
                     const auto& handOver = pitchAnchorsFor(note);
                     if (!handOver.empty())
@@ -5461,7 +6402,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
                 // line would make the swing unreadable wherever the line moves;
                 // against the flat nominal pitch its depth and rate can be read
                 // at a glance.  What is rendered adds the two together.
-                if (tool != Tool::amplitude
+                if (tool != Tool::amplitude && showPitchLine
                     && note.vibratoEnabled && note.durationSeconds > 1.0e-9)
                 {
                     const auto noteHasFocus = selectedNotes.contains(note.id.toStdString())
@@ -5505,9 +6446,10 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     // shape can be dialled in without opening the dialog.
                     if (noteHasFocus)
                     {
-                        const std::array<std::pair<VibratoHandle, juce::Colour>, 6> handles {{
+                        const std::array<std::pair<VibratoHandle, juce::Colour>, 7> handles {{
                             { VibratoHandle::offset,  juce::Colour(0xffc9a0ff) },
                             { VibratoHandle::length,  juce::Colour(0xffffc857) },
+                            { VibratoHandle::end,     juce::Colour(0xffffc857) },
                             { VibratoHandle::fadeIn,  juce::Colour(0xff9ae66e) },
                             { VibratoHandle::fadeOut, juce::Colour(0xff9ae66e) },
                             { VibratoHandle::cycle,   juce::Colour(0xffff8fa3) },
@@ -5515,11 +6457,10 @@ void PianoRollComponent::paint(juce::Graphics& g)
                         }};
                         for (const auto& handle : handles)
                         {
-                            const auto place = vibratoHandlePlace(shown, handle.first);
-                            const auto hx = x + static_cast<float>(place.timeSeconds)
-                                * pixelsPerSecond + static_cast<float>(place.pixelOffsetX);
-                            const auto hy = baseY
-                                - static_cast<float>(place.cents / 100.0) * rowHeight;
+                            const auto centre = vibratoHandleCentre(shown, handle.first,
+                                                                    absoluteStart);
+                            const auto hx = centre.x;
+                            const auto hy = centre.y;
                             const auto held = dragMode == DragMode::vibrato
                                 && note.id == draggedNote
                                 && draggedVibratoHandle == handle.first;
@@ -5535,53 +6476,42 @@ void PianoRollComponent::paint(juce::Graphics& g)
                 // The S transition between two adjacent notes is part of the
                 // pitch line, not a point-tool guide: the renderer writes the
                 // same bridge into both notes.  Drawing it only under the point
-                // tool left a gap between their lines everywhere else.
-                if (utauMode && tool != Tool::amplitude)
+                // tool left a gap between their lines everywhere else -- and
+                // drawing it whatever the switch said left the joins behind
+                // when the line was hidden, which is a pitch line arriving at
+                // every note from nowhere.
+                if (utauMode && tool != Tool::amplitude && showPitchLine)
                 {
                 // Anchor handles and the shape menu belong to the point
                 // tool; the bridge itself is drawn for every tool, just
                 // below, because it is part of the pitch line.
                 const PositionedUtauNote positionedNote {
-                    note.id, absoluteStart, absoluteStart + note.durationSeconds
+                    note.id, absoluteStart, absoluteStart + note.durationSeconds,
+                    note.utauAutoPitchTransition
                 };
-                const auto& bridgeAnchors = pitchAnchorsFor(note);
-                if (!bridgeAnchors.empty())
-                    if (const auto next = nextUtauNoteFor(note.id);
-                        next && formsAdjacentPitchBoundary(positionedNote, *next))
-                        if (const auto* nextNote = findNote(next->id))
-                        {
-                            const auto& nextAnchors = draggedNote == nextNote->id
-                                    && dragMode == DragMode::pointPitch && !pitchStroke.empty()
-                                ? pitchStroke : pitchAnchorsFor(*nextNote);
-                            if (!nextAnchors.empty())
-                            {
-                                const auto bridgeStart = absoluteStart
-                                    + bridgeAnchors.back().timeSeconds;
-                                const auto bridgeEnd = next->startSeconds
-                                    + nextAnchors.front().timeSeconds;
-                                const auto steps = std::max(4, static_cast<int>(std::ceil(
-                                    std::max(0.001, bridgeEnd - bridgeStart)
-                                        * pixelsPerSecond / 3.0)));
-                                juce::Path bridge;
-                                for (int step = 0; step <= steps; ++step)
-                                {
-                                    const auto u = static_cast<float>(step) / steps;
-                                    const auto shaped = u * u * (3.0f - 2.0f * u);
-                                    const auto time = bridgeStart
-                                        + (bridgeEnd - bridgeStart) * u;
-                                    const auto midi = bridgeAnchors.back().targetMidi
-                                        + (nextAnchors.front().targetMidi
-                                            - bridgeAnchors.back().targetMidi) * shaped;
-                                    const auto point = juce::Point<float>(timeToX(time),
-                                        midiToY(midi) + rowHeight * 0.5f);
-                                    if (step == 0) bridge.startNewSubPath(point);
-                                    else bridge.lineTo(point);
-                                }
-                                g.setColour(Palette::noteLight.withAlpha(0.88f));
-                                g.strokePath(bridge, juce::PathStrokeType(2.0f,
-                                    juce::PathStrokeType::curved));
-                            }
-                        }
+                if (const auto span = transitionBridge(track, note, absoluteStart))
+                {
+                    const auto steps = std::max(4, static_cast<int>(std::ceil(
+                        std::max(0.001, span->endSeconds - span->startSeconds)
+                            * pixelsPerSecond / 3.0)));
+                    juce::Path bridge;
+                    for (int step = 0; step <= steps; ++step)
+                    {
+                        const auto u = static_cast<float>(step) / steps;
+                        const auto shaped = u * u * (3.0f - 2.0f * u);
+                        const auto time = span->startSeconds
+                            + (span->endSeconds - span->startSeconds) * u;
+                        const auto midi = span->startMidi
+                            + (span->endMidi - span->startMidi) * shaped;
+                        const auto point = juce::Point<float>(timeToX(time),
+                            midiToY(midi) + rowHeight * 0.5f);
+                        if (step == 0) bridge.startNewSubPath(point);
+                        else bridge.lineTo(point);
+                    }
+                    g.setColour(Palette::noteLight.withAlpha(0.88f));
+                    g.strokePath(bridge, juce::PathStrokeType(2.0f,
+                        juce::PathStrokeType::curved));
+                }
                 }
 
                 if ((utauMode || pointsOwnTheLine) && showPitchLine
@@ -5615,10 +6545,15 @@ void PianoRollComponent::paint(juce::Graphics& g)
                     };
                     juce::Path controlLine;
                     auto controlLineOpen = false;
-                    for (std::size_t index = 1; index < anchors.size(); ++index)
+                    // Its own handles, or its part of a line it shares with its
+                    // neighbours -- the corners either way, so the line passes
+                    // through every point exactly.
+                    const auto breaks = pitchLineBreaks(track, note, absoluteStart);
+                    juce::ignoreUnused(anchors);
+                    for (std::size_t index = 1; index < breaks.size(); ++index)
                     {
-                        const auto startTime = anchors[index - 1].timeSeconds;
-                        const auto endTime = anchors[index].timeSeconds;
+                        const auto startTime = breaks[index - 1];
+                        const auto endTime = breaks[index];
                         const auto pixelWidth = std::max(1.0f,
                             static_cast<float>(endTime - startTime) * pixelsPerSecond);
                         auto steps = std::max(2, static_cast<int>(std::ceil(pixelWidth / 3.0f)));
@@ -5634,10 +6569,10 @@ void PianoRollComponent::paint(juce::Graphics& g)
                             const auto amount = static_cast<double>(step) / steps;
                             const auto time = startTime + (endTime - startTime) * amount;
                             const auto curveX = x + static_cast<float>(time) * pixelsPerSecond;
-                            auto midi = glideAt(time, pitchAt(anchors, time));
+                            auto midi = pitchLineMidiAt(track, note, absoluteStart, time);
                             if (foldVibrato)
-                                midi += static_cast<float>(
-                                    vibratoCentsAt(shownVibrato, time) / 100.0);
+                                midi += static_cast<float>(vibratoCentsAt(shownVibrato,
+                                    juce::jlimit(0.0, note.durationSeconds, time)) / 100.0);
                             const auto curveY = midiToY(midi) + rowHeight * 0.5f;
                             if (!controlLineOpen)
                             {
@@ -5661,14 +6596,25 @@ void PianoRollComponent::paint(juce::Graphics& g)
                         ? pitchStroke : pitchAnchorsFor(note);
                     const auto noteSelected = selectedNotes.contains(note.id.toStdString())
                         || note.id == selectedNote;
+                    // Which are shown is settled before a drag begins and
+                    // holds until it ends: a handle appearing or vanishing
+                    // under a drag reads as the drag having made or taken it.
+                    const auto* handleMember = utauMode
+                        ? sharedLinesFor(track, false).memberFor(note.id) : nullptr;
                     for (std::size_t index = 0; index < anchors.size(); ++index)
                     {
+                        const auto active = draggedNote == note.id
+                            && static_cast<int>(index) == draggedPitchAnchor;
+                        // Past the moment a later note's bend takes over, a
+                        // point of this one decides nothing, and offering it
+                        // is how a point came to be dragged for nothing.
+                        if (handleMember != nullptr && !active
+                            && !handleMember->owns(absoluteStart + anchors[index].timeSeconds))
+                            continue;
                         const auto anchorX = x + static_cast<float>(anchors[index].timeSeconds)
                             * pixelsPerSecond;
                         const auto anchorY = midiToY(anchors[index].targetMidi)
                             + rowHeight * 0.5f;
-                        const auto active = draggedNote == note.id
-                            && static_cast<int>(index) == draggedPitchAnchor;
                         const auto radius = index == 0 || index + 1 == anchors.size() ? 4.8f : 4.0f;
                         g.setColour(active ? Palette::noteFill
                                            : Palette::panelRaised.withAlpha(noteSelected ? 1.0f : 0.82f));
@@ -5741,6 +6687,8 @@ void PianoRollComponent::paint(juce::Graphics& g)
         auto paintedEnvelopeCount = 0;
         juce::Graphics::ScopedSaveState clip(g);
         g.reduceClipRegion(plot.toNearestInt().expanded(7));
+        // The audio first, so the envelope and its handles stay on top of it.
+        drawAmplitudeLaneWaveforms(g);
         for (const auto& hit : noteHits)
         {
             const auto selected = selectedNotes.contains(hit.id.toStdString())
@@ -5754,6 +6702,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
             if (dragMode == DragMode::amplitudePoint && amplitudeDragUsesLane
                 && !amplitudeStroke.empty() && participatesInEdit)
                 envelope = mapAmplitudeEnvelopeToNote(amplitudeStroke, draggedNote, hit.id);
+            juce::ignoreUnused(participatesInEdit);
             if (envelope.size() < 2) continue;
 
             ++paintedEnvelopeCount;
@@ -6171,7 +7120,7 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
             {
                 bool utau = false;
                 const auto* candidate = findNote(candidateHit.id, &utau);
-                if (candidate == nullptr || !utau || !candidate->utauFlagCurveEnabled)
+                if (candidate == nullptr || !utau || !flagCurveActiveFor(candidate->id))
                     continue;
                 const auto start = candidateHit.startSeconds + candidateHit.clipStartSeconds;
                 const auto candidatePoints = flagLaneCurveFor(*candidate);
@@ -6255,7 +7204,7 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
                 {
                     bool utau = false;
                     const auto* candidate = findNote(candidateHit.id, &utau);
-                    if (candidate == nullptr || !utau || !candidate->utauFlagCurveEnabled)
+                    if (candidate == nullptr || !utau || !flagCurveActiveFor(candidate->id))
                         continue;
                     const auto start = candidateHit.startSeconds + candidateHit.clipStartSeconds;
                     const auto [spanFrom, spanTo] = flagLaneSpanFor(*candidate);
@@ -6305,6 +7254,10 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
                 auto& anchors = pitchAnchorsFor(*note);
                 for (std::size_t index = 0; index < anchors.size(); ++index)
                 {
+                    // Only the handles that are drawn can be taken hold of.
+                    if (!pitchHandleOffered(*note, hit.startSeconds + hit.clipStartSeconds
+                                                       + anchors[index].timeSeconds))
+                        continue;
                     const auto anchor = juce::Point<float>(
                         timeToX(hit.startSeconds + hit.clipStartSeconds
                                 + anchors[index].timeSeconds),
@@ -6350,10 +7303,12 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
                 pointDragCanMoveHorizontally = pitchStroke.size() > 1;
                 pointDragMinimumTime = 0.0;
                 pointDragMaximumTime = note->durationSeconds;
+                pointDragOwnedUntil = std::numeric_limits<double>::infinity();
 
                 const PositionedUtauNote positionedNote {
                     note->id, closestAbsoluteStart,
-                    closestAbsoluteStart + note->durationSeconds
+                    closestAbsoluteStart + note->durationSeconds,
+                    note->utauAutoPitchTransition
                 };
                 if (closestAnchor == 0)
                 {
@@ -6361,23 +7316,17 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
                     if (const auto span = utauSoundSpans.find(note->id.toStdString());
                         span != utauSoundSpans.end())
                         minimumAbsolute = std::min(minimumAbsolute, span->second.first);
-                    // A head reaches back as far as the last point of the note
-                    // before it.  That is the whole constraint: the two must not
-                    // cross.  Stopping it at this note's own start instead made
-                    // the transition between abutting notes unshapeable, since
-                    // the head could then only ever move later.
+                    // A head reaches back as far as the last point the note
+                    // before it shows, and no further: the two may stand on one
+                    // vertical line, never cross.  Past it, that point would be
+                    // overruled by this one and vanish from the note before.
+                    // A head a file already put further back than that is
+                    // left where it is, not pulled forward on being taken.
                     if (const auto previous = previousUtauNoteFor(note->id))
-                    {
-                        auto previousTail = previous->startSeconds;
-                        if (const auto* previousNote = findNote(previous->id))
-                        {
-                            const auto& previousAnchors = pitchAnchorsFor(*previousNote);
-                            if (!previousAnchors.empty())
-                                previousTail = previous->startSeconds
-                                    + previousAnchors.back().timeSeconds;
-                        }
-                        minimumAbsolute = previousTail + minimumAnchorSeparation;
-                    }
+                        minimumAbsolute = std::min(
+                            lastShownPitchPoint(previous->id, previous->startSeconds)
+                                .value_or(previous->startSeconds),
+                            positionedNote.startSeconds + pitchStroke.front().timeSeconds);
                     pointDragMinimumTime = minimumAbsolute - positionedNote.startSeconds;
                 }
                 if (closestAnchor + 1 == static_cast<int>(pitchStroke.size())
@@ -6389,20 +7338,23 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
                     // and by nothing else, so the pair can be brought as close
                     // together as the user wants without ever crossing.
                     auto maximumAbsolute = positionedNote.endSeconds;
+                    // As far as the first point the note after it shows: onto
+                    // the same vertical line at most.
                     if (const auto next = nextUtauNoteFor(note->id))
-                    {
-                        auto nextHead = next->startSeconds;
-                        if (const auto* nextNote = findNote(next->id))
-                        {
-                            const auto& nextAnchors = pitchAnchorsFor(*nextNote);
-                            if (!nextAnchors.empty())
-                                nextHead = next->startSeconds
-                                    + nextAnchors.front().timeSeconds;
-                        }
-                        maximumAbsolute = nextHead - minimumAnchorSeparation;
-                    }
+                        maximumAbsolute = std::max(
+                            firstShownPitchPoint(next->id, next->startSeconds)
+                                .value_or(next->startSeconds),
+                            positionedNote.startSeconds + pitchStroke.back().timeSeconds);
                     pointDragMaximumTime = maximumAbsolute - positionedNote.startSeconds;
                 }
+                // On a shared line a point decides only the stretch its note
+                // owns, which ends at the next note's first point: any point of
+                // this note -- not only its last -- goes up to that vertical
+                // line at most, and would vanish under the pointer past it.
+                if (const auto* noteTrack = trackOf(note->id))
+                    if (const auto* member = sharedLinesFor(*noteTrack).memberFor(note->id))
+                        if (std::isfinite(member->takeover))
+                            pointDragOwnedUntil = member->takeover - positionedNote.startSeconds;
                 dragMode = DragMode::pointPitch;
                 repaint();
                 return;
@@ -6475,6 +7427,7 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
             previewConsonantVelocity = consonant->currentVelocity;
             consonantSetsPin = consonant->setsPin;
             consonantOverlapSeconds = consonant->overlapSeconds;
+            consonantDragTravelled = false;
             dragMode = DragMode::consonantLeadIn;
             setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
             repaint();
@@ -6760,12 +7713,7 @@ void PianoRollComponent::mouseDoubleClick(const juce::MouseEvent& event)
         for (const auto& point : envelope)
             if (std::abs(point.timeSeconds - local) * pixelsPerSecond < 9.0f)
                 return;
-        envelope.push_back({ local, amplitudeDbAt(envelope, local) });
-        std::stable_sort(envelope.begin(), envelope.end(),
-            [](const auto& left, const auto& right)
-            {
-                return left.timeSeconds < right.timeSeconds;
-            });
+        envelope = envelopeWithPointAt(std::move(envelope), local);
         const auto wasSelected = selectedNotes.contains(note->id.toStdString())
             || (selectedNotes.empty() && selectedNote == note->id);
         if (!wasSelected)
@@ -6800,9 +7748,27 @@ void PianoRollComponent::mouseDoubleClick(const juce::MouseEvent& event)
             const auto absoluteStart = hit.startSeconds + hit.clipStartSeconds;
             const auto local = static_cast<double>(event.position.x - timeToX(absoluteStart))
                 / pixelsPerSecond;
-            if (local < 0.0 || local > note->durationSeconds) continue;
             auto& anchors = pitchAnchorsFor(*note);
-            const auto lineY = midiToY(pitchAt(anchors, local)) + rowHeight * 0.5f;
+            // On a shared line the point goes to the note that owns the moment
+            // clicked -- which over a note's tail may be the next note's bend.
+            const auto* noteTrack = trackOf(note->id);
+            const auto* member = noteTrack != nullptr
+                ? sharedLinesFor(*noteTrack).memberFor(note->id) : nullptr;
+            if (member != nullptr && !anchors.empty())
+            {
+                const auto from = std::isfinite(member->ownFrom)
+                    ? member->ownFrom - absoluteStart
+                    : std::min(0.0, anchors.front().timeSeconds);
+                // Into the turn as well: a point there becomes where the
+                // turn begins.
+                const auto to = std::min(member->takeover - absoluteStart - minimumAnchorSeparation,
+                                         member->drawTo - absoluteStart);
+                if (local < from || local > to) continue;
+            }
+            else if (local < 0.0 || local > note->durationSeconds) continue;
+            const auto lineY = midiToY(member != nullptr
+                    ? member->line->midiAt(absoluteStart + local) : pitchAt(anchors, local))
+                + rowHeight * 0.5f;
             const auto distance = std::abs(event.position.y - lineY);
             if (distance < closestDistance)
             {
@@ -6818,7 +7784,15 @@ void PianoRollComponent::mouseDoubleClick(const juce::MouseEvent& event)
             for (const auto& anchor : anchors)
                 if (std::abs(anchor.timeSeconds - closestLocal) * pixelsPerSecond < 9.0f)
                     return;
-            const auto targetPitch = pitchAt(anchors, closestLocal);
+            // At the pitch the line is at there -- inside a turn, that is the
+            // turn, not the note's own line it is leaving.
+            const auto* closestTrack = trackOf(closestNote->id);
+            const auto* closestMember = closestTrack != nullptr
+                ? sharedLinesFor(*closestTrack).memberFor(closestNote->id) : nullptr;
+            const auto targetPitch = closestMember != nullptr
+                ? closestMember->line->midiAt(closestHit->startSeconds + closestHit->clipStartSeconds
+                                              + closestLocal)
+                : pitchAt(anchors, closestLocal);
             anchors.push_back({ closestLocal, targetPitch });
             std::stable_sort(anchors.begin(), anchors.end(), [](const auto& left, const auto& right)
             {
@@ -6965,17 +7939,29 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& event)
         const auto local = juce::jlimit(0.0, duration,
             static_cast<double>(event.position.x - 58.0f) / pixelsPerSecond
                 - vibratoDragAbsoluteStart);
-        const auto span = duration
-            * juce::jlimit(0.0, 100.0, previewVibrato.vibratoLengthPercent) / 100.0;
-        const auto start = duration - span;
+        const auto swing = vibratoSpanOf(previewVibrato);
+        const auto start = swing.start;
+        const auto end = swing.end;
+        const auto span = end - start;
+        // Never shorter than a hundredth of the note, as the length never was.
+        const auto shortest = duration * 0.01;
         switch (draggedVibratoHandle)
         {
             case VibratoHandle::length:
                 // Dragging the start earlier makes the vibrato cover more of
-                // the note; the span is always measured back from its end.
-                previewVibrato.vibratoLengthPercent =
-                    juce::jlimit(1.0, 100.0, (duration - local) / duration * 100.0);
+                // the note; its end stays where it is.
+                previewVibrato.vibratoLengthPercent = (end
+                    - juce::jlimit(0.0, std::max(0.0, end - shortest), local)) / duration * 100.0;
                 break;
+            case VibratoHandle::end:
+            {
+                // Moving the end moves only the end: the start stays put, so
+                // the length is whatever now lies between them.
+                const auto moved = juce::jlimit(std::min(duration, start + shortest), duration, local);
+                previewVibrato.vibratoEndPercent = moved / duration * 100.0;
+                previewVibrato.vibratoLengthPercent = (moved - start) / duration * 100.0;
+                break;
+            }
             case VibratoHandle::fadeIn:
                 if (span > 1.0e-9)
                     previewVibrato.vibratoFadeInPercent =
@@ -6984,7 +7970,7 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& event)
             case VibratoHandle::fadeOut:
                 if (span > 1.0e-9)
                     previewVibrato.vibratoFadeOutPercent =
-                        juce::jlimit(0.0, 100.0, (duration - local) / span * 100.0);
+                        juce::jlimit(0.0, 100.0, (end - local) / span * 100.0);
                 break;
             case VibratoHandle::cycle:
                 // The handle rides three quarters of the way through the first
@@ -7032,6 +8018,10 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& event)
     }
     if (dragMode == DragMode::consonantLeadIn)
     {
+        // The preview answers at once, as a handle should.  Only what a
+        // release writes waits for the pointer to have gone somewhere.
+        if (event.getDistanceFromDragStart() >= consonantClickSlopPixels)
+            consonantDragTravelled = true;
         dragConsonantTo(std::max(0.0,
             static_cast<double>(event.position.x - 58.0f) / pixelsPerSecond));
         repaintDrag(event.position.x);
@@ -7099,6 +8089,16 @@ void PianoRollComponent::mouseDrag(const juce::MouseEvent& event)
                         + minimumAnchorSeparation;
                 anchor.timeSeconds = juce::jlimit(
                     lowest, std::max(lowest, pointDragMaximumTime), local);
+            }
+            // Whichever point it is, not into the stretch a later note's bend
+            // decides: it would stop counting and vanish from under the pointer.
+            if (anchor.timeSeconds > pointDragOwnedUntil)
+            {
+                const auto lowest = draggedPitchAnchor > 0
+                    ? pitchStroke[static_cast<std::size_t>(draggedPitchAnchor - 1)].timeSeconds
+                        + minimumAnchorSeparation
+                    : std::min(pointDragMinimumTime, pointDragOwnedUntil);
+                anchor.timeSeconds = std::max(lowest, pointDragOwnedUntil);
             }
         }
         repaintDrag(event.position.x);
@@ -7343,7 +8343,14 @@ void PianoRollComponent::finishDrag()
                                    previewJieFractions[1], previewJieFractions[2]);
     else if (dragMode == DragMode::consonantLeadIn)
     {
-        if (consonantSetsPin)
+        if (!consonantDragTravelled)
+        {
+            // A click on the handle, which is where a seam is clicked.  It
+            // leaves the note as it was: writing the preview back released
+            // the pin, and a note behind a 拼字 note went back to its entry's
+            // own timing each time anyone clicked between the two.
+        }
+        else if (consonantSetsPin)
             // 谋 pins the lead-in the drag asked for.  Backing into it through
             // the consonant velocity rewrites a setting the note carries --
             // and for a first region the entry calls a vowel the velocity does
@@ -7392,11 +8399,20 @@ void PianoRollComponent::finishDrag()
     pointDragCanMoveHorizontally = false;
     pointDragMaximumTime = 0.0;
     pointDragMinimumTime = 0.0;
+    pointDragOwnedUntil = std::numeric_limits<double>::infinity();
     dragMode = DragMode::none;
 }
 
 bool PianoRollComponent::keyPressed(const juce::KeyPress& key)
 {
+    // The lyric box has no use for Tab, so it comes up to here.  Left alone it
+    // would go on to the window, which moves focus to the next control and
+    // closes the box; taken here, it goes on to the next note instead.
+    if (key.isKeyCode(juce::KeyPress::tabKey) && inlineAliasNoteId.isNotEmpty())
+    {
+        advanceInlineAliasEdit(!key.getModifiers().isShiftDown());
+        return true;
+    }
     if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'A')
     {
         selectAllNotes();

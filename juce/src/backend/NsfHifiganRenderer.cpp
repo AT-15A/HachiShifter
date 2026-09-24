@@ -1,4 +1,5 @@
 #include "NsfHifiganRenderer.h"
+#include "AmplitudeEnvelopeCurve.h"
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_dsp/juce_dsp.h>
@@ -1218,16 +1219,18 @@ NsfUtauNotePlan buildNsfUtauNotePlan(const NsfUtauSampleTiming& timing,
 std::vector<float> buildNsfUtauTargetMidi(float midiNote,
                                           const std::vector<NsfUtauPitchPoint>& pitchCurve,
                                           double framePeriodMs, double outputSeconds,
-                                          double soundStartOffsetSeconds)
+                                          double soundStartOffsetSeconds,
+                                          const std::function<float(double)>& timelinePitchCents)
 {
     const auto framePeriod = std::max(0.1, framePeriodMs) / 1000.0;
     const auto frames = std::max(1, static_cast<int>(std::ceil(
         std::max(0.001, outputSeconds) / framePeriod)) + 1);
     std::vector<float> target(static_cast<std::size_t>(frames), midiNote);
-    if (pitchCurve.empty()) return target;
+    if (pitchCurve.empty() && !timelinePitchCents) return target;
 
     const auto centsAt = [&](double localTime)
     {
+        if (timelinePitchCents) return timelinePitchCents(localTime);
         if (localTime <= pitchCurve.front().timeSeconds) return pitchCurve.front().cents;
         if (localTime >= pitchCurve.back().timeSeconds) return pitchCurve.back().cents;
         for (std::size_t i = 1; i < pitchCurve.size(); ++i)
@@ -1321,7 +1324,8 @@ NsfUtauSynthResult synthesizeNsfUtauNote(const juce::File& sampleFile,
                                          float midiNote,
                                          const std::vector<NsfUtauPitchPoint>& pitchCurve,
                                          const juce::File& modelDirectory,
-                                         const OrtExecutionConfig& execution)
+                                         const OrtExecutionConfig& execution,
+                                         const std::function<float(double)>& timelinePitchCents)
 {
     NsfUtauSynthResult result;
     if (!plan.valid)
@@ -1364,7 +1368,7 @@ NsfUtauSynthResult synthesizeNsfUtauNote(const juce::File& sampleFile,
 
     constexpr auto framePeriodMs = 5.0;
     const auto targetMidi = buildNsfUtauTargetMidi(midiNote, pitchCurve, framePeriodMs,
-        plan.outputSeconds, plan.soundStartOffsetSeconds);
+        plan.outputSeconds, plan.soundStartOffsetSeconds, timelinePitchCents);
     const std::vector<float> formant(targetMidi.size(), 0.0f);
     const auto targetSamples = std::max(1, static_cast<int>(std::lround(
         plan.outputSeconds * sourceRate)));
@@ -1417,7 +1421,7 @@ UtauRenderResult renderNsfUtauPhrase(const UtauRenderRequest& request,
             request.voicebankDirectory, note.alias, note.midiNote,
             note.consonantVelocity, request.fourRegion, request.consonantClasses,
             note.stpSeconds, note.preutteranceOverrideEnabled, note.preutteranceSeconds,
-            note.overlapOverrideEnabled, note.overlapSeconds);
+            note.overlapOverrideEnabled, note.overlapSeconds, &note.oto);
         if (!resolved.found) { ++missing; continue; }
 
         NsfUtauSampleTiming timing;
@@ -1440,13 +1444,39 @@ UtauRenderResult renderNsfUtauPhrase(const UtauRenderRequest& request,
         // the target MIDI is simply the note's pitch (the recording's own pitch
         // is what the mel carries; no source-vs-target ratio is applied here).
         auto synth = synthesizeNsfUtauNote(resolved.file, plan, note.midiNote,
-                                           pitch, modelDirectory, execution);
+                                           pitch, modelDirectory, execution, note.timelinePitchCents);
         if (!synth.usedModel || synth.audio.getNumSamples() <= 0)
         {
             if (result.warning.isEmpty() && synth.error.isNotEmpty())
                 result.warning = synth.error;
             ++missing;
             continue;
+        }
+        // Preserve the local editor's envelope, including linear-amplitude
+        // segments, when switching an existing voicebank track to native NSF.
+        if (!note.amplitudeEnvelope.empty())
+        {
+            const auto& points = note.amplitudeEnvelope;
+            for (int i = 0; i < synth.audio.getNumSamples(); ++i)
+            {
+                const auto time = plan.soundStartOffsetSeconds + i / synth.sampleRate;
+                auto db = points.front().gainDb;
+                if (time >= points.back().timeSeconds) db = points.back().gainDb;
+                else for (std::size_t j = 1; j < points.size(); ++j)
+                {
+                    if (time > points[j].timeSeconds) continue;
+                    const auto& left = points[j - 1];
+                    const auto& right = points[j];
+                    const auto span = right.timeSeconds - left.timeSeconds;
+                    const auto u = static_cast<float>(juce::jlimit(0.0, 1.0,
+                        (time - left.timeSeconds) / std::max(1.0e-9, span)));
+                    db = envelopeDbBetween(left.gainDb, right.gainDb, u, left.linearToNext);
+                    break;
+                }
+                const auto gain = envelopeGainFromDb(db);
+                for (int c = 0; c < synth.audio.getNumChannels(); ++c)
+                    synth.audio.setSample(c, i, synth.audio.getSample(c, i) * gain);
+            }
         }
         if (note.gain != 1.0f) synth.audio.applyGain(juce::jlimit(0.0f, 4.0f, note.gain));
         phraseRate = synth.sampleRate;

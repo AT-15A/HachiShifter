@@ -1,9 +1,11 @@
 #include "UtauRenderer.h"
 #include "../SampleSettings.h"
+#include "AmplitudeEnvelopeCurve.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <deque>
+#include <future>
 #include <map>
 #include <limits>
 #include <memory>
@@ -85,6 +87,9 @@ struct RenderedNote
     bool external = false;
     bool piano = false;
     bool rest = false;
+    // A lyric the voicebank has no sample for: sung as the piano, and still
+    // reported as missing.
+    bool missing = false;
 };
 
 struct ExternalResamplerAttempt
@@ -98,7 +103,19 @@ struct VoicebankIndex
 {
     std::vector<VoiceSample> samples;
     std::map<juce::String, std::pair<juce::String, juce::String>> prefixMap;
+    // The first sample for each alias and for each file name, keyed the way
+    // equalsIgnoreCase compares -- character by character in upper case -- so
+    // a lookup finds exactly what scanning the samples in order found.  Asked
+    // once per note on every layout of the roll, the scan was most of the time
+    // an edit took.
+    std::unordered_map<std::string, std::size_t> byAlias;
+    std::unordered_map<std::string, std::size_t> byFileName;
 };
+
+std::string foldedKey(const juce::String& text)
+{
+    return text.toUpperCase().toStdString();
+}
 
 juce::String decodeText(const juce::File& file)
 {
@@ -187,10 +204,7 @@ double adjustedPreutterance(const VoiceSample& sample, int velocity)
 
 float pitchCentsAt(const UtauNoteRenderSpec& note, double localSeconds)
 {
-    // The UTAU resampler path reads the sampled pitchCurve (matching standard
-    // host PIT).  The continuous timelinePitchCents evaluator is a native-render
-    // feature consumed by the model backends, not by the resampler protocol, so
-    // it is deliberately not preferred here.
+    if (note.timelinePitchCents) return note.timelinePitchCents(localSeconds);
     if (note.pitchCurve.empty()) return 0.0f;
     const auto right = std::lower_bound(note.pitchCurve.begin(), note.pitchCurve.end(), localSeconds,
         [](const UtauPitchPoint& point, double time) { return point.timeSeconds < time; });
@@ -224,14 +238,15 @@ juce::String encodePitchbend(const UtauNoteRenderSpec& note, double bpm,
         const auto curveEnd = note.pitchCurve.empty()
             ? std::max(0.0, note.durationSeconds)
             : std::max(note.durationSeconds, note.pitchCurve.back().timeSeconds);
-        // The UTAU resampler PIT is clamped to the note's own curve span, which
-        // is what standard UTAU hosts do: the lead-in holds the head pitch and
-        // the tail holds the last.  Reading the continuous timeline evaluator
-        // unclamped here would diverge from every host's PIT.  The continuous
-        // evaluator is a native-renderer feature (dense per-frame target), not a
-        // change to the resampler protocol.
-        const auto localTime = juce::jlimit(curveStart, curveEnd,
-                                            outputTime - preutteranceSeconds);
+        auto localTime = note.timelinePitchCents
+            ? outputTime - preutteranceSeconds
+            : juce::jlimit(curveStart, curveEnd, outputTime - preutteranceSeconds);
+        // retimeLeadIn later maps the natural head onto the requested head.
+        // Read pitch at that final timeline position, not the pre-stretch time.
+        if (note.timelinePitchCents && note.preutteranceOverrideEnabled
+            && localTime < 0.0 && preutteranceSeconds > 1.0e-9)
+            localTime *= std::min(std::max(0.0, note.preutteranceSeconds),
+                                 std::max(0.0, note.startSeconds)) / preutteranceSeconds;
         auto value = juce::jlimit(-2048, 2047, static_cast<int>(std::lround(
             baseOffsetCents + pitchCentsAt(note, localTime))));
         if (value < 0) value += 4096;
@@ -308,6 +323,66 @@ void inferSourceMidi(VoiceSample& sample)
         sample.sourceMidi = *directoryPitch;
 }
 
+// An oto row's numbers laid onto a sample: where the entry starts and stops in
+// the recording, its lead-in, consonant and overlap, and its regions.  One
+// conversion for the voicebank's rows and for a note's own, so a note given an
+// exact copy of its entry renders exactly as the entry does.
+void applyOtoNumbers(VoiceSample& sample, double duration, double offsetMs,
+                     double consonantMs, double cutoffMs, double preutteranceMs,
+                     double overlapMs, bool hasRegions, double onsetMs,
+                     double glideMs, double nucleusMs, const juce::String& classes)
+{
+    sample.fileSeconds = duration;
+    sample.offset = juce::jlimit(0.0, duration, offsetMs / 1000.0);
+    const auto requestedEnd = cutoffMs < 0.0
+        ? sample.offset - cutoffMs / 1000.0
+        : duration - cutoffMs / 1000.0;
+    sample.end = juce::jlimit(sample.offset + 0.001,
+        std::max(sample.offset + 0.001, duration), requestedEnd);
+    sample.preutterance = juce::jlimit(0.0, sample.end - sample.offset,
+                                       preutteranceMs / 1000.0);
+    sample.consonant = juce::jlimit(0.0, sample.end - sample.offset,
+                                   consonantMs / 1000.0);
+    sample.overlap = overlapMs / 1000.0;
+    sample.hasRegions = false;
+    sample.regionSeconds = {};
+    sample.mouClasses = {};
+    if (hasRegions)
+    {
+        const auto span = sample.end - sample.offset;
+        const auto b1 = juce::jlimit(0.0, span, onsetMs / 1000.0);
+        const auto b2 = juce::jlimit(b1, span, glideMs / 1000.0);
+        const auto b3 = juce::jlimit(b2, span, nucleusMs / 1000.0);
+        // Two or three regions carry fewer boundaries; the last one runs to
+        // the end of the sample and the rest of the array stays empty.
+        const auto count = classes.isEmpty() ? 4 : classes.length();
+        if (count == 2)      sample.regionSeconds = { b1, span - b1, 0.0, 0.0 };
+        else if (count == 3) sample.regionSeconds = { b1, b2 - b1, span - b2, 0.0 };
+        else                 sample.regionSeconds = { b1, b2 - b1, b3 - b2, span - b3 };
+        sample.hasRegions = true;
+        sample.mouClasses = classes;
+    }
+}
+
+// The entry a note's lyric resolved to, with the note's own numbers in place
+// of the row's.  The recording, the alias and the pitch it was recorded at
+// are still the entry's: a note's own oto says where in that recording to
+// read, not which recording.
+//
+// Read the way the track's mode reads a voicebank row.  The note may have been
+// edited in another mode, but a row loaded for UTAU has no regions and one
+// loaded for 界 has no classes, so neither does this.
+VoiceSample withNoteOto(const VoiceSample& entry, const UtauOtoOverride& oto,
+                        bool fourRegion, bool consonantClasses)
+{
+    auto sample = entry;
+    applyOtoNumbers(sample, entry.fileSeconds, oto.offsetMs, oto.consonantMs,
+                    oto.cutoffMs, oto.preutteranceMs, oto.overlapMs,
+                    oto.hasRegions && fourRegion, oto.onsetMs, oto.glideMs,
+                    oto.nucleusMs, consonantClasses ? oto.classes : juce::String());
+    return sample;
+}
+
 std::vector<VoiceSample> loadHjmVoicebank(const juce::File& root,
                                           juce::AudioFormatManager& formats)
 {
@@ -381,34 +456,10 @@ std::vector<VoiceSample> loadVoicebank(const juce::File& root, bool fourRegion,
         sample.file = entry.audioFile;
         sample.alias = entry.alias.trim().isNotEmpty()
             ? entry.alias.trim() : entry.audioFile.getFileNameWithoutExtension();
-        sample.fileSeconds = duration;
-        sample.offset = juce::jlimit(0.0, duration, entry.offsetMs / 1000.0);
-        const auto requestedEnd = entry.cutoffMs < 0.0
-            ? sample.offset - entry.cutoffMs / 1000.0
-            : duration - entry.cutoffMs / 1000.0;
-        sample.end = juce::jlimit(sample.offset + 0.001,
-            std::max(sample.offset + 0.001, duration), requestedEnd);
-        sample.preutterance = juce::jlimit(0.0, sample.end - sample.offset,
-                                           entry.preutteranceMs / 1000.0);
-        sample.consonant = juce::jlimit(0.0, sample.end - sample.offset,
-                                       entry.consonantMs / 1000.0);
-        sample.overlap = entry.overlapMs / 1000.0;
-        if (entry.hasJieOto)
-        {
-            const auto span = sample.end - sample.offset;
-            const auto b1 = juce::jlimit(0.0, span, entry.jieOnsetMs / 1000.0);
-            const auto b2 = juce::jlimit(b1, span, entry.jieGlideMs / 1000.0);
-            const auto b3 = juce::jlimit(b2, span, entry.jieNucleusMs / 1000.0);
-            // Two or three regions carry fewer boundaries; the last one runs
-            // to the end of the sample and the rest of the array stays empty.
-            const auto count = entry.mouClasses.isEmpty()
-                ? 4 : entry.mouClasses.length();
-            if (count == 2)      sample.regionSeconds = { b1, span - b1, 0.0, 0.0 };
-            else if (count == 3) sample.regionSeconds = { b1, b2 - b1, span - b2, 0.0 };
-            else                 sample.regionSeconds = { b1, b2 - b1, b3 - b2, span - b3 };
-            sample.hasRegions = true;
-            sample.mouClasses = entry.mouClasses;
-        }
+        applyOtoNumbers(sample, duration, entry.offsetMs, entry.consonantMs,
+                        entry.cutoffMs, entry.preutteranceMs, entry.overlapMs,
+                        entry.hasJieOto, entry.jieOnsetMs, entry.jieGlideMs,
+                        entry.jieNucleusMs, entry.mouClasses);
         inferSourceMidi(sample);
         result.push_back(std::move(sample));
     }
@@ -480,36 +531,228 @@ std::vector<VoiceSample> loadVoicebank(const juce::File& root, bool fourRegion,
     return result;
 }
 
-std::shared_ptr<const VoicebankIndex> loadVoicebankIndex(const juce::File& root,
-                                                         bool fourRegion,
-                                                         bool consonantClasses)
-{
-    static std::mutex cacheMutex;
-    static std::unordered_map<std::string, std::shared_ptr<const VoicebankIndex>> cache;
-    static std::deque<std::string> insertionOrder;
-    const auto key = (root.getFullPathName() + "|"
-                      + (consonantClasses ? "mou|" : fourRegion ? "jie|" : "classic|")
-        + juce::String(root.getLastModificationTime().toMilliseconds()) + "|"
-        + juce::String(static_cast<juce::int64>(
-            voicebankCacheRevision().load(std::memory_order_relaxed)))).toStdString();
-    {
-        const std::scoped_lock lock(cacheMutex);
-        if (const auto found = cache.find(key); found != cache.end()) return found->second;
-    }
+using IndexPointer = std::shared_ptr<const VoicebankIndex>;
 
-    auto loaded = std::make_shared<VoicebankIndex>();
-    loaded->samples = loadVoicebank(root, fourRegion, consonantClasses);
-    loaded->prefixMap = loadPrefixMap(root);
-    const std::scoped_lock lock(cacheMutex);
-    if (const auto found = cache.find(key); found != cache.end()) return found->second;
-    cache.emplace(key, loaded);
-    insertionOrder.push_back(key);
-    while (insertionOrder.size() > 4)
+// A file an index was read from, and when it was last written (-1: absent).
+struct FileStamp
+{
+    juce::File file;
+    juce::int64 modified = -1;
+};
+
+juce::int64 modifiedStamp(const juce::File& file)
+{
+    return file.existsAsFile() ? file.getLastModificationTime().toMilliseconds() : -1;
+}
+
+// What an index depends on: every oto the bank has, the 界 and 谋 files beside
+// each one whether or not they exist yet, and the prefix maps.
+//
+// Not the folder's own modification time, which is what the cache used to be
+// keyed on.  The engine writes its analysis cache beside the samples, so
+// every sample rendered for the first time touched the folder, and the next
+// edit read the whole bank again -- on the message thread, for seconds.
+std::vector<FileStamp> voicebankStamps(const juce::File& root)
+{
+    std::vector<FileStamp> stamps;
+    const auto stamp = [&stamps](const juce::File& file)
     {
-        cache.erase(insertionOrder.front());
-        insertionOrder.pop_front();
+        stamps.push_back({ file, modifiedStamp(file) });
+    };
+    juce::Array<juce::File> otoFiles;
+    root.findChildFiles(otoFiles, juce::File::findFiles, true, "oto.ini");
+    for (const auto& oto : otoFiles)
+    {
+        stamp(oto);
+        stamp(SampleSettings::jieClassicOtoFileFor(oto));
+        stamp(SampleSettings::jieOtoFileFor(oto));
+        stamp(SampleSettings::mouOtoFileFor(oto));
     }
-    return loaded;
+    // A bank read from its sidecars has no oto yet; one appearing is a change.
+    if (otoFiles.isEmpty()) stamp(root.getChildFile("oto.ini"));
+    juce::Array<juce::File> maps;
+    root.findChildFiles(maps, juce::File::findFiles, true, "prefix.map");
+    for (const auto& map : maps) stamp(map);
+    return stamps;
+}
+
+struct IndexCache
+{
+    struct Entry
+    {
+        IndexPointer index;
+        std::shared_future<IndexPointer> pending;
+        std::vector<std::function<void()>> whenReady;
+        std::vector<FileStamp> stamps;
+        bool rootExisted = false;
+        double checkedAt = 0.0;
+        std::uint64_t lastUsed = 0;
+    };
+    std::mutex mutex;
+    std::map<std::string, Entry> entries;
+    std::uint64_t clock = 0;
+    std::atomic<int> builds { 0 };
+    std::atomic<int> messageThreadWaits { 0 };
+};
+
+IndexCache& indexCache()
+{
+    static IndexCache cache;
+    return cache;
+}
+
+// Background readings of a bank for voicebankIndexReady.  Made after the
+// cache, so it is destroyed before it.
+juce::ThreadPool& indexReadingPool()
+{
+    indexCache();
+    static juce::ThreadPool pool(2);
+    return pool;
+}
+
+// Files written from outside this application are noticed within a second:
+// checking them on every lookup would be a handful of disk queries per note.
+// Writes made here count in the key, and are seen at once.
+constexpr double voicebankRecheckMs = 1000.0;
+
+std::string indexKey(const juce::File& root, bool fourRegion, bool consonantClasses)
+{
+    return (root.getFullPathName() + "|"
+            + (consonantClasses ? "mou|" : fourRegion ? "jie|" : "classic|")
+            + juce::String(static_cast<juce::int64>(
+                  voicebankCacheRevision().load(std::memory_order_relaxed))) + "|"
+            + juce::String(static_cast<juce::int64>(
+                  SampleSettings::voicebankFilesRevision()))).toStdString();
+}
+
+// Lock held.  Whether a cached index still describes the files on disk.
+bool entryCurrent(IndexCache::Entry& entry, const juce::File& root)
+{
+    const auto now = juce::Time::getMillisecondCounterHiRes();
+    if (now - entry.checkedAt < voicebankRecheckMs) return true;
+    if (root.isDirectory() != entry.rootExisted) return false;
+    for (const auto& stamp : entry.stamps)
+        if (modifiedStamp(stamp.file) != stamp.modified) return false;
+    entry.checkedAt = now;
+    return true;
+}
+
+// Lock held.  Keeps the four most recently used banks that are not being read.
+void trimIndexCache(IndexCache& cache)
+{
+    constexpr std::size_t kept = 4;
+    for (;;)
+    {
+        std::size_t idle = 0;
+        auto oldest = cache.entries.end();
+        for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it)
+        {
+            if (it->second.pending.valid() || !it->second.whenReady.empty()) continue;
+            ++idle;
+            if (oldest == cache.entries.end() || it->second.lastUsed < oldest->second.lastUsed)
+                oldest = it;
+        }
+        if (idle <= kept || oldest == cache.entries.end()) return;
+        cache.entries.erase(oldest);
+    }
+}
+
+// Lock held.  The index when it is ready and current.  Otherwise pending is
+// the reading under way -- one is started, and promise set, when there is
+// none, and the caller then does the reading.
+IndexPointer lookupIndex(IndexCache& cache, const std::string& key, const juce::File& root,
+                         std::shared_future<IndexPointer>& pending,
+                         std::shared_ptr<std::promise<IndexPointer>>& promise)
+{
+    auto& entry = cache.entries[key];
+    entry.lastUsed = ++cache.clock;
+    if (entry.index != nullptr)
+    {
+        if (entryCurrent(entry, root)) return entry.index;
+        entry.index.reset();
+    }
+    if (!entry.pending.valid())
+    {
+        promise = std::make_shared<std::promise<IndexPointer>>();
+        entry.pending = promise->get_future().share();
+    }
+    pending = entry.pending;
+    return nullptr;
+}
+
+// Reads the bank and files the result.  Every caller waiting on the reading
+// is answered, including with a failure; nothing is left waiting forever.
+void readVoicebankIndex(const std::string& key, const juce::File& root, bool fourRegion,
+                        bool consonantClasses, std::promise<IndexPointer>& promise)
+{
+    auto& cache = indexCache();
+    try
+    {
+        // Stamped before reading, so a file written while it is read is newer
+        // than what was stamped and the index is read again.
+        const auto rootExisted = root.isDirectory();
+        auto stamps = voicebankStamps(root);
+        auto loaded = std::make_shared<VoicebankIndex>();
+        loaded->samples = loadVoicebank(root, fourRegion, consonantClasses);
+        loaded->prefixMap = loadPrefixMap(root);
+        for (std::size_t index = 0; index < loaded->samples.size(); ++index)
+        {
+            const auto& sample = loaded->samples[index];
+            loaded->byAlias.emplace(foldedKey(sample.alias), index);
+            loaded->byFileName.emplace(
+                foldedKey(sample.file.getFileNameWithoutExtension()), index);
+        }
+        cache.builds.fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::function<void()>> answered;
+        {
+            const std::scoped_lock lock(cache.mutex);
+            auto& entry = cache.entries[key];
+            entry.index = loaded;
+            entry.stamps = std::move(stamps);
+            entry.rootExisted = rootExisted;
+            entry.checkedAt = juce::Time::getMillisecondCounterHiRes();
+            entry.pending = {};
+            answered.swap(entry.whenReady);
+            trimIndexCache(cache);
+        }
+        promise.set_value(loaded);
+        for (auto& callback : answered)
+            juce::MessageManager::callAsync(std::move(callback));
+    }
+    catch (...)
+    {
+        // Those waiting are told as well, so they can ask again rather than
+        // wait on a reading that is never coming.
+        std::vector<std::function<void()>> answered;
+        {
+            const std::scoped_lock lock(cache.mutex);
+            auto& entry = cache.entries[key];
+            entry.pending = {};
+            answered.swap(entry.whenReady);
+        }
+        promise.set_exception(std::current_exception());
+        for (auto& callback : answered)
+            juce::MessageManager::callAsync(std::move(callback));
+    }
+}
+
+IndexPointer loadVoicebankIndex(const juce::File& root, bool fourRegion, bool consonantClasses)
+{
+    auto& cache = indexCache();
+    const auto key = indexKey(root, fourRegion, consonantClasses);
+    std::shared_future<IndexPointer> pending;
+    std::shared_ptr<std::promise<IndexPointer>> promise;
+    {
+        const std::scoped_lock lock(cache.mutex);
+        if (auto index = lookupIndex(cache, key, root, pending, promise)) return index;
+    }
+    if (juce::MessageManager::existsAndIsCurrentThread())
+        cache.messageThreadWaits.fetch_add(1, std::memory_order_relaxed);
+    // Two renders of one bank used to read it twice at once; the second now
+    // waits for the first.
+    if (promise != nullptr)
+        readVoicebankIndex(key, root, fourRegion, consonantClasses, *promise);
+    return pending.get();
 }
 
 // The same entry, moved bodily along the recording.
@@ -535,7 +778,8 @@ VoiceSample shiftedBy(const VoiceSample& sample, double seconds)
     return shifted;
 }
 
-const VoiceSample* resolveSample(
+// The rule, as a scan.  Kept as the reference the tables are checked against.
+const VoiceSample* resolveSampleByScan(
     const std::vector<VoiceSample>& samples,
     const std::map<juce::String, std::pair<juce::String, juce::String>>& prefixMap,
     const juce::String& requestedAlias, float midi)
@@ -559,6 +803,31 @@ const VoiceSample* resolveSample(
     for (const auto& sample : samples)
         if (sample.file.getFileNameWithoutExtension().equalsIgnoreCase(alias)) return &sample;
     return nullptr;
+}
+
+// The same rule through the index's tables: the prefix-map spelling first,
+// then the lyric as it is, then -- for a bank of one sample -- that sample,
+// and last a sample whose file is named like the lyric.
+const VoiceSample* resolveSample(const VoicebankIndex& voicebank,
+                                 const juce::String& requestedAlias, float midi)
+{
+    const auto& samples = voicebank.samples;
+    if (samples.empty()) return nullptr;
+    const auto alias = requestedAlias.trim();
+    if (alias.isEmpty()) return nullptr;
+    const auto byAlias = [&voicebank, &samples](const juce::String& candidate) -> const VoiceSample*
+    {
+        const auto found = voicebank.byAlias.find(foldedKey(candidate));
+        return found != voicebank.byAlias.end() ? &samples[found->second] : nullptr;
+    };
+    if (const auto found = voicebank.prefixMap.find(midiName(midi).toLowerCase());
+        found != voicebank.prefixMap.end())
+        if (const auto* sample = byAlias(found->second.first + alias + found->second.second))
+            return sample;
+    if (const auto* sample = byAlias(alias)) return sample;
+    if (samples.size() == 1) return &samples.front();
+    const auto file = voicebank.byFileName.find(foldedKey(alias));
+    return file != voicebank.byFileName.end() ? &samples[file->second] : nullptr;
 }
 
 bool readAudio(const juce::File& file, juce::AudioBuffer<float>& buffer, double& rate)
@@ -679,7 +948,7 @@ ExternalResamplerAttempt runExternalResampler(
     // the start of the rendered segment.  A note's own points are written
     // against its nominal start, so each moves forward by the preutterance.
     auto curveArgument = juce::String();
-    if (note.flagCurve)
+    if (UtauRenderer::sendsFlagCurves(request.fourRegion, note.flagCurve))
     {
         juce::StringArray curves;
         for (const auto& [flag, points] : note.flagCurves)
@@ -938,7 +1207,7 @@ float amplitudeGainAt(const std::vector<UtauAmplitudePoint>& points, double loca
         const auto amount = span > 1.0e-9
             ? static_cast<float>(juce::jlimit(0.0, 1.0,
                 (localSeconds - left.timeSeconds) / span)) : 0.0f;
-        gainDb = left.gainDb + (right->gainDb - left.gainDb) * amount;
+        gainDb = envelopeDbBetween(left.gainDb, right->gainDb, amount, left.linearToNext);
     }
     return gainDb <= -59.9f ? 0.0f : std::pow(10.0f, gainDb / 20.0f);
 }
@@ -990,25 +1259,34 @@ std::vector<UtauAmplitudePoint> envelopeForNoteAsItIs(
     return points;
 }
 
-void mixNote(juce::AudioBuffer<float>& mix, const juce::AudioBuffer<float>& note,
-             int destinationStart, double preutteranceSeconds,
-             const std::vector<UtauAmplitudePoint>& amplitudeEnvelope,
-             double fadeInSeconds, bool equalPowerFadeIn = false,
-             std::optional<int> sequenceFadeOutStart = std::nullopt,
-             double sequenceFadeOutSeconds = 0.0, bool equalPowerFadeOut = false)
+// Everything the mix multiplies one sample of a note by: its envelope, the
+// fade in across its overlap, and the fade out -- into the next note, or off
+// the end of the piece when nothing follows.  Written once, because the
+// waveform drawn for a note is shaped by it too, and two copies of a rule are
+// how a picture and a sound come to disagree.
+struct NoteMixGain
 {
-    const auto fadeIn = std::max(1, static_cast<int>(std::lround(
-        std::max(0.003, fadeInSeconds) * mixSampleRate)));
-    const auto naturalFadeOut = std::max(1, static_cast<int>(std::lround(0.012 * mixSampleRate)));
-    const auto sequenceFadeOut = std::max(1, static_cast<int>(std::lround(
-        std::max(0.003, sequenceFadeOutSeconds) * mixSampleRate)));
-    for (int index = 0; index < note.getNumSamples(); ++index)
+    const std::vector<UtauAmplitudePoint>* envelope = nullptr;
+    int samples = 0;
+    int destinationStart = 0;
+    double preutteranceSeconds = 0.0;
+    int fadeIn = 1;
+    bool equalPowerFadeIn = false;
+    std::optional<int> sequenceFadeOutStart;
+    int sequenceFadeOut = 1;
+    bool equalPowerFadeOut = false;
+    int naturalFadeOut = 1;
+
+    // withEnvelope false leaves the envelope out and keeps the fades: the
+    // piece as the line in the envelope lane acts on it.
+    [[nodiscard]] float at(int index, bool withEnvelope = true) const
     {
+        if (index < 0 || index >= samples) return 0.0f;
         const auto destination = destinationStart + index;
-        if (destination < 0 || destination >= mix.getNumSamples()) continue;
         const auto localSeconds = static_cast<double>(index) / mixSampleRate
             - preutteranceSeconds;
-        auto envelope = amplitudeGainAt(amplitudeEnvelope, localSeconds);
+        auto gain = withEnvelope && envelope != nullptr
+            ? amplitudeGainAt(*envelope, localSeconds) : 1.0f;
         if (index < fadeIn)
         {
             // Two linear ramps crossing sum to a dip in the middle, which is
@@ -1016,34 +1294,68 @@ void mixNote(juce::AudioBuffer<float>& mix, const juce::AudioBuffer<float>& note
             // level across the crossing instead, so a spliced join keeps its
             // loudness where an untouched one sags.
             const auto position = static_cast<float>(index) / static_cast<float>(fadeIn);
-            envelope *= equalPowerFadeIn
+            gain *= equalPowerFadeIn
                 ? std::sin(position * juce::MathConstants<float>::halfPi) : position;
         }
         if (sequenceFadeOutStart)
         {
             const auto fadePosition = destination - *sequenceFadeOutStart;
             if (fadePosition >= sequenceFadeOut)
-                envelope = 0.0f;
+                gain = 0.0f;
             else if (fadePosition >= 0)
             {
                 const auto position = static_cast<float>(fadePosition)
                     / static_cast<float>(sequenceFadeOut);
-                envelope *= equalPowerFadeOut
+                gain *= equalPowerFadeOut
                     ? std::cos(position * juce::MathConstants<float>::halfPi)
                     : 1.0f - position;
             }
         }
         else
         {
-            const auto remaining = note.getNumSamples() - 1 - index;
+            const auto remaining = samples - 1 - index;
             if (remaining < naturalFadeOut)
-                envelope *= static_cast<float>(remaining)
+                gain *= static_cast<float>(std::max(0, remaining))
                     / static_cast<float>(naturalFadeOut);
         }
+        return gain;
+    }
+};
+
+NoteMixGain noteMixGain(int samples, int destinationStart, double preutteranceSeconds,
+                        const std::vector<UtauAmplitudePoint>& amplitudeEnvelope,
+                        double fadeInSeconds, bool equalPowerFadeIn = false,
+                        std::optional<int> sequenceFadeOutStart = std::nullopt,
+                        double sequenceFadeOutSeconds = 0.0, bool equalPowerFadeOut = false)
+{
+    NoteMixGain gain;
+    gain.envelope = &amplitudeEnvelope;
+    gain.samples = samples;
+    gain.destinationStart = destinationStart;
+    gain.preutteranceSeconds = preutteranceSeconds;
+    gain.fadeIn = std::max(1, static_cast<int>(std::lround(
+        std::max(0.003, fadeInSeconds) * mixSampleRate)));
+    gain.equalPowerFadeIn = equalPowerFadeIn;
+    gain.sequenceFadeOutStart = sequenceFadeOutStart;
+    gain.sequenceFadeOut = std::max(1, static_cast<int>(std::lround(
+        std::max(0.003, sequenceFadeOutSeconds) * mixSampleRate)));
+    gain.equalPowerFadeOut = equalPowerFadeOut;
+    gain.naturalFadeOut = std::max(1, static_cast<int>(std::lround(0.012 * mixSampleRate)));
+    return gain;
+}
+
+void mixNote(juce::AudioBuffer<float>& mix, const juce::AudioBuffer<float>& note,
+             const NoteMixGain& gain)
+{
+    for (int index = 0; index < note.getNumSamples(); ++index)
+    {
+        const auto destination = gain.destinationStart + index;
+        if (destination < 0 || destination >= mix.getNumSamples()) continue;
+        const auto level = gain.at(index);
         for (int channel = 0; channel < mix.getNumChannels(); ++channel)
         {
             const auto sourceChannel = std::min(channel, note.getNumChannels() - 1);
-            mix.addSample(channel, destination, note.getSample(sourceChannel, index) * envelope);
+            mix.addSample(channel, destination, note.getSample(sourceChannel, index) * level);
         }
     }
 }
@@ -1065,9 +1377,8 @@ void mixNote(juce::AudioBuffer<float>& mix, const juce::AudioBuffer<float>& note
 // Not past the next note's own end: beyond that the note after it is in
 // charge of the seam, and an overlap typed larger than the note it belongs to
 // would otherwise leave the previous syllable droning under the whole phrase.
-std::vector<double> crossfadeTails(
-    const UtauRenderRequest& request, const std::vector<VoiceSample>& samples,
-    const std::map<juce::String, std::pair<juce::String, juce::String>>& prefixMap)
+std::vector<double> crossfadeTails(const UtauRenderRequest& request,
+                                   const VoicebankIndex& voicebank)
 {
     std::vector<double> tails(request.notes.size(), 0.0);
     std::vector<std::size_t> order(request.notes.size());
@@ -1082,9 +1393,15 @@ std::vector<double> crossfadeTails(
         const auto& note = request.notes[index];
         const auto& next = request.notes[order[position + 1]];
         if (isRestLyric(next.alias) || next.alias.trim().isEmpty()) continue;
-        const auto* sample = resolveSample(samples, prefixMap, next.alias,
-                                           next.midiNote);
-        if (sample == nullptr) continue;
+        const auto* resolved = resolveSample(voicebank, next.alias, next.midiNote);
+        if (resolved == nullptr) continue;
+        // The next note's own oto, when it has one, is where its lead-in and
+        // overlap come from.
+        std::optional<VoiceSample> own;
+        if (next.oto.enabled)
+            own = withNoteOto(*resolved, next.oto, request.fourRegion,
+                              request.consonantClasses);
+        const auto* sample = own ? &*own : resolved;
         // The same two numbers the renderer and the mixer work from.  An STP
         // moves the entry along the recording and leaves both untouched, so
         // the unshifted entry answers for them.
@@ -1100,8 +1417,7 @@ std::vector<double> crossfadeTails(
             ? next.overlapSeconds : sample->overlap;
         const auto soundStart = next.startSeconds - nextPreutterance;
         const auto noteEnd = note.startSeconds + note.durationSeconds;
-        // Exactly the cases the mixer crossfades.  A splice is capped at this
-        // note's end by the mixer itself, and where the next note starts
+        // Exactly the case the mixer crossfades: where the next note starts
         // sounding after this one has finished there is no crossing at all.
         // Splicing is not an exception here -- it changes the shape of the
         // seam, not where it is, so the same tail must be rendered under it.
@@ -1117,10 +1433,13 @@ std::vector<double> crossfadeTails(
 
 std::string renderedNoteKey(const UtauRenderRequest& request, const VoiceSample& sample,
                             const UtauNoteRenderSpec& note, double effectivePreutterance,
-                            double outputSeconds)
+                            double outputSeconds, double naturalPreutterance,
+                            double naturalOutputSeconds)
 {
     juce::MemoryOutputStream stream;
-    stream.writeInt(13); // Increment when note rendering semantics change.
+    stream.writeInt(14); // Timeline PIT, including the actual lead-in and tail.
+    stream.writeString(encodePitchbend(note, note.bpm > 0.0 ? note.bpm : request.bpm,
+                                      naturalPreutterance, naturalOutputSeconds));
     stream.writeBool(request.fourRegion);
     stream.writeBool(request.consonantClasses);
     stream.writeBool(sample.hasRegions);
@@ -1229,9 +1548,147 @@ void storeRenderedNote(const std::string& key, const RenderedNote& rendered)
 }
 }
 
+juce::String UtauRenderer::diagnosticPitchbend(const UtauNoteRenderSpec& note,
+    double bpm, double preutterance, double outputSeconds)
+{
+    return encodePitchbend(note, bpm, preutterance, outputSeconds);
+}
+
 void UtauRenderer::invalidateVoicebankCache()
 {
     voicebankCacheRevision().fetch_add(1, std::memory_order_relaxed);
+}
+
+juce::String UtauRenderer::hfDaemonInterpreter(const juce::File& engineDirectory)
+{
+    juce::String interpreter = "pythonw";
+    const auto config = engineDirectory.getChildFile("hf_backend").getChildFile("python.txt");
+    if (!config.existsAsFile()) return interpreter;
+    juce::MemoryBlock bytes;
+    config.loadFileAsData(bytes);
+    const auto* data = static_cast<const char*>(bytes.getData());
+    const auto size = static_cast<int>(bytes.getSize());
+    // The engine reads it with fopen, in the local code page; a UTF-8 file is
+    // taken as UTF-8.
+    juce::String text;
+    if (juce::CharPointer_UTF8::isValidString(data, size))
+        text = juce::String::fromUTF8(data, size);
+#if JUCE_WINDOWS
+    else if (size > 0)
+    {
+        const auto wide = MultiByteToWideChar(CP_ACP, 0, data, size, nullptr, 0);
+        std::wstring buffer(static_cast<std::size_t>(std::max(0, wide)), L'\0');
+        if (wide > 0) MultiByteToWideChar(CP_ACP, 0, data, size, buffer.data(), wide);
+        text = juce::String(buffer.c_str());
+    }
+#endif
+    // First line; whitespace off its end and spaces and tabs off its start.
+    auto line = text.upToFirstOccurrenceOf("\n", false, false);
+    while (line.isNotEmpty() && static_cast<juce::juce_wchar>(line.getLastCharacter()) <= ' ')
+        line = line.dropLastCharacters(1);
+    while (line.startsWithChar(' ') || line.startsWithChar('\t'))
+        line = line.substring(1);
+    interpreter = line.isNotEmpty() ? line : juce::String("pythonw");
+    // As the engine does: anything that is neither a drive path nor a UNC path
+    // is taken from the engine's folder -- including a bare "pythonw" written
+    // in the file, which the engine resolves the same way.
+    const auto drive = interpreter.length() >= 2 && interpreter[1] == ':';
+    const auto unc = interpreter.startsWith("\\\\");
+    if (!drive && !unc)
+        interpreter = engineDirectory.getFullPathName() + "\\" + interpreter;
+    return interpreter;
+}
+
+bool UtauRenderer::startHfDaemonIfNeeded(const juce::File& resamplerExecutable, int port)
+{
+    const auto backend = resamplerExecutable.getParentDirectory().getChildFile("hf_backend");
+    const auto script = backend.getChildFile("hf_daemon.py");
+    if (!resamplerExecutable.existsAsFile() || !script.existsAsFile()) return false;
+    {
+        // A connection that says nothing is safe: the daemon answers it with
+        // ERR and goes on serving.
+        juce::StreamingSocket probe;
+        if (probe.connect("127.0.0.1", port, 300)) return false;
+    }
+#if JUCE_WINDOWS
+    const auto interpreter = hfDaemonInterpreter(resamplerExecutable.getParentDirectory());
+    const auto commandText = "\"" + interpreter + "\" \"" + script.getFullPathName() + "\"";
+    std::wstring commandLine(commandText.toWideCharPointer());
+    STARTUPINFOW startup {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process {};
+    // Nothing of this process is handed on: the daemon outlives it, and a
+    // pipe or console it held would stay open for as long as it runs.
+    const auto started = CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE,
+        DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, nullptr,
+        backend.getFullPathName().toWideCharPointer(), &startup, &process);
+    if (!started) return false;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+#else
+    return false;
+#endif
+}
+
+void UtauRenderer::prewarmHfDaemon(const juce::File& resamplerExecutable)
+{
+    juce::Thread::launch([resamplerExecutable]
+    {
+        (void) startHfDaemonIfNeeded(resamplerExecutable);
+    });
+}
+
+bool UtauRenderer::voicebankIndexReady(const juce::File& voicebankDirectory, bool fourRegion,
+                                       bool consonantClasses, std::function<void()> whenReady)
+{
+    auto& cache = indexCache();
+    const auto key = indexKey(voicebankDirectory, fourRegion, consonantClasses);
+    std::shared_future<IndexPointer> pending;
+    std::shared_ptr<std::promise<IndexPointer>> promise;
+    {
+        const std::scoped_lock lock(cache.mutex);
+        if (lookupIndex(cache, key, voicebankDirectory, pending, promise) != nullptr)
+            return true;
+        if (whenReady) cache.entries[key].whenReady.push_back(std::move(whenReady));
+    }
+    if (promise != nullptr)
+        indexReadingPool().addJob([key, voicebankDirectory, fourRegion, consonantClasses, promise]
+        {
+            readVoicebankIndex(key, voicebankDirectory, fourRegion, consonantClasses, *promise);
+        });
+    return false;
+}
+
+int UtauRenderer::diagnosticIndexBuilds()
+{
+    return indexCache().builds.load(std::memory_order_relaxed);
+}
+
+int UtauRenderer::diagnosticMessageThreadWaits()
+{
+    return indexCache().messageThreadWaits.load(std::memory_order_relaxed);
+}
+
+void UtauRenderer::diagnosticRecheckVoicebankFiles()
+{
+    auto& cache = indexCache();
+    const std::scoped_lock lock(cache.mutex);
+    for (auto& [key, entry] : cache.entries) entry.checkedAt = 0.0;
+}
+
+juce::String UtauRenderer::diagnosticResolve(const juce::File& voicebankDirectory,
+                                             const juce::String& alias, float midiNote,
+                                             bool fourRegion, bool consonantClasses,
+                                             bool byScan)
+{
+    const auto voicebank = loadVoicebankIndex(voicebankDirectory, fourRegion, consonantClasses);
+    const auto* sample = byScan
+        ? resolveSampleByScan(voicebank->samples, voicebank->prefixMap, alias, midiNote)
+        : resolveSample(*voicebank, alias, midiNote);
+    if (sample == nullptr) return "none";
+    return sample->file.getFullPathName() + "|" + sample->alias + "|"
+        + juce::String(sample->offset, 6);
 }
 
 UtauRegionSplit UtauRenderer::regionSplit(const std::array<double, 4>& sourceSeconds,
@@ -1479,18 +1936,49 @@ bool UtauRenderer::crossfadesInto(double soundStart, double noteEnd)
     return soundStart <= noteEnd + 1.0e-6;
 }
 
+bool UtauRenderer::sendsFlagCurves(bool fourRegion, bool noteFlagCurve)
+{
+    return fourRegion && noteFlagCurve;
+}
+
+bool UtauRenderer::readsOnlyFirstTwoRegions(bool fourRegion, bool consonantClasses,
+                                            double durationSeconds)
+{
+    return fourRegion && !consonantClasses && durationSeconds <= 1.0e-12;
+}
+
+std::array<double, 4> UtauRenderer::firstTwoRegions(
+    const std::array<double, 4>& regionSeconds)
+{
+    return { regionSeconds[0], regionSeconds[1], 0.0, 0.0 };
+}
+
 std::optional<UtauSampleTiming> UtauRenderer::sampleTiming(
     const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
     int consonantVelocity, bool fourRegion, bool consonantClasses)
 {
-    if (!voicebankDirectory.isDirectory() || alias.trim().isEmpty()
-        || isRestLyric(alias))
-        return std::nullopt;
+    return sampleTiming(voicebankDirectory, alias, midiNote, consonantVelocity,
+                        fourRegion, consonantClasses, nullptr);
+}
+
+std::optional<UtauSampleTiming> UtauRenderer::sampleTiming(
+    const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
+    int consonantVelocity, bool fourRegion, bool consonantClasses,
+    const UtauOtoOverride* noteOto)
+{
+    // No look at the disk here: the cache knows whether the folder is still
+    // there, and asking again for every note was part of what an edit cost.
+    if (alias.trim().isEmpty() || isRestLyric(alias)) return std::nullopt;
     const auto voicebank = loadVoicebankIndex(voicebankDirectory, fourRegion,
                                              consonantClasses);
-    if (const auto* sample = resolveSample(voicebank->samples, voicebank->prefixMap,
-                                           alias, midiNote))
+    if (const auto* resolved = resolveSample(*voicebank, alias, midiNote))
     {
+        // Read on every repaint for every note, so a note without its own oto
+        // is answered from the shared entry and nothing is copied for it.
+        std::optional<VoiceSample> own;
+        if (noteOto != nullptr && noteOto->enabled)
+            own = withNoteOto(*resolved, *noteOto, fourRegion, consonantClasses);
+        const auto* sample = own ? &*own : resolved;
         const auto velocity = headConsonantVelocity(*sample, consonantVelocity);
         const auto scale = consonantVelocityScale(velocity);
         return UtauSampleTiming { adjustedPreutterance(*sample, velocity),
@@ -1507,7 +1995,8 @@ UtauRenderer::ResolvedSample UtauRenderer::resolveVoiceSample(
     const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
     int consonantVelocity, bool fourRegion, bool consonantClasses, double stpSeconds,
     bool preutteranceOverrideEnabled, double preutteranceSecondsOverride,
-    bool overlapOverrideEnabled, double overlapSecondsOverride)
+    bool overlapOverrideEnabled, double overlapSecondsOverride,
+    const UtauOtoOverride* noteOto)
 {
     ResolvedSample resolved;
     if (!voicebankDirectory.isDirectory() || alias.trim().isEmpty()
@@ -1516,11 +2005,13 @@ UtauRenderer::ResolvedSample UtauRenderer::resolveVoiceSample(
     const auto voicebank = loadVoicebankIndex(voicebankDirectory, fourRegion,
                                               consonantClasses);
     const auto* found = ::hachi::backend::resolveSample(
-        voicebank->samples, voicebank->prefixMap, alias, midiNote);
+        *voicebank, alias, midiNote);
     if (found == nullptr) return resolved;
     // STP moves the whole entry inside the recording, exactly as the render
     // path does, so the region read here matches what would be sung.
-    const auto sample = shiftedBy(*found, stpSeconds);
+    const auto entry = noteOto != nullptr && noteOto->enabled
+        ? withNoteOto(*found, *noteOto, fourRegion, consonantClasses) : *found;
+    const auto sample = shiftedBy(entry, stpSeconds);
     const auto velocity = headConsonantVelocity(sample, consonantVelocity);
     resolved.found = true;
     resolved.file = sample.file;
@@ -1560,7 +2051,7 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
     result.buffer.clear();
     std::vector<RenderedNote> renderedNotes(request.notes.size());
     // How much of each note's tail the note after it reaches back into.
-    const auto crossfadeTailSeconds = crossfadeTails(request, samples, prefixMap);
+    const auto crossfadeTailSeconds = crossfadeTails(request, *voicebank);
     std::atomic<std::size_t> nextNote { 0 };
     std::atomic<std::size_t> completedNotes { 0 };
     std::atomic<bool> externalResamplerHealthy {
@@ -1608,14 +2099,40 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
                 }
             }
             else if (const auto* found = resolveSample(
-                         samples, prefixMap, note.alias, note.midiNote))
+                         *voicebank, note.alias, note.midiNote))
             {
                 destination.found = true;
                 // The note's own STP first, and then nothing below knows the
                 // difference: the entry it works from is already the shifted
                 // one, so the arguments, the native path and the cache key all
                 // follow it without a second rule.
-                const auto sample = shiftedBy(*found, note.stpSeconds);
+                // This note's own oto first, when it has one, then its STP:
+                // the STP moves whatever entry the note is sung from.
+                auto sample = shiftedBy(
+                    note.oto.enabled ? withNoteOto(*found, note.oto, request.fourRegion,
+                                                   request.consonantClasses)
+                                     : *found,
+                    note.stpSeconds);
+                // 界: a 拼字 note reads the onset and the glide and nothing
+                // after them.  The recording is cut where the second region
+                // ends, so neither the engine nor the native path has anything
+                // past it to read.  The engine gives a region with no source no
+                // time, so cut there the nucleus and coda take none of the note
+                // without being told separately.  Left whole, all four were
+                // squeezed into what a note of no length sounds, and whatever
+                // lay behind the glide came out at the end of it.
+                if (sample.hasRegions && UtauRenderer::readsOnlyFirstTwoRegions(
+                        request.fourRegion, request.consonantClasses,
+                        note.durationSeconds))
+                {
+                    const auto kept = std::max(0.001,
+                        sample.regionSeconds[0] + sample.regionSeconds[1]);
+                    sample.end = std::min(sample.end, sample.offset + kept);
+                    sample.preutterance = std::min(sample.preutterance,
+                                                   sample.end - sample.offset);
+                    sample.consonant = std::min(sample.consonant,
+                                                sample.end - sample.offset);
+                }
                 // Velocity is applied first.  A per-note Pre value then
                 // stretches/compresses that already velocity-adjusted lead-in
                 // without changing the following vowel/tail duration.
@@ -1637,7 +2154,8 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
                 const auto finalOutputSeconds = std::max(0.03,
                     destination.preutterance + note.durationSeconds + 0.02 + tail);
                 const auto cacheKey = renderedNoteKey(request, sample, note,
-                    destination.preutterance, finalOutputSeconds);
+                    destination.preutterance, finalOutputSeconds,
+                    naturalPreutterance, naturalOutputSeconds);
                 if (restoreRenderedNote(cacheKey, destination))
                 {
                 }
@@ -1673,6 +2191,20 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
                     if (destination.external || !request.resamplerExecutable.existsAsFile())
                         storeRenderedNote(cacheKey, destination);
                 }
+            }
+            else
+            {
+                // A lyric the voicebank has no sample for still sounds: the
+                // piano preview at the note's pitch, so the melody is heard
+                // while the lyric is put right.  It is still reported as
+                // missing below -- that report is what tells a typo from a
+                // note left without a lyric on purpose.
+                destination.found = true;
+                destination.missing = true;
+                destination.piano = true;
+                destination.preutterance = 0.0;
+                destination.overlap = 0.004;
+                destination.audio = renderPianoPreview(note);
             }
             const auto done = completedNotes.fetch_add(1, std::memory_order_relaxed) + 1;
             if (request.progress && !request.notes.empty())
@@ -1715,6 +2247,7 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
             continue;
         }
         if (rendered.rest) continue;
+        if (rendered.missing) ++missingCount;
         if (rendered.piano) ++pianoCount;
         else if (rendered.external) ++externalCount;
         else ++nativeCount;
@@ -1769,13 +2302,45 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
                 }
             }
         }
-        mixNote(result.buffer, rendered.audio, start, rendered.preutterance,
-                envelopeForNoteAsItIs(note.amplitudeEnvelope, rendered.preutterance,
-                                      note.durationSeconds
-                                          + crossfadeTailSeconds[index]),
-                rendered.overlap,
-                note.splice && rendered.overlap > 0.0,
-                sequenceFadeOutStart, sequenceFadeOutSeconds, equalPowerFadeOut);
+        const auto envelope = envelopeForNoteAsItIs(note.amplitudeEnvelope,
+            rendered.preutterance, note.durationSeconds + crossfadeTailSeconds[index]);
+        const auto gain = noteMixGain(rendered.audio.getNumSamples(), start,
+                                      rendered.preutterance, envelope,
+                                      rendered.overlap,
+                                      note.splice && rendered.overlap > 0.0,
+                                      sequenceFadeOutStart, sequenceFadeOutSeconds,
+                                      equalPowerFadeOut);
+        // Handed over before it is mixed, which is the only moment it is
+        // this note's audio and nothing else's, with the very gain the mix
+        // is about to apply, so that what is drawn is shaped as it is heard.
+        if (request.notePiece && rendered.audio.getNumSamples() > 0)
+        {
+            const auto sampleAt = [preutterance = rendered.preutterance](double localSeconds)
+            {
+                return static_cast<int>(std::llround(
+                    (localSeconds + preutterance) * mixSampleRate));
+            };
+            request.notePiece(index, rendered.audio, mixSampleRate, rendered.preutterance,
+                              [&gain, sampleAt](double localSeconds)
+                              {
+                                  return gain.at(sampleAt(localSeconds));
+                              },
+                              [&gain, &envelope, sampleAt](double localSeconds)
+                              {
+                                  // Inside the envelope's span its shape is
+                                  // left out -- that is what the lane's line is
+                                  // there to change.  Outside it the envelope
+                                  // holds its end value, which no point can
+                                  // move, so that part stays: past its last
+                                  // point a piece is silence however it is
+                                  // drawn, and was showing as sound.
+                                  const auto inside = envelope.size() < 2
+                                      || (localSeconds >= envelope.front().timeSeconds
+                                          && localSeconds <= envelope.back().timeSeconds);
+                                  return gain.at(sampleAt(localSeconds), !inside);
+                              });
+        }
+        mixNote(result.buffer, rendered.audio, gain);
     }
     if (request.progress) request.progress(0.98);
     auto peak = 0.0f;
@@ -1801,7 +2366,8 @@ UtauRenderResult UtauRenderer::render(const UtauRenderRequest& request)
     if (missingCount > 0)
     {
         if (result.warning.isNotEmpty()) result.warning += "; ";
-        result.warning += juce::String(missingCount) + " alias(es) were not found";
+        result.warning += juce::String(missingCount)
+            + " alias(es) were not found, played as piano";
     }
     if (request.progress) request.progress(1.0);
     return result;

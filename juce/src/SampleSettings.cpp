@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <atomic>
 #include <map>
+#include <numeric>
 #include <set>
 #include <memory>
 #include <vector>
@@ -21,6 +23,22 @@ namespace hachi
 {
 namespace
 {
+std::atomic<std::uint64_t>& voicebankFilesRevisionCounter()
+{
+    static std::atomic<std::uint64_t> revision { 0 };
+    return revision;
+}
+
+// Wraps every write to a file the voicebank index is read from.  Counted once
+// the write has returned, succeeded or not -- a failed write can still have
+// changed the file -- and never before it, or an index built in between would
+// be filed under the new count while holding the old contents.
+bool voicebankFileWritten(bool result)
+{
+    voicebankFilesRevisionCounter().fetch_add(1, std::memory_order_relaxed);
+    return result;
+}
+
 juce::String csvEscape(const juce::String& value);
 
 juce::String encodeSegments(const std::vector<NativeSegment>& segments)
@@ -69,7 +87,7 @@ juce::String encodeAmplitudeEnvelope(const std::vector<AmplitudeEnvelopePoint>& 
     {
         if (result.isNotEmpty()) result += ";";
         result += juce::String(point.timeSeconds, 9) + "|"
-            + juce::String(point.gainDb, 6);
+            + juce::String(point.gainDb, 6) + "|" + (point.linearToNext ? "1" : "0");
     }
     return result;
 }
@@ -82,7 +100,8 @@ std::vector<AmplitudeEnvelopePoint> decodeAmplitudeEnvelope(const juce::String& 
         const auto values = juce::StringArray::fromTokens(encoded, "|", "");
         if (values.size() < 2) continue;
         result.push_back({ values[0].getDoubleValue(),
-            juce::jlimit(-60.0f, 12.0f, values[1].getFloatValue()) });
+            juce::jlimit(-60.0f, 12.0f, values[1].getFloatValue()),
+            values.size() >= 3 && values[2] == "1" });
     }
     return result;
 }
@@ -248,7 +267,7 @@ bool writeOtoTextPreservingEncoding(const juce::File& file,
         encoded.append(output.toRawUTF8(), output.getNumBytesAsUTF8());
     }
 #endif
-    if (!file.replaceWithData(encoded.getData(), encoded.getSize()))
+    if (!voicebankFileWritten(file.replaceWithData(encoded.getData(), encoded.getSize())))
     {
         error = "Could not write " + file.getFullPathName();
         return false;
@@ -680,7 +699,7 @@ bool SampleSettings::save(const juce::File& audio,
         csv += "\n";
     }
     const auto sidecar = sidecarFor(audio);
-    if (!sidecar.replaceWithText(csv, false, false, "\n"))
+    if (!voicebankFileWritten(sidecar.replaceWithText(csv, false, false, "\n")))
     {
         error = "Could not write " + sidecar.getFullPathName();
         return false;
@@ -809,7 +828,7 @@ bool SampleSettings::exportOto(const juce::File& oto, const juce::File& audio,
     while (out.size() > 0 && out[out.size() - 1].trim().isEmpty())
         out.remove(out.size() - 1);
 
-    if (!oto.replaceWithText(out.joinIntoString("\n") + "\n", false, false, "\n"))
+    if (!voicebankFileWritten(oto.replaceWithText(out.joinIntoString("\n") + "\n", false, false, "\n")))
     {
         error = "Could not write " + oto.getFullPathName();
         return false;
@@ -835,13 +854,13 @@ void appendUnlistedAudio(const juce::File& root,
                         "*.wav;*.flac;*.aif;*.aiff");
     if (audioFiles.isEmpty()) return;
 
-    juce::StringArray described;
+    std::set<juce::String> described;
     for (const auto& entry : entries)
-        described.add(entry.audioFile.getFullPathName().toLowerCase());
+        described.insert(entry.audioFile.getFullPathName().toLowerCase());
 
     for (const auto& file : audioFiles)
     {
-        if (described.contains(file.getFullPathName().toLowerCase())) continue;
+        if (described.count(file.getFullPathName().toLowerCase()) > 0) continue;
         // The row belongs in the oto governing this sample's own folder.  Where
         // there is none, name the file it would be written to so saving can
         // create it rather than failing.
@@ -884,6 +903,11 @@ std::vector<VoicebankOtoEntry> SampleSettings::loadVoicebankOto(
     juce::Array<juce::File> otoFiles;
     root.findChildFiles(otoFiles, juce::File::findFiles, true, "oto.ini");
     otoFiles.sort();
+    // Each entry's oto file relative to the root, which is what the entries
+    // are sorted by first.  Worked out once per file: asked inside the
+    // comparison it was two path computations for every compare, and a
+    // thousand-row bank kept under a long path spent seconds sorting.
+    std::vector<juce::String> otoOrderKeys;
     for (const auto& originalOto : otoFiles)
     {
         const auto jieOto = jieClassicOtoFileFor(originalOto);
@@ -892,6 +916,7 @@ std::vector<VoicebankOtoEntry> SampleSettings::loadVoicebankOto(
         // even before that destination has been seeded.  Saving can therefore
         // never accidentally fall back to the original oto.ini.
         const auto storageOto = jieMode ? jieOto : originalOto;
+        const auto otoOrderKey = storageOto.getRelativePathFrom(root);
         auto malformed = 0;
         const auto otoLines = juce::StringArray::fromLines(decodeOtoText(sourceOto));
         for (int lineIndex = 0; lineIndex < otoLines.size(); ++lineIndex)
@@ -927,21 +952,30 @@ std::vector<VoicebankOtoEntry> SampleSettings::loadVoicebankOto(
             entry.overlapMs = fields[5].trim().getDoubleValue();
             entry.lineIndex = lineIndex;
             entries.push_back(std::move(entry));
+            otoOrderKeys.push_back(otoOrderKey);
         }
         if (malformed > 0)
             warnings.add(sourceOto.getRelativePathFrom(root) + ": "
                          + juce::String(malformed) + " malformed line(s)");
     }
 
-    std::stable_sort(entries.begin(), entries.end(), [&root](const auto& left, const auto& right)
+    std::vector<std::size_t> order(entries.size());
+    std::iota(order.begin(), order.end(), std::size_t { 0 });
+    std::stable_sort(order.begin(), order.end(),
+        [&entries, &otoOrderKeys](std::size_t left, std::size_t right)
     {
-        const auto leftOto = left.otoFile.getRelativePathFrom(root);
-        const auto rightOto = right.otoFile.getRelativePathFrom(root);
-        const auto otoOrder = leftOto.compareNatural(rightOto);
+        const auto otoOrder = otoOrderKeys[left].compareNatural(otoOrderKeys[right]);
         if (otoOrder != 0) return otoOrder < 0;
-        const auto fileOrder = left.sourceName.compareNatural(right.sourceName);
-        return fileOrder != 0 ? fileOrder < 0 : left.alias.compareNatural(right.alias) < 0;
+        const auto fileOrder = entries[left].sourceName.compareNatural(entries[right].sourceName);
+        return fileOrder != 0 ? fileOrder < 0
+                              : entries[left].alias.compareNatural(entries[right].alias) < 0;
     });
+    {
+        std::vector<VoicebankOtoEntry> sorted;
+        sorted.reserve(entries.size());
+        for (const auto index : order) sorted.push_back(std::move(entries[index]));
+        entries = std::move(sorted);
+    }
     if (otoFiles.isEmpty()) warnings.add("No oto.ini found in voicebank directory");
     else if (entries.empty()) warnings.add("No valid oto.ini entries found");
     appendUnlistedAudio(root, otoFiles, jieMode, entries);
@@ -962,7 +996,7 @@ bool SampleSettings::updateVoicebankOtoEntry(const VoicebankOtoEntry& original,
         // listed in Jie mode but never saved.
         const auto sibling = original.otoFile.getParentDirectory().getChildFile("oto.ini");
         if (original.lineIndex >= 0 || !sibling.existsAsFile()
-            || !sibling.copyFileTo(original.otoFile))
+            || !voicebankFileWritten(sibling.copyFileTo(original.otoFile)))
         {
             error = "oto.ini not found: " + original.otoFile.getFullPathName();
             return false;
@@ -1022,6 +1056,11 @@ bool SampleSettings::updateVoicebankOtoEntry(const VoicebankOtoEntry& original,
     return true;
 }
 
+std::uint64_t SampleSettings::voicebankFilesRevision()
+{
+    return voicebankFilesRevisionCounter().load(std::memory_order_relaxed);
+}
+
 juce::File SampleSettings::jieClassicOtoFileFor(const juce::File& otoFile)
 {
     if (otoFile.getFileName().equalsIgnoreCase("oto.jie.ini")) return otoFile;
@@ -1043,7 +1082,7 @@ bool SampleSettings::updateJieVoicebankOtoEntry(const VoicebankOtoEntry& origina
             error = "Original oto.ini not found: " + source.getFullPathName();
             return false;
         }
-        if (!source.copyFileTo(target))
+        if (!voicebankFileWritten(source.copyFileTo(target)))
         {
             error = "Could not create independent Jie oto: " + target.getFullPathName();
             return false;
@@ -1082,7 +1121,7 @@ bool SampleSettings::duplicateVoicebankOtoEntry(const VoicebankOtoEntry& source,
             const auto original = source.otoFile.getFileName().equalsIgnoreCase("oto.jie.ini")
                 ? source.otoFile.getParentDirectory().getChildFile("oto.ini")
                 : source.otoFile;
-            if (!original.existsAsFile() || !original.copyFileTo(target))
+            if (!original.existsAsFile() || !voicebankFileWritten(original.copyFileTo(target)))
             {
                 error = "Could not create independent Jie oto: " + target.getFullPathName();
                 return false;
@@ -1478,7 +1517,8 @@ bool SampleSettings::createJieOto(const juce::File& root, int& written, int& kep
     {
         const juce::File otoFile(group.first);
         const auto independentOto = jieClassicOtoFileFor(otoFile);
-        if (!independentOto.existsAsFile() && !otoFile.copyFileTo(independentOto))
+        if (!independentOto.existsAsFile()
+            && !voicebankFileWritten(otoFile.copyFileTo(independentOto)))
         {
             error = "Could not create independent Jie oto: "
                 + independentOto.getFullPathName();
@@ -1514,7 +1554,7 @@ bool SampleSettings::createJieOto(const juce::File& root, int& written, int& kep
             lines.add(jieRowText(seeded, {}));
             ++written;
         }
-        if (!jieFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n"))
+        if (!voicebankFileWritten(jieFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n")))
         {
             error = "Could not write " + jieFile.getFullPathName();
             return false;
@@ -1611,7 +1651,7 @@ bool SampleSettings::updateMouOtoEntry(const VoicebankOtoEntry& original,
     else
         lines.add(text);
 
-    if (!mouFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n"))
+    if (!voicebankFileWritten(mouFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n")))
     {
         error = "Could not write " + mouFile.getFullPathName();
         return false;
@@ -1697,7 +1737,7 @@ bool SampleSettings::createMouOto(const juce::File& root, int& written, int& kep
             addedHere.insert(key);
             ++written;
         }
-        if (!mouFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n"))
+        if (!voicebankFileWritten(mouFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n")))
         {
             error = "Could not write " + mouFile.getFullPathName();
             return false;
@@ -1740,7 +1780,7 @@ bool SampleSettings::updateJieOtoEntry(const VoicebankOtoEntry& original,
     else
         lines.add(text);
 
-    if (!jieFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n"))
+    if (!voicebankFileWritten(jieFile.replaceWithText(lines.joinIntoString("\n") + "\n", false, false, "\n")))
     {
         error = "Could not write " + jieFile.getFullPathName();
         return false;

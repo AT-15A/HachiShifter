@@ -674,8 +674,9 @@ public:
     {
         if (shouldExit()) return jobHasFinished;
         juce::AudioFormatManager formats;
-        if (request.pitchBackend == PitchRenderBackend::mld5
-            || request.pitchBackend == PitchRenderBackend::mld3
+        // Preserve the local MLD5 renderer for existing projects. This is an
+        // independent experimental renderer, never the official Melodyne provider.
+        if (request.pitchBackend == PitchRenderBackend::mld3
             || request.pitchBackend == PitchRenderBackend::vslib)
         {
             RenderedAudio failure;

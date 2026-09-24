@@ -1,7 +1,9 @@
 #include "OtoWaveformEditorComponent.h"
 #include "backend/UtauRenderer.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace hachi
@@ -34,7 +36,90 @@ juce::String regionName(bool mou, int index)
     return juce::isPositiveAndBelow(index, 4)
         ? utf8(jieRegionNames[static_cast<std::size_t>(index)]) : juce::String{};
 }
+
+// A whole recording, as two channels: a mono file is copied to both, or it
+// would come out of the left speaker only.  Empty when it cannot be read.
+juce::AudioBuffer<float> readRecording(const juce::File& file, double& sampleRate)
+{
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    const std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(file));
+    if (reader == nullptr || reader->sampleRate <= 0.0 || reader->lengthInSamples <= 0
+        || reader->lengthInSamples > std::numeric_limits<int>::max())
+        return {};
+    sampleRate = reader->sampleRate;
+    const auto count = static_cast<int>(reader->lengthInSamples);
+    const auto channels = juce::jlimit(1, 2, static_cast<int>(reader->numChannels));
+    juce::AudioBuffer<float> read(channels, count);
+    read.clear();
+    if (!reader->read(&read, 0, count, 0, true, channels > 1)) return {};
+    juce::AudioBuffer<float> recording(2, count);
+    for (int channel = 0; channel < 2; ++channel)
+        recording.copyFrom(channel, 0, read, std::min(channel, channels - 1), 0, count);
+    return recording;
 }
+}
+
+// A recording, played once from the top at whatever rate the device runs, and
+// silent after its end.  The audio thread only reads the samples and moves the
+// position; the window reads the position back for the playhead, so the
+// position is the one thing the two share.
+class OtoWaveformEditorComponent::SourcePreview final : public juce::AudioSource
+{
+public:
+    SourcePreview(juce::AudioBuffer<float> audio, double rate)
+        : recording(std::move(audio)), recordingRate(rate) {}
+
+    void prepareToPlay(int, double sampleRate) override
+    {
+        step.store(sampleRate > 0.0 ? recordingRate / sampleRate : 1.0);
+    }
+    void releaseResources() override {}
+    void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override
+    {
+        info.clearActiveBufferRegion();
+        render(*info.buffer, info.startSample, info.numSamples);
+    }
+    // Fills up to count samples from startSample and says how many there were
+    // to give.  Past the end nothing is written.
+    int render(juce::AudioBuffer<float>& buffer, int startSample, int count)
+    {
+        const auto length = recording.getNumSamples();
+        const auto advance = step.load();
+        auto at = position.load();
+        auto written = 0;
+        for (; written < count && at < static_cast<double>(length); ++written, at += advance)
+        {
+            const auto left = static_cast<int>(at);
+            const auto right = std::min(length - 1, left + 1);
+            const auto fraction = static_cast<float>(at - left);
+            for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            {
+                const auto* samples = recording.getReadPointer(std::min(channel, 1));
+                buffer.setSample(channel, startSample + written,
+                    samples[left] + (samples[right] - samples[left]) * fraction);
+            }
+        }
+        position.store(at);
+        return written;
+    }
+    // How far in, in seconds.
+    [[nodiscard]] double seconds() const
+    {
+        return std::min(position.load(), static_cast<double>(recording.getNumSamples()))
+            / recordingRate;
+    }
+    [[nodiscard]] bool finished() const
+    {
+        return position.load() >= static_cast<double>(recording.getNumSamples());
+    }
+
+private:
+    const juce::AudioBuffer<float> recording;
+    const double recordingRate;
+    std::atomic<double> position { 0.0 };
+    std::atomic<double> step { 1.0 };
+};
 
 OtoWaveformEditorComponent::WaveformView::WaveformView(
     VoicebankOtoEntry& value, bool jieMode, bool mouMode,
@@ -233,6 +318,18 @@ void OtoWaveformEditorComponent::WaveformView::paint(juce::Graphics& g)
                            static_cast<float>(plot.getY() + 5));
         g.drawText(juce::String(value / 1000.0, 3), static_cast<int>(x) - 28,
                    plot.getBottom() + 2, 56, 16, juce::Justification::centred);
+    }
+
+    // 播放原音: how far the sound has got, over everything else.
+    if (playheadMs)
+    {
+        const auto x = xForMilliseconds(*playheadMs);
+        if (x >= static_cast<float>(plot.getX()) && x <= static_cast<float>(plot.getRight()))
+        {
+            g.setColour(juce::Colours::white);
+            g.drawLine(x, static_cast<float>(plot.getY()), x,
+                       static_cast<float>(plot.getBottom()), 1.5f);
+        }
     }
 }
 
@@ -763,6 +860,13 @@ OtoWaveformEditorComponent::OtoWaveformEditorComponent(
         }
         syncRegionCount();
     }
+    // 播放原音 sits at the other end of the row from Save and Cancel: listening
+    // is not a way of leaving the window.
+    playButton.setButtonText(utf8("播放原音"));
+    playButton.setTooltip(utf8("从头播放这条 oto 所在的整个 wav 原始录音，"
+                               "没经过任何引擎；再点一次停止"));
+    playButton.onClick = [this] { togglePlayback(); };
+    addAndMakeVisible(playButton);
     saveButton.onClick = [this] { save(); };
     addAndMakeVisible(saveButton);
     cancelButton.setButtonText(utf8("取消"));
@@ -825,6 +929,7 @@ void OtoWaveformEditorComponent::resized()
     }
     area.removeFromTop(7);
     auto buttons = area.removeFromBottom(34);
+    playButton.setBounds(buttons.removeFromLeft(112).reduced(0, 2));
     cancelButton.setBounds(buttons.removeFromRight(92).reduced(0, 2));
     buttons.removeFromRight(8);
     saveButton.setBounds(buttons.removeFromRight(142).reduced(0, 2));
@@ -1045,6 +1150,17 @@ void OtoWaveformEditorComponent::commitEditors()
 void OtoWaveformEditorComponent::save()
 {
     commitEditors();
+    if (noteHandoff)
+    {
+        // 单独OTO编辑: the entry goes to one note and nowhere else.  No oto file
+        // is written, and the voicebank's cached entries are left alone,
+        // because nothing about the voicebank has changed.  谋's classes are
+        // in the entry already: the box writes each valid string it holds
+        // straight into it.
+        noteHandoff(edited);
+        closeWindow();
+        return;
+    }
     juce::String error;
     // A from-scratch material is stored natively: the override writes the HJM
     // sidecar and the oto files are left untouched.
@@ -1094,6 +1210,162 @@ void OtoWaveformEditorComponent::save()
     backend::UtauRenderer::invalidateVoicebankCache();
     if (onSaved) onSaved();
     closeWindow();
+}
+
+std::unique_ptr<OtoWaveformEditorComponent> OtoWaveformEditorComponent::forNote(
+    ProjectModel& project, const juce::String& noteId, juce::String& error)
+{
+    const auto data = project.snapshot();
+    const TrackData* owner = nullptr;
+    const NoteData* target = nullptr;
+    for (const auto& track : data.tracks)
+        for (const auto& clip : track.clips)
+            for (const auto& note : clip.notes)
+                if (note.id == noteId) { owner = &track; target = &note; }
+    if (owner == nullptr || target == nullptr) return {};
+    if (owner->pitchAlgorithm != PitchAlgorithm::utau)
+    {
+        error = utf8("单独OTO编辑仅用于 UTAU 轨道。");
+        return {};
+    }
+    if (!owner->voicebankDirectory.isDirectory())
+    {
+        error = utf8("请先为当前轨道选择 UTAU 音源库。");
+        return {};
+    }
+    juce::StringArray warnings;
+    const auto mouMode = owner->utauMode == UtauMode::mou;
+    const auto regions = utauModeUsesRegions(owner->utauMode);
+    const auto entries = SampleSettings::loadVoicebankOto(owner->voicebankDirectory,
+                                                          warnings, regions, mouMode);
+    const auto index = SampleSettings::findEntryForAlias(entries, target->label);
+    if (index < 0)
+    {
+        error = utf8("音源库里没有这个歌词的 oto 条目。");
+        return {};
+    }
+    auto editor = std::make_unique<OtoWaveformEditorComponent>(
+        SampleSettings::entryWithNoteOto(entries[static_cast<std::size_t>(index)],
+                                         target->utauOto),
+        regions, mouMode, [] {});
+    // The project outlives every window opened on it.
+    editor->saveToNoteInstead([&project, noteId, regions](const VoicebankOtoEntry& entry)
+    {
+        project.setNoteUtauOto(noteId, SampleSettings::noteOtoFromEntry(entry, regions));
+    });
+    return editor;
+}
+
+void OtoWaveformEditorComponent::saveToNoteInstead(
+    std::function<void(const VoicebankOtoEntry&)> handoff)
+{
+    noteHandoff = std::move(handoff);
+    saveButton.setButtonText(utf8("应用到此音符"));
+    saveButton.setTooltip(utf8("只作用于这一个音符，不修改 oto 文件"));
+    helpLabel.setText(utf8("单独 OTO：只作用于这一个音符，不修改 oto 文件；数值单位均为 ms"),
+                      juce::dontSendNotification);
+}
+
+OtoWaveformEditorComponent::~OtoWaveformEditorComponent()
+{
+    // Closing the window is how most playing ends: the device must not be left
+    // calling a player that is about to go.
+    stopPlayback();
+}
+
+void OtoWaveformEditorComponent::togglePlayback()
+{
+    if (preview != nullptr) stopPlayback();
+    else startPlayback();
+}
+
+void OtoWaveformEditorComponent::startPlayback()
+{
+    stopPlayback();
+    // The whole recording the entry is cut from, not only 偏移 to 终止: what is
+    // either side of the entry is how you hear where its edges belong.
+    auto rate = 0.0;
+    auto recording = readRecording(edited.audioFile, rate);
+    if (recording.getNumSamples() <= 0) return;
+    if (playbackHost.beforeStart && !playbackHost.beforeStart()) return;
+    juce::AudioDeviceManager* devices = nullptr;
+    if (playbackHost.devices)
+    {
+        devices = playbackHost.devices();
+        if (devices == nullptr) return;
+    }
+    preview = std::make_unique<SourcePreview>(std::move(recording), rate);
+    if (devices != nullptr)
+    {
+        previewPlayer = std::make_unique<juce::AudioSourcePlayer>();
+        previewPlayer->setSource(preview.get());
+        devices->addAudioCallback(previewPlayer.get());
+        previewDevices = devices;
+    }
+    playButton.setButtonText(utf8("停止播放"));
+    waveform.setPlayheadMilliseconds(0.0);
+    startTimerHz(30);
+}
+
+void OtoWaveformEditorComponent::stopPlayback()
+{
+    stopTimer();
+    if (previewDevices != nullptr)
+    {
+        // Only while that device is still there to be told: the window can
+        // outlive whoever handed it over, and the device along with them.
+        if (playbackHost.devices && playbackHost.devices() == previewDevices)
+            previewDevices->removeAudioCallback(previewPlayer.get());
+        previewDevices = nullptr;
+    }
+    if (previewPlayer != nullptr) previewPlayer->setSource(nullptr);
+    previewPlayer.reset();
+    preview.reset();
+    waveform.setPlayheadMilliseconds({});
+    playButton.setButtonText(utf8("播放原音"));
+}
+
+void OtoWaveformEditorComponent::timerCallback()
+{
+    if (preview == nullptr)
+    {
+        stopTimer();
+        return;
+    }
+    if (preview->finished())
+    {
+        stopPlayback();
+        return;
+    }
+    waveform.setPlayheadMilliseconds(preview->seconds() * 1000.0);
+}
+
+int OtoWaveformEditorComponent::diagnosticPullPreview(juce::AudioBuffer<float>& out,
+                                                      double outputRate, double maxSeconds)
+{
+    if (preview == nullptr || outputRate <= 0.0) return 0;
+    constexpr int block = 512;
+    preview->prepareToPlay(block, outputRate);
+    const auto wanted = static_cast<int>(std::llround(maxSeconds * outputRate));
+    juce::AudioBuffer<float> scratch(2, block);
+    auto added = 0;
+    while (preview != nullptr && added < wanted)
+    {
+        const auto count = std::min(block, wanted - added);
+        scratch.clear();
+        const auto produced = preview->render(scratch, 0, count);
+        if (produced > 0)
+        {
+            const auto base = out.getNumSamples();
+            out.setSize(2, base + produced, true, true, false);
+            for (int channel = 0; channel < 2; ++channel)
+                out.copyFrom(channel, base, scratch, channel, 0, produced);
+        }
+        added += produced;
+        timerCallback();
+        if (produced < count) break;
+    }
+    return added;
 }
 
 void OtoWaveformEditorComponent::closeWindow()

@@ -53,6 +53,20 @@ struct UstNote
     // crossfade with the note before it, and p4 usually equals the next note's
     // overlap for the same reason.  p5/v5 add one more point in the middle and
     // are rare; some files write p5 with no v5, which places nothing.
+    // VBR: the seven numbers UTAU writes a vibrato as -- how much of the
+    // note's end it covers (%), one swing (ms), its depth (cents), the fade in
+    // and out (% of the vibrato), the phase it starts at (% of a swing) and
+    // how far the swing's centre is moved off the note's pitch (% of depth).
+    // Files carry an eighth field, which UTAU does not use.
+    bool hasVibrato = false;
+    double vibratoLengthPercent = 0.0;
+    double vibratoCycleMs = 0.0;
+    double vibratoDepthCents = 0.0;
+    double vibratoFadeInPercent = 0.0;
+    double vibratoFadeOutPercent = 0.0;
+    double vibratoPhasePercent = 0.0;
+    double vibratoOffsetPercent = 0.0;
+
     bool hasEnvelope = false;
     double envelopeP1 = 0.0, envelopeP2 = 0.0, envelopeP3 = 0.0;
     double envelopeP4 = 0.0;
@@ -84,10 +98,18 @@ public:
 
     // A UST is written in whatever code page the machine that saved it used;
     // UTAU itself reads them that way.  Newer tools write UTF-8.  Valid UTF-8
-    // is taken as UTF-8, and anything else as the local code page, which is
-    // the best a file with no declared encoding allows.
+    // is taken as UTF-8.  Anything else is read in the local code page and in
+    // Shift-JIS -- and on a Chinese or Japanese machine in GBK too -- and the
+    // reading with the most kana wins: a Japanese file opened on a Chinese
+    // machine, read in the local code page alone, turned every kana into a
+    // rare hanzi.  With no kana either way, the local code page, as before.
     [[nodiscard]] static juce::String decode(const juce::MemoryBlock& bytes,
                                              juce::String& encodingUsed);
+    // The same, as a machine whose code page is localCodePage would read it,
+    // which decides the readings tried.  So a check can be every machine.
+    [[nodiscard]] static juce::String decode(const juce::MemoryBlock& bytes,
+                                             juce::String& encodingUsed,
+                                             int localCodePage);
 
     [[nodiscard]] static std::optional<UstProject> read(const juce::File& file,
                                                         juce::String& error,

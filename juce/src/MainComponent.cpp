@@ -81,27 +81,45 @@ void EnvelopePresetButton::paintButton(juce::Graphics& g, bool highlighted, bool
         findColour(juce::TextButton::buttonColourId), highlighted, down);
 
     auto area = getLocalBounds().toFloat().reduced(4.0f, 3.0f);
-    const auto captionHeight = caption.isEmpty() ? 0.0f : 11.0f;
+    const auto captionHeight = preset.name.isEmpty() ? 0.0f : 11.0f;
     auto plot = area.removeFromTop(std::max(8.0f, area.getHeight() - captionHeight));
 
     // The ramps keep their true ratio to each other but not to the note: a 5 ms
     // attack against a note of any real length would be a fraction of a pixel.
-    // Together they take a fixed share of the width, so the four presets are
-    // told apart by the same thing that distinguishes them in use.
-    const auto ramps = std::max(1.0e-6, attackSeconds + releaseSeconds);
+    // Together they take a fixed share of the width, so the presets are told
+    // apart by the same thing that distinguishes them in use.  A stretch hangs
+    // from the side of the note it is measured from -- the start, or the beat
+    // drawn a nominal 60 ms in, on the left; the end on the right -- and the one
+    // joining the two sides is the hold, which takes up the rest.
+    using From = PianoRollComponent::EnvelopePresetPoint::From;
+    constexpr auto nominalLeadIn = 0.06;
+    struct Knot { double seconds; bool fromEnd; float gainDb; };
+    std::vector<Knot> knots { { 0.0, false, -60.0f } };
+    for (const auto& point : preset.points)
+        knots.push_back({ point.from == From::beat ? nominalLeadIn + point.seconds
+                                                   : point.seconds,
+                          point.from == From::soundEnd, point.gainDb });
+    knots.push_back({ 0.0, true, -60.0f });
+    auto rampSeconds = 0.0;
+    for (std::size_t index = 1; index < knots.size(); ++index)
+        if (knots[index - 1].fromEnd == knots[index].fromEnd)
+            rampSeconds += std::abs(knots[index].seconds - knots[index - 1].seconds);
     const auto rampWidth = plot.getWidth() * 0.62f;
-    const auto attackWidth = rampWidth * static_cast<float>(attackSeconds / ramps);
-    const auto releaseWidth = rampWidth - attackWidth;
-    const auto floorY = plot.getBottom();
-    const auto peakY = plot.getY();
-    const auto holdEnd = peakY + (floorY - peakY)
-        * (1.0f - std::pow(10.0f, plateauEndDb / 20.0f));
+    const auto scale = rampWidth / static_cast<float>(std::max(1.0e-6, rampSeconds));
 
     juce::Path shape;
-    shape.startNewSubPath(plot.getX(), floorY);
-    shape.lineTo(plot.getX() + attackWidth, peakY);
-    shape.lineTo(plot.getRight() - releaseWidth, holdEnd);
-    shape.lineTo(plot.getRight(), floorY);
+    for (std::size_t index = 0; index < knots.size(); ++index)
+    {
+        const auto& knot = knots[index];
+        const auto x = knot.fromEnd
+            ? plot.getRight() - scale * static_cast<float>(knot.seconds)
+            : plot.getX() + scale * static_cast<float>(knot.seconds);
+        const auto level = knot.gainDb <= -59.9f ? 0.0f
+                                                 : std::pow(10.0f, knot.gainDb / 20.0f);
+        const auto y = plot.getBottom() - (plot.getBottom() - plot.getY()) * level;
+        if (index == 0) shape.startNewSubPath(x, y);
+        else shape.lineTo(x, y);
+    }
     shape.closeSubPath();
 
     const auto tint = juce::Colour(0xff72d6aa);
@@ -110,12 +128,12 @@ void EnvelopePresetButton::paintButton(juce::Graphics& g, bool highlighted, bool
     g.setColour(tint.withAlpha(highlighted || down ? 1.0f : 0.85f));
     g.strokePath(shape, juce::PathStrokeType(1.3f));
 
-    if (caption.isNotEmpty())
+    if (preset.name.isNotEmpty())
     {
         g.setColour(findColour(juce::TextButton::textColourOffId)
                         .withAlpha(highlighted || down ? 1.0f : 0.8f));
         g.setFont(9.5f);
-        g.drawText(caption, area, juce::Justification::centred, false);
+        g.drawText(preset.name, area, juce::Justification::centred, false);
     }
 }
 
@@ -127,7 +145,8 @@ MainComponent::MainComponent()
     juce::PropertiesFile::Options options;
     options.applicationName = "HachiShifterNext";
     options.filenameSuffix = "settings";
-    options.folderName = "HachiShifterNext";
+    options.folderName = juce::SystemStats::getEnvironmentVariable(
+        "HACHI_TEST_SETTINGS_DIR", "HachiShifterNext");
     options.osxLibrarySubFolder = "Application Support";
     options.storageFormat = juce::PropertiesFile::storeAsXML;
     preferences = std::make_unique<juce::PropertiesFile>(options);
@@ -643,6 +662,10 @@ MainComponent::MainComponent()
     {
         showRegionEditorForNote(noteId);
     };
+    pianoRoll.onOpenNoteOtoEditor = [this](const juce::String& noteId)
+    {
+        showNoteOtoEditorForNote(noteId);
+    };
     pianoRoll.onNoteAliasCommitted = [this](const juce::String& noteId)
     {
         prepareUtauTrackForNote(noteId);
@@ -738,6 +761,9 @@ MainComponent::MainComponent()
 
     project.addChangeListener(this);
     audio.addChangeListener(this);
+    // Opening a project read its whole voicebank before the window could draw
+    // again: 0.8 s for a thousand-sample bank, several on a cold disk.
+    pianoRoll.setReadsVoicebankInBackground(true);
     // MenuBarComponent caches its labels when the model is attached. Attach
     // only after applyPreferences() restores the saved application language.
     menuBar.setModel(this);
@@ -807,6 +833,10 @@ void MainComponent::applyPreferences()
     // AudioEngine, which is also where the headless path picks it up.
     audio.setUtauResamplerFile(juce::File(
         preferences->getValue("algorithm.utauResampler").trim().unquoted()));
+    // The HF daemon takes 10-20 s to load its model.  Started now, that wait
+    // is over by the time anything is played rather than spent on the first
+    // HF note.
+    backend::UtauRenderer::prewarmHfDaemon(audio.currentUtauResamplerFile());
     const auto tracks = project.snapshot().tracks;
     for (const auto& track : tracks)
         if (track.pitchAlgorithm == PitchAlgorithm::utau
@@ -833,6 +863,11 @@ void MainComponent::applyPreferences()
     // settings change appear ineffective.
     syncAudio(project.snapshot());
     lookAndFeel.refreshColours();
+    for (auto* editor : { &bpmEditor, &beatsEditor })
+    {
+        editor->setColour(juce::Label::backgroundColourId, Palette::background);
+        editor->setColour(juce::Label::outlineColourId, Palette::grid);
+    }
     // A theme switch changes the shared Palette; components that cached a
     // Palette colour through setColour (labels, editors) must re-apply it or
     // they keep the previous theme's colour and, in light mode, draw a pale
@@ -943,39 +978,35 @@ void MainComponent::refreshTexts()
     // Opens on press rather than release, the way a dropdown does.
     showViewMenuButton.setTriggeredOnMouseDown(true);
     showViewMenuButton.onClick = [this] { showViewMenu(); };
-    // Attack, release and the gain the hold ends on.  These are the four
-    // commonest Envelope fields across real USTs rather than round numbers:
-    // 0,5,35 is UTAU's own default, then a decaying hold, a softer attack and
-    // a short tail.
-    struct EnvelopePreset { const char* text; const char* tip;
-                            double attack; double release; float plateauEnd; };
-    static const std::array<EnvelopePreset, 4> presets {{
-        { "标准", "起音 5 ms，释放 35 ms（UTAU 默认）", 0.005, 0.035, 0.0f },
-        { "渐弱", "起音 5 ms，释放 35 ms，平台末尾降到 90%", 0.005, 0.035, -0.92f },
-        { "柔起", "起音 15 ms，释放 35 ms", 0.015, 0.035, 0.0f },
-        { "短收", "起音 5 ms，释放 5 ms", 0.005, 0.005, 0.0f }
-    }};
     envelopePresetCaption.setText(utf8("包络预设"), juce::dontSendNotification);
     envelopePresetCaption.setJustificationType(juce::Justification::centredRight);
     addAndMakeVisible(envelopePresetCaption);
+    // One button per preset, in the order the roll lists them.  Texts are
+    // refreshed again every time the settings close, so the buttons are made
+    // the first time only and given their text every time.
+    const auto& presets = PianoRollComponent::envelopePresets();
+    if (envelopePresetButtons.empty())
+        for (const auto& preset : presets)
+        {
+            auto button = std::make_unique<EnvelopePresetButton>();
+            // The list is static, so the preset outlives every button made
+            // from it.
+            button->onClick = [this, &preset]
+            {
+                const auto count = pianoRoll.applyEnvelopePreset(preset);
+                if (count > 0)
+                    statusLabel.setText(utf8("包络预设：") + juce::String(count)
+                        + utf8(" 个音符"), juce::dontSendNotification);
+                else
+                    showError(utf8("先选中要套用预设的音符。"));
+            };
+            addAndMakeVisible(*button);
+            envelopePresetButtons.push_back(std::move(button));
+        }
     for (std::size_t index = 0; index < presets.size(); ++index)
     {
-        const auto& preset = presets[index];
-        auto& button = envelopePresetButtons[index];
-        button.configure(utf8(preset.text), preset.attack, preset.release,
-                         preset.plateauEnd);
-        button.setTooltip(utf8(preset.tip));
-        button.onClick = [this, preset]
-        {
-            const auto count = pianoRoll.applyEnvelopePreset(
-                preset.attack, preset.release, preset.plateauEnd);
-            if (count > 0)
-                statusLabel.setText(utf8("包络预设：") + juce::String(count)
-                    + utf8(" 个音符"), juce::dontSendNotification);
-            else
-                showError(utf8("先选中要套用预设的音符。"));
-        };
-        addAndMakeVisible(button);
+        envelopePresetButtons[index]->configure(presets[index]);
+        envelopePresetButtons[index]->setTooltip(presets[index].tip);
     }
     spliceButton.setButtonText(utf8("强制连接"));
     spliceButton.setTooltip(utf8("把选中的音符连接为一条可渲染的原生边界；"
@@ -984,7 +1015,8 @@ void MainComponent::refreshTexts()
     spliceButton.setEnabled(false);
     flagCurveButton.setButtonText(utf8("线性flag"));
     flagCurveButton.setTooltip(utf8("让选中音符的 g 随时间连续变化，改由 flag 包络里的曲线决定；"
-                                     "Flags 里写的 g 在开启期间不再起作用，其它 flag 照常"));
+                                     "Flags 里写的 g 在开启期间不再起作用，其它 flag 照常。"
+                                     "只有界•UTAU 与谋•UTAU 有这个功能，普通 UTAU 模式下不可用"));
     flagCurveButton.setClickingTogglesState(true);
     flagCurveButton.setEnabled(false);
     flagCurveButton.onClick = [this]
@@ -1006,7 +1038,8 @@ void MainComponent::refreshTexts()
         refreshSelectedNoteParameter();
     };
     flagEnvelopeButton.setButtonText(utf8("flag 包络"));
-    flagEnvelopeButton.setTooltip(utf8("在底部通道里画 g 的渐变曲线；先对该音符开启线性 flag"));
+    flagEnvelopeButton.setTooltip(utf8("在底部通道里画 g 的渐变曲线；先对该音符开启线性 flag"
+                                        "（界•UTAU 与谋•UTAU 模式）"));
     flagEnvelopeButton.setEnabled(false);
     flagEnvelopeButton.onClick = [this]
     {
@@ -1090,6 +1123,36 @@ void MainComponent::refreshProjectControls()
     resized();
 }
 
+bool MainComponent::selectedTrackIsUtau() const
+{
+    // The picker and the track itself both: every UTAU mode shows in the
+    // picker, and the track is what the conversion is going to change.
+    if (!isUtauAlgorithmSelected()) return false;
+    const auto data = project.snapshot();
+    return std::any_of(data.tracks.begin(), data.tracks.end(), [this](const auto& track)
+    {
+        return track.id == selectedTrackId && track.pitchAlgorithm == PitchAlgorithm::utau;
+    });
+}
+
+std::optional<bool> MainComponent::diagnosticEditMenuItemEnabled(int itemId)
+{
+    auto menu = getMenuForIndex(1, {});
+    for (juce::PopupMenu::MenuItemIterator item(menu); item.next();)
+        if (item.getItem().itemID == itemId) return item.getItem().isEnabled;
+    return std::nullopt;
+}
+
+void MainComponent::diagnosticChooseMenuItem(int itemId)
+{
+    menuItemSelected(itemId, 1);
+}
+
+void MainComponent::diagnosticSelectTrack(const juce::String& trackId)
+{
+    if (trackList.onTrackSelected) trackList.onTrackSelected(trackId);
+}
+
 bool MainComponent::isUtauAlgorithmSelected() const
 {
     // Every UTAU mode, not just the two that existed first: the whole UTAU
@@ -1106,6 +1169,8 @@ void MainComponent::refreshSelectedNoteParameter()
     const auto selectedIds = pianoRoll.selectedNoteIds();
     std::vector<NoteData> selectedNotes;
     std::vector<int> selectedNoteConsonantVelocities;
+    // Whether every selected note is on a track that can carry a 线性flag.
+    auto flagCurvesOnSelection = true;
     selectedNotes.reserve(selectedIds.size());
     selectedNoteConsonantVelocities.reserve(selectedIds.size());
     for (const auto& track : data.tracks)
@@ -1120,6 +1185,8 @@ void MainComponent::refreshSelectedNoteParameter()
                         note.utauConsonantVelocity != inheritedUtauConsonantVelocity
                             ? note.utauConsonantVelocity
                             : track.utauConsonantVelocity);
+                    flagCurvesOnSelection = flagCurvesOnSelection
+                        && trackTakesFlagCurves(track);
                 }
                 if (note.id == selectedNoteId)
                 {
@@ -1200,9 +1267,11 @@ void MainComponent::refreshSelectedNoteParameter()
     const auto allFlagCurve = !selectedNotes.empty()
         && std::all_of(selectedNotes.begin(), selectedNotes.end(),
             [](const auto& note) { return note.utauFlagCurveEnabled; });
-    flagCurveButton.setEnabled(!selectedNotes.empty());
+    // 线性flag is a 界/谋 feature: on a plain UTAU track the switch is dead, and
+    // so is the lane it opens.
+    flagCurveButton.setEnabled(!selectedNotes.empty() && flagCurvesOnSelection);
     flagCurveButton.setToggleState(allFlagCurve, juce::dontSendNotification);
-    flagEnvelopeButton.setEnabled(anyFlagCurve);
+    flagEnvelopeButton.setEnabled(anyFlagCurve && flagCurvesOnSelection);
     if (!noteAliasEditor.hasKeyboardFocus(false))
         noteAliasEditor.setText(multipleNotes ? juce::String::fromUTF8("×")
             : found ? selected.label : juce::String{}, false);
@@ -1514,10 +1583,61 @@ void MainComponent::showRegionEditorForNote(const juce::String& noteId)
     options.escapeKeyTriggersCloseButton = true;
     options.useNativeTitleBar = true;
     options.resizable = true;
-    options.content.setOwned(new OtoWaveformEditorComponent(
-        entry, utauModeUsesRegions(owner->utauMode), mouMode, [] {}));
+    auto* editor = new OtoWaveformEditorComponent(
+        entry, utauModeUsesRegions(owner->utauMode), mouMode, [] {});
+    attachOtoPlayback(*editor);
+    options.content.setOwned(editor);
     if (auto* window = options.launchAsync())
         window->setResizeLimits(720, 400, 1800, 1100);
+}
+
+void MainComponent::showNoteOtoEditorForNote(const juce::String& noteId)
+{
+    juce::String error;
+    auto editor = OtoWaveformEditorComponent::forNote(project, noteId, error);
+    if (editor == nullptr)
+    {
+        if (error.isNotEmpty()) showError(error);
+        return;
+    }
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = utf8("单独OTO编辑（只作用于此音符） — ")
+        + editor->originalEntry().sourceName;
+    options.dialogBackgroundColour = Palette::panel;
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = true;
+    attachOtoPlayback(*editor);
+    options.content.setOwned(editor.release());
+    if (auto* window = options.launchAsync())
+        window->setResizeLimits(720, 400, 1800, 1100);
+}
+
+void MainComponent::attachOtoPlayback(OtoWaveformEditorComponent& editor)
+{
+    // The window can outlive this component, so every call asks first.
+    juce::Component::SafePointer<MainComponent> safe(this);
+    OtoWaveformEditorComponent::PlaybackHost host;
+    host.devices = [safe]() -> juce::AudioDeviceManager*
+    {
+        return safe != nullptr ? &safe->audio.devices() : nullptr;
+    };
+    host.beforeStart = [safe]
+    {
+        if (safe == nullptr) return false;
+        // Hearing the recording is not hearing the song: the song stops rather
+        // than playing on underneath it.
+        safe->playWhenRenderReady = false;
+        if (safe->audio.isPlaying()) safe->audio.stop();
+        juce::String deviceError;
+        if (!safe->audio.ensureOutputDevice(deviceError))
+        {
+            safe->showError(safe->strings.text("settings.noAudioDevice") + "\n" + deviceError);
+            return false;
+        }
+        return true;
+    };
+    editor.setPlaybackHost(std::move(host));
 }
 
 bool MainComponent::bindDefaultUtauVoicebank(const juce::String& trackId)
@@ -1840,7 +1960,7 @@ void MainComponent::deleteSelectedClip()
         [this, clipId] { project.removeClip(clipId); });
 }
 
-void MainComponent::showTrackAreaMenu(juce::Point<int> screenPosition)
+juce::PopupMenu MainComponent::trackAreaMenu()
 {
     juce::PopupMenu menu;
     menu.setLookAndFeel(&getLookAndFeel());
@@ -1848,22 +1968,129 @@ void MainComponent::showTrackAreaMenu(juce::Point<int> screenPosition)
     // Somewhere to keep a reference vocal or a backing take: audible while it
     // is the track in hand, silent whenever anything else is playing.
     menu.addItem(3, strings.text("track.newReference"));
+    menu.addItem(importMidiTrackMenuItem, strings.text("track.importMidi"));
     // Named for the selected track rather than for the click, because the
     // click landed on the space between tracks and points at none of them --
     // and a right-click there deliberately leaves the selection alone.
     menu.addItem(2, strings.text("track.delete"), selectedTrackId.isNotEmpty());
-    menu.showMenuAsync(
+    return menu;
+}
+
+void MainComponent::trackAreaMenuItemChosen(int chosen)
+{
+    // A melodic track, which is what the app makes by default and what
+    // ProjectModel::addTrack assumes; the Track menu still offers the audio
+    // kind explicitly for the times that is not what is wanted.
+    if (chosen == 1) addTrackFromMenu(true);
+    else if (chosen == 3) addReferenceTrackFromMenu();
+    else if (chosen == importMidiTrackMenuItem) importMidiTrack();
+    else if (chosen == 2) deleteSelectedTrack();
+}
+
+void MainComponent::showTrackAreaMenu(juce::Point<int> screenPosition)
+{
+    trackAreaMenu().showMenuAsync(
         juce::PopupMenu::Options().withTargetScreenArea(
             juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1)),
-        [this](int chosen)
+        [this](int chosen) { trackAreaMenuItemChosen(chosen); });
+}
+
+std::vector<MainComponent::MenuItemState> MainComponent::diagnosticTrackAreaMenu()
+{
+    std::vector<MenuItemState> items;
+    auto menu = trackAreaMenu();
+    for (juce::PopupMenu::MenuItemIterator item(menu); item.next();)
+        if (item.getItem().itemID != 0)
+            items.push_back({ item.getItem().itemID, item.getItem().text, item.getItem().isEnabled });
+    return items;
+}
+
+void MainComponent::importMidiTrack()
+{
+    chooser = std::make_unique<juce::FileChooser>(strings.text("track.importMidi"), juce::File{},
+                                                  "*.mid;*.midi");
+    chooser->launchAsync(juce::FileBrowserComponent::openMode
+                             | juce::FileBrowserComponent::canSelectFiles,
+        [this](const juce::FileChooser& selected)
         {
-            // A melodic track, which is what the app makes by default and what
-            // ProjectModel::addTrack assumes; the Track menu still offers the
-            // audio kind explicitly for the times that is not what is wanted.
-            if (chosen == 1) addTrackFromMenu(true);
-            else if (chosen == 3) addReferenceTrackFromMenu();
-            else if (chosen == 2) deleteSelectedTrack();
+            const auto file = selected.getResult();
+            if (file != juce::File{}) importMidiTrackFrom(file);
         });
+}
+
+void MainComponent::importMidiTrackFrom(const juce::File& file)
+{
+    juce::String error;
+    const auto choices = ProjectModel::midiTrackChoices(file, error);
+    if (choices.empty())
+    {
+        showError(strings.text("error.midi") + "\n" + error);
+        return;
+    }
+    // One track with notes -- a type 0 file, or a type 1 file whose other
+    // track only holds the tempo -- leaves nothing to ask.
+    if (choices.size() == 1)
+    {
+        addMidiTrackFrom(file, choices.front().index);
+        return;
+    }
+    // By the name the track gives itself; one without a name by its place in
+    // the file, which counts the tempo track too, as a sequencer shows it.
+    juce::StringArray labels;
+    for (const auto& choice : choices)
+        labels.add((choice.name.isNotEmpty()
+                        ? choice.name
+                        : strings.text("dialog.midiTrackLabel") + " " + juce::String(choice.index + 1))
+                   + "  (" + juce::String(choice.noteCount) + " "
+                   + strings.text("dialog.midiTrackNotes") + ")");
+    auto* dialog = new juce::AlertWindow(strings.text("dialog.midiTrackTitle"),
+        file.getFileName() + "\n" + strings.text("dialog.midiTrackMessage"),
+        juce::MessageBoxIconType::QuestionIcon);
+    dialog->addComboBox("track", labels, strings.text("dialog.midiTrackLabel"));
+    if (auto* box = dialog->getComboBoxComponent("track")) box->setSelectedItemIndex(0);
+    dialog->addButton(strings.text("dialog.import"), 1,
+                      juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton(strings.text("dialog.cancel"), 0,
+                      juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<MainComponent> safe(this);
+    dialog->enterModalState(true,
+        juce::ModalCallbackFunction::create(
+            [safe, dialog, file, choices](int result)
+            {
+                const auto* box = dialog->getComboBoxComponent("track");
+                const auto picked = box != nullptr ? box->getSelectedItemIndex() : -1;
+                if (safe != nullptr && result == 1 && picked >= 0
+                    && picked < static_cast<int>(choices.size()))
+                    safe->addMidiTrackFrom(file, choices[static_cast<std::size_t>(picked)].index);
+                delete dialog;
+            }), false);
+}
+
+void MainComponent::addMidiTrackFrom(const juce::File& file, int trackIndex)
+{
+    juce::String error;
+    const auto trackId = project.addMidiTrack(file, trackIndex, error);
+    if (trackId.isEmpty())
+    {
+        showError(strings.text("error.midi") + "\n" + error);
+        return;
+    }
+    // Show what was just imported, as a UST import does.
+    selectedTrackId = trackId;
+    trackList.setSelectedTrack(trackId);
+    selectedNoteId.clear();
+    pianoRoll.clearNoteSelection();
+    const auto data = project.snapshot();
+    for (const auto& track : data.tracks)
+        if (track.id == trackId)
+        {
+            if (!track.clips.empty()) focusClip(track.clips.front().id);
+            statusLabel.setText(strings.text("status.midiTrackImported") + track.name,
+                                juce::dontSendNotification);
+            break;
+        }
+    refreshProjectControls();
+    menuItemsChanged();
 }
 
 void MainComponent::refreshStretchAlgorithmItems(int preferredId)
@@ -1906,6 +2133,76 @@ PianoRollComponent::Tool MainComponent::diagnosticTool() const
 void MainComponent::diagnosticRefreshControls()
 {
     refreshProjectControls();
+}
+
+MainComponent::EnvelopePresetLayout MainComponent::diagnosticEnvelopePresetLayout()
+{
+    // UTAU in the picker, which is what the row keys its UTAU tools off, and
+    // the row laid out again.
+    pitchAlgorithm.setSelectedId(7, juce::dontSendNotification);
+    resized();
+    EnvelopePresetLayout layout;
+    for (const auto& button : envelopePresetButtons)
+        if (button->isVisible())
+            layout.buttons.emplace_back(button->caption(), button->getBounds());
+    layout.viewMenu = showViewMenuButton.getBounds();
+    layout.rightControlsStart = pianoViewport.getRight() - 4;
+    return layout;
+}
+
+void MainComponent::diagnosticRefreshTexts()
+{
+    refreshTexts();
+}
+
+bool MainComponent::diagnosticIntegratedLayout(const juce::File& directory)
+{
+    directory.createDirectory();
+    const auto id = project.addTrack("Integrated UTAU", true);
+    project.setTrackPitchAlgorithm(id, PitchAlgorithm::utau);
+    const auto clip = project.addClip(id, 0.0, 4.0);
+    for (int i = 0; i < 6; ++i)
+    {
+        const auto note = project.addNote(clip, 0.5 + i * 0.5, 0.5, 60.0f + (i % 3) * 2.0f);
+        project.setNoteLabel(note, "a");
+    }
+    project.dispatchPendingMessages();
+    pianoRoll.diagnosticRefresh();
+    diagnosticSelectTrack(id);
+    if (!assetManagerVisible) showAssetManager();
+    auto ok = true;
+    for (const auto& theme : { juce::String("dark"), juce::String("light") })
+    {
+        preferences->setValue("ui.theme", theme);
+        applyPreferences();
+        refreshTexts();
+        for (const auto width : { 1280, 1600 })
+        {
+            setSize(width, 800);
+            diagnosticSelectTrack(id);
+            resized();
+            const auto edge = assetManager->getX();
+            auto right = 0;
+            for (const auto& button : envelopePresetButtons)
+            {
+                ok = ok && button->isVisible() && button->getWidth() == 46
+                    && button->getX() >= right && button->getRight() <= edge;
+                right = button->getRight();
+            }
+            ok = ok && showViewMenuButton.getX() >= right
+                && showViewMenuButton.getRight() <= edge
+                && flagCurveButton.getRight() <= edge && flagCurveButton.getWidth() > 0;
+            auto file = directory.getChildFile("integrated-" + theme + "-" + juce::String(width) + ".png");
+            file.deleteFile();
+            if (auto stream = file.createOutputStream())
+            {
+                juce::PNGImageFormat png;
+                ok = png.writeImageToStream(createComponentSnapshot(getLocalBounds()), *stream) && ok;
+            }
+            else ok = false;
+        }
+    }
+    return ok;
 }
 
 bool MainComponent::diagnosticRenderOrderPicker()
@@ -2296,7 +2593,7 @@ void MainComponent::resized()
     constexpr auto modeEditorHeight = 36;
     const auto sampleEditorHeight = sourceEditActive ? 36 : 0;
     const auto splitAvailable = std::max(1, area.getHeight() - 8 - 36
-        - sampleEditorHeight - modeEditorHeight);
+        - sampleEditorHeight - modeEditorHeight - 36);
     // Folded away, the arrangement takes no room at all and the splitter goes
     // with it -- there is nothing left above to drag against.
     const auto upperHeight = tracksCollapsed ? 0
@@ -2376,7 +2673,13 @@ void MainComponent::resized()
     parameterHeader.removeFromLeft(5);
     takeParameter(verticalZoomOutButton, 30);
     takeParameter(verticalZoomInButton, 30);
-    // The common row ends with the view menu and optional robust-pitch toggle.
+    auto expressionBar = area.removeFromTop(36).reduced(4, 3);
+    const auto takeExpression = [&expressionBar](juce::Component& component, int width)
+    {
+        component.setBounds(expressionBar.removeFromLeft(width));
+        expressionBar.removeFromLeft(3);
+    };
+    // Keep the complete local envelope controls on their own row.
     // Parameter controls are placed in the mode row below, not mixed into the
     // tool row, so both modes retain the same tool geometry.
     for (auto* component : { static_cast<juce::Component*>(&smoothCaption),
@@ -2387,17 +2690,40 @@ void MainComponent::resized()
          static_cast<juce::Component*>(&breathParamButton),
          static_cast<juce::Component*>(&tensionParamButton),
          static_cast<juce::Component*>(&formantParamButton),
-         static_cast<juce::Component*>(&volumeParamButton),
-         static_cast<juce::Component*>(&flagEnvelopeButton),
-         static_cast<juce::Component*>(&envelopePresetCaption) })
-        component->setVisible(false);
-    for (auto& button : envelopePresetButtons) button.setVisible(false);
+         static_cast<juce::Component*>(&volumeParamButton) })
+        component->setVisible(!utauEditorActive);
+    volumeParamButton.setVisible(true);
+    if (!utauEditorActive)
+    {
+        takeExpression(smoothCaption, 42);
+        takeExpression(smoothSlider, 118);
+        takeExpression(pitchParamButton, 50);
+        takeExpression(driftParamButton, 50);
+        takeExpression(attackParamButton, 50);
+        takeExpression(breathParamButton, 50);
+        takeExpression(tensionParamButton, 50);
+        takeExpression(formantParamButton, 50);
+        takeExpression(volumeParamButton, 50);
+    }
+    else
+    {
+        takeExpression(volumeParamButton, 78);
+        takeExpression(flagEnvelopeButton, 78);
+    }
+    flagEnvelopeButton.setVisible(utauEditorActive);
+    envelopePresetCaption.setVisible(utauEditorActive);
+    if (utauEditorActive) takeExpression(envelopePresetCaption, 60);
+    for (auto& button : envelopePresetButtons)
+    {
+        button->setVisible(utauEditorActive);
+        if (utauEditorActive) takeExpression(*button, 46);
+    }
     // After the envelope presets, at the end of the row, as asked.  That puts
     // it past the controls that come and go with the mode, so unlike before it
     // does not sit at a fixed x.
-    takeParameter(showViewMenuButton, 72);
+    takeExpression(showViewMenuButton, 72);
     if (robustPitchCurveButton.isVisible())
-        takeParameter(robustPitchCurveButton, 74);
+        takeExpression(robustPitchCurveButton, 74);
     sourceEditHint.setBounds(parameterHeader.reduced(3, 0));
     auto sampleBar = area.removeFromTop(sampleEditorHeight).reduced(4, 3);
     auto setSampleVisible = [this](bool visible)
@@ -2448,11 +2774,13 @@ void MainComponent::resized()
             component.setBounds(modeBar.removeFromLeft(width));
             modeBar.removeFromLeft(4);
         };
-        takeUtau(utauVoicebankLabel, 76);
-        takeUtau(utauVoicebankButton, 108);
-        takeUtau(utauVoicebankPath, std::min(330, std::max(100, modeBar.getWidth() - 620)));
-        takeUtau(noteAliasLabel, 92);
-        takeUtau(noteAliasEditor, 130);
+        const auto compact = modeBar.getWidth() < 1050;
+        takeUtau(utauVoicebankLabel, compact ? 48 : 76);
+        takeUtau(utauVoicebankButton, compact ? 80 : 108);
+        utauVoicebankPath.setVisible(!compact);
+        if (!compact) takeUtau(utauVoicebankPath, std::min(330, std::max(100, modeBar.getWidth() - 620)));
+        takeUtau(noteAliasLabel, compact ? 64 : 92);
+        takeUtau(noteAliasEditor, compact ? 100 : 130);
         takeUtau(noteConsonantVelocityLabel, 72);
         takeUtau(noteConsonantVelocityEditor, 52);
         takeUtau(noteFlagsLabel, 42);
@@ -3048,6 +3376,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
         menu.addItem(8, strings.text("file.export"));
         menu.addItem(12, strings.text("file.exportLastRender"),
                      !lastRenderedNoteIds.empty());
+        menu.addItem(14, strings.text("file.exportMidi"));
         menu.addSeparator();
         menu.addItem(4, strings.text("file.audio"));
         menu.addItem(5, strings.text("file.melodyne"));
@@ -3077,6 +3406,11 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
         menu.addItem(28, strings.text("edit.setPitch"), hasNotes);
         menu.addItem(29, strings.text("edit.averagePitch"), hasNotes);
         menu.addItem(19, strings.text("edit.quantizePitch"), hasNotes);
+        menu.addSeparator();
+        // Only in the UTAU modes: pinyin is what a UTAU voicebank's aliases
+        // are spelt in, and the lyric of any other kind of note is a label.
+        menu.addItem(hanziToPinyinMenuItem, strings.text("edit.hanziToPinyin"),
+                     selectedTrackId.isNotEmpty());
         menu.addSeparator();
         menu.addItem(23, strings.text("edit.copyClip"), selectedClipId.isNotEmpty());
         menu.addItem(24, strings.text("edit.pasteClip"), copiedClipId.isNotEmpty());
@@ -3129,6 +3463,7 @@ void MainComponent::menuItemSelected(int id, int)
     else if (id == 11) saveProjectAs();
     else if (id == 8) exportMixdown();
     else if (id == 12) exportLastRender();
+    else if (id == 14) exportMidi();
     else if (id == 4 || id == 30) importAudio();
     else if (id == 5) importMelodyne();
     else if (id == 6) importMidi();
@@ -3152,6 +3487,8 @@ void MainComponent::menuItemSelected(int id, int)
     else if (id == 28) showSetNotesPitchDialog();
     else if (id == 29) project.averageNotesMidi(pianoRoll.selectedNoteIds());
     else if (id == 19) project.quantizeNotesMidi(pianoRoll.selectedNoteIds());
+    else if (id == hanziToPinyinMenuItem && selectedTrackId.isNotEmpty())
+        project.convertTrackLyricsToPinyin(selectedTrackId);
     else if (id == 51) pasteCopiedNotes(copiedOriginSeconds);
     else if (id == 23) copySelectedClip();
     else if (id == 24) pasteCopiedClip();
@@ -4186,6 +4523,30 @@ void MainComponent::importMelodyne()
         });
 }
 
+void MainComponent::exportMidi()
+{
+    chooser = std::make_unique<juce::FileChooser>(strings.text("file.exportMidi"),
+        exportStartFile(lastExportDirectory, project.snapshot().name), "*.mid");
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
+        [this](const juce::FileChooser& selected)
+        {
+            auto file = selected.getResult();
+            if (file == juce::File{}) return;
+            if (!file.hasFileExtension("mid;midi")) file = file.withFileExtension("mid");
+            rememberExportDirectory(file.getParentDirectory());
+            juce::String error;
+            if (!ProjectModel::writeMidiFile(project.snapshot(), file, error))
+            {
+                showError(strings.text("error.exportMidi") + "\n" + error);
+                return;
+            }
+            statusLabel.setText(strings.text("status.midiExported") + "  "
+                                    + file.getFileName(),
+                                juce::dontSendNotification);
+        });
+}
+
 void MainComponent::importMidi()
 {
     chooser = std::make_unique<juce::FileChooser>(strings.text("file.midi"), juce::File{}, "*.mid;*.midi");
@@ -4216,13 +4577,81 @@ void MainComponent::importUst()
 
 void MainComponent::loadUstFile(const juce::File& file)
 {
+    // A UST is a song, and importing one is opening it.  It used to be added
+    // behind whatever was already open: the second import put its track at the
+    // bottom, the roll went on showing the first song, and the new one's tempo
+    // was dropped on the way in -- so the file looked like it had not been
+    // read at all.  Two USTs in one project is still worth having, which is a
+    // harmony part beside a lead, so with something already open the choice is
+    // put to the user rather than decided for them.
+    if (!ustImportNeedsChoice(project.snapshot()))
+    {
+        importUstFile(file, ProjectModel::UstImportMode::replaceProject);
+        return;
+    }
+    auto* dialog = new juce::AlertWindow(strings.text("dialog.ustImportTitle"),
+        strings.text("dialog.ustImportMessage"), juce::MessageBoxIconType::QuestionIcon);
+    dialog->addButton(strings.text("dialog.ustReplace"), 1);
+    dialog->addButton(strings.text("dialog.ustAddTrack"), 2);
+    dialog->addButton(strings.text("dialog.cancel"), 0,
+                      juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<MainComponent> safe(this);
+    dialog->enterModalState(true,
+        juce::ModalCallbackFunction::create(
+            [safe, dialog, file](int result)
+            {
+                if (safe != nullptr && result == 1)
+                    // Replacing throws the open project away, so it goes
+                    // through the same question closing it would.
+                    safe->performWithUnsavedCheck([safe, file]
+                    {
+                        if (safe == nullptr) return;
+                        safe->importUstFile(file,
+                            ProjectModel::UstImportMode::replaceProject);
+                    });
+                else if (safe != nullptr && result == 2)
+                    safe->importUstFile(file, ProjectModel::UstImportMode::addTrack);
+                delete dialog;
+            }), false);
+}
+
+void MainComponent::importUstFile(const juce::File& file,
+                                  ProjectModel::UstImportMode mode)
+{
+    const auto replacing = mode == ProjectModel::UstImportMode::replaceProject;
+    // Everything the old project's audio refers to is about to go; stop before
+    // it does rather than let a render finish into a project that is gone.
+    if (replacing) audio.stop();
     juce::String error;
     juce::StringArray warnings;
-    if (!project.addUstFile(file, error, warnings))
+    juce::String importedTrack;
+    if (!project.addUstFile(file, error, warnings, mode, &importedTrack))
     {
         showError(strings.text("error.ust") + "\n" + error);
         return;
     }
+    if (replacing)
+    {
+        audio.setPosition(0.0);
+        audio.setUtauRenderNoteSelection({});
+        activeUtauSelectionCount = 0;
+        copiedClipId.clear();
+        copiedNotes.clear();
+        // The open .hjpx is not this song: saving now must ask where to put
+        // it, or the previous project would be overwritten by this one.
+        currentProjectFile = juce::File{};
+    }
+    selectedNoteId.clear();
+    pianoRoll.clearNoteSelection();
+    // Show what was just imported.  Keeping the old focus is how a second
+    // import came to look like nothing had happened.
+    const auto data = project.snapshot();
+    for (const auto& track : data.tracks)
+        if (track.id == importedTrack && !track.clips.empty())
+        {
+            focusClip(track.clips.front().id);
+            break;
+        }
     refreshProjectControls();
     menuItemsChanged();
     // A UST names a voicebank this application cannot resolve, and carries an

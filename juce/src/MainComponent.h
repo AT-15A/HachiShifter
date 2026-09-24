@@ -17,6 +17,8 @@
 
 namespace hachi
 {
+class OtoWaveformEditorComponent;
+
 class EditorViewport final : public juce::Viewport
 {
 public:
@@ -58,28 +60,22 @@ public:
     }
 };
 
-// A preset button that draws the shape it applies.  Four two-character names
-// all look alike in a toolbar; the trapezoid says which is which at a glance.
+// A preset button that draws the shape it applies.  Two-character names all
+// look alike in a toolbar; the outline says which is which at a glance.
 class EnvelopePresetButton final : public juce::Button
 {
 public:
     EnvelopePresetButton() : juce::Button({}) {}
-    void configure(juce::String captionText, double attack, double release,
-                   float plateauEnd)
+    void configure(const PianoRollComponent::EnvelopePreset& shown)
     {
-        caption = std::move(captionText);
-        attackSeconds = attack;
-        releaseSeconds = release;
-        plateauEndDb = plateauEnd;
+        preset = shown;
         repaint();
     }
+    [[nodiscard]] juce::String caption() const { return preset.name; }
     void paintButton(juce::Graphics& g, bool highlighted, bool down) override;
 
 private:
-    juce::String caption;
-    double attackSeconds = 0.005;
-    double releaseSeconds = 0.035;
-    float plateauEndDb = 0.0f;
+    PianoRollComponent::EnvelopePreset preset;
 };
 
 class MainComponent final : public juce::Component,
@@ -141,6 +137,13 @@ public:
     [[nodiscard]] static juce::String pasteTargetClipIn(const ProjectData& data,
                                                         const juce::String& trackId,
                                                         double atSeconds);
+    // Whether importing a UST has to ask which way: with a song already open
+    // the choice between opening the new one and laying it beside the old one
+    // is the user's, and with nothing open there is no choice to make.
+    [[nodiscard]] static bool ustImportNeedsChoice(const ProjectData& data)
+    {
+        return !data.tracks.empty();
+    }
     [[nodiscard]] static double pasteTargetSeconds(
         bool sameTrack, double playheadSeconds, double originSeconds,
         std::optional<double> selectionStartSeconds,
@@ -233,8 +236,16 @@ public:
     void showDrawSettingsMenu(juce::Point<int> screenPosition);
     void setDrawLengthDivision(int division);
     void showTrackAreaMenu(juce::Point<int> screenPosition);
+    // Its items as they stand, and what choosing one does.
+    [[nodiscard]] juce::PopupMenu trackAreaMenu();
+    void trackAreaMenuItemChosen(int chosen);
     void addTrackFromMenu(bool compose);
     void addReferenceTrackFromMenu();
+    // 导入 MIDI 轨道: a file, then -- when it has more than one track with
+    // notes on it -- which of them, then that one as a new track.
+    void importMidiTrack();
+    void importMidiTrackFrom(const juce::File& file);
+    void addMidiTrackFrom(const juce::File& file, int trackIndex);
     // The one way the engine is told about the project.  It carries the track
     // being worked on with it, because a material track's audibility depends
     // on that and the engine decides it while syncing -- sending one without
@@ -290,9 +301,41 @@ public:
     // could have caught it: a check has to press the button on a real window
     // and then let the window lay itself out, as every selection does.
     void diagnosticPressTool(PianoRollComponent::Tool wanted);
+    // Edit > 汉字转拼音.
+    static constexpr int hanziToPinyinMenuItem = 52;
+    // The edit menu as it is built right now: whether it offers an item, and
+    // if it does, whether the item is enabled.
+    [[nodiscard]] std::optional<bool> diagnosticEditMenuItemEnabled(int itemId);
+    void diagnosticChooseMenuItem(int itemId);
+    void diagnosticSelectTrack(const juce::String& trackId);
+    // The track area's 导入 MIDI 轨道.
+    static constexpr int importMidiTrackMenuItem = 4;
+    struct MenuItemState
+    {
+        int id = 0;
+        juce::String text;
+        bool enabled = false;
+    };
+    [[nodiscard]] std::vector<MenuItemState> diagnosticTrackAreaMenu();
+    [[nodiscard]] juce::String diagnosticSelectedTrack() const { return selectedTrackId; }
+    [[nodiscard]] juce::String diagnosticStatusText() const { return statusLabel.getText(); }
+    [[nodiscard]] ProjectModel& diagnosticProject() { return project; }
     [[nodiscard]] PianoRollComponent::Tool diagnosticTool() const;
     void diagnosticRefreshControls();
+    // The envelope presets as the row lays them out with a UTAU track in hand:
+    // each button's caption and bounds, the view button after them, and where
+    // the controls pinned to the right of the row begin.
+    struct EnvelopePresetLayout
+    {
+        std::vector<std::pair<juce::String, juce::Rectangle<int>>> buttons;
+        juce::Rectangle<int> viewMenu;
+        int rightControlsStart = 0;
+    };
+    [[nodiscard]] EnvelopePresetLayout diagnosticEnvelopePresetLayout();
+    // The texts refreshed again, as closing the settings does.
+    void diagnosticRefreshTexts();
     [[nodiscard]] bool diagnosticRenderOrderPicker();
+    [[nodiscard]] bool diagnosticIntegratedLayout(const juce::File& directory);
 
 private:
     void changeListenerCallback(juce::ChangeBroadcaster* source) override;
@@ -305,6 +348,7 @@ private:
     void refreshProjectControls();
     void refreshSelectedNoteParameter();
     void applySelectedNoteParameter();
+    [[nodiscard]] bool selectedTrackIsUtau() const;
     void adjustHorizontalZoom(double factor);
     void adjustVerticalZoom(double factor);
     void refreshStretchAlgorithmItems(int preferredId = 0);
@@ -317,6 +361,11 @@ private:
     // without going through the voicebank list.  Empty noteId uses the
     // current selection.
     void showRegionEditorForNote(const juce::String& noteId = {});
+    // 单独OTO编辑: the same editor, working on one note's own copy of its entry.
+    void showNoteOtoEditorForNote(const juce::String& noteId);
+    // 播放原音 in either OTO window: this window's output device, with the
+    // song stopped before the recording starts.
+    void attachOtoPlayback(OtoWaveformEditorComponent& editor);
     bool bindDefaultUtauVoicebank(const juce::String& trackId);
     void prepareUtauTrackForNote(const juce::String& noteId);
     void commitNoteAlias();
@@ -355,9 +404,11 @@ private:
                               const juce::String& targetTrackId = {});
     void scheduleAnalysis(const juce::File& file, const juce::String& clipId);
     void importMidi();
+    void exportMidi();
     // A UTAU project file, which arrives as a plain UTAU track.
     void importUst();
     void loadUstFile(const juce::File& file);
+    void importUstFile(const juce::File& file, ProjectModel::UstImportMode mode);
     void importMelodyne();
     void showSettings();
     void applyPreferences();
@@ -446,8 +497,8 @@ private:
     void showViewMenu();
     void applyViewOptions();
     juce::Label envelopePresetCaption;
-    // Four shapes taken from the commonest Envelope fields in real USTs.
-    std::array<EnvelopePresetButton, 4> envelopePresetButtons;
+    // One per preset in PianoRollComponent::envelopePresets(), in its order.
+    std::vector<std::unique_ptr<EnvelopePresetButton>> envelopePresetButtons;
     juce::ToggleButton robustPitchCurveButton;
     juce::ComboBox pitchAlgorithm;
     juce::ComboBox stretchAlgorithm;

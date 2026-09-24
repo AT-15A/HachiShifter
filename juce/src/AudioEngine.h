@@ -22,11 +22,28 @@ struct UtauNoteWaveform
 {
     juce::String noteId;
     std::uint64_t renderHash = 0;
+    // The same note without its amplitude envelope.  An envelope only decides
+    // how loud the audio is, never what was sung, so a note whose envelope
+    // alone has changed still has this audio -- and the picture can be
+    // reshaped from it instead of disappearing until a render catches up.
+    std::uint64_t audioHash = 0;
     double startSeconds = 0.0;      // on the timeline
+    // What the piece covers, which is not what the note covers: it begins one
+    // preutterance before the note -- the consonant is sung ahead of the beat
+    // -- and lasts as long as the engine made it, which may reach past the
+    // note's end into the crossfade with the next one.
+    double leadInSeconds = 0.0;
     double durationSeconds = 0.0;
     // One bucket per millisecond: the extremes of the samples inside it.
+    // As it is heard, with the note's own amplitude envelope in it.
     std::vector<float> minima;
     std::vector<float> maxima;
+    // The same buckets before the envelope is applied.  The loudness lane
+    // draws these: the envelope is the line being drawn there, so the audio
+    // under it has to be the audio the line is being drawn over -- shaped, a
+    // point pulled to silence would hide the very sound it silences.
+    std::vector<float> unshapedMinima;
+    std::vector<float> unshapedMaxima;
 };
 
 class AudioEngine final : public juce::AudioSource, public juce::ChangeBroadcaster
@@ -79,6 +96,10 @@ public:
     // this reports what the real constructor and the real setter settled on,
     // for the running executable's own location.
     [[nodiscard]] juce::File diagnosticUtauResamplerFile() const
+    {
+        return utauResamplerFile;
+    }
+    [[nodiscard]] juce::File currentUtauResamplerFile() const
     {
         return utauResamplerFile;
     }
@@ -160,6 +181,17 @@ public:
     // note under a drawn waveform, to find out whether it is still the note
     // that produced it.
     [[nodiscard]] static std::uint64_t utauNoteRenderHash(const NoteData& note);
+    // Everything utauNoteRenderHash covers except the amplitude envelope: what
+    // says two notes would be sung the same way, however loud each is.
+    [[nodiscard]] static std::uint64_t utauNoteAudioHash(const NoteData& note);
+    // The notes one UTAU clip is sent to the renderer as, pitch curves and all,
+    // for a check to read what will actually be sung.  Given a selection, only
+    // those notes, sent as a render of that selection sends them.
+    [[nodiscard]] static std::vector<backend::UtauNoteRenderSpec> diagnosticUtauRequestNotes(
+        const ProjectData& project, const juce::String& clipId,
+        const std::vector<juce::String>& selection = {});
+    [[nodiscard]] static std::string diagnosticUtauRenderKey(
+        const ProjectData& project, const juce::String& clipId);
 
     bool exportWav(const juce::File& file, juce::String& error,
                    const juce::String& trackId = {},

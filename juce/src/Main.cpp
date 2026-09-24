@@ -1,4 +1,6 @@
+#include "tests/IntegratedSmoke.h"
 #include "MainComponent.h"
+#include "Pinyin.h"
 #include "StartupLog.h"
 #include "backend/McpServer.h"
 #include "backend/AnalysisService.h"
@@ -19,9 +21,12 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <iostream>
+#include <thread>
 #include <set>
 #include <limits>
+#include "tests/TimelinePitchSmoke.h"
 
 namespace hachi
 {
@@ -36,10 +41,223 @@ public:
     {
         startupLog("Application: initialise " + getApplicationVersion());
         auto arguments = juce::StringArray::fromTokens(commandLine, true);
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-timeline-pit")
+        {
+            setApplicationReturnValue(timelinePitchSmoke() ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (!arguments.isEmpty() && arguments[0] == "--mcp")
         {
-            backend::McpServer server;
+            // --roots=A;B names folders read_file and list_directory may
+            // see; without any, they see only where the session's own work is.
+            juce::StringArray roots;
+            for (int index = 1; index < arguments.size(); ++index)
+                if (arguments[index].startsWith("--roots="))
+                    roots.addTokens(arguments[index].fromFirstOccurrenceOf("=", false, false),
+                                    ";", "\"");
+            backend::McpServer server(roots);
             setApplicationReturnValue(server.run());
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-oto-playback")
+        {
+            // 播放原音: the OTO window's play button plays the whole recording
+            // the entry is cut from -- not only 偏移 to 终止 -- exactly as
+            // recorded, at the device's rate, and stops at the end of it or
+            // when pressed again.  Pulled here block by block, the way a device
+            // pulls it, since no device can be listened to from a check.
+            const auto passed = [&]
+            {
+                const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-oto-playback-" + juce::Uuid().toDashedString());
+                work.createDirectory();
+                constexpr auto rate = 44100.0;
+                // High, low, high, half a second each: the tones that come out,
+                // and their order, say how much of the recording was played.
+                const auto wav = work.getChildFile("tone.wav");
+                {
+                    juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * 1.5));
+                    for (int index = 0; index < buffer.getNumSamples(); ++index)
+                    {
+                        const auto time = static_cast<double>(index) / rate;
+                        const auto hertz = time >= 0.5 && time < 1.0 ? 220.0 : 880.0;
+                        buffer.setSample(0, index, 0.5f * static_cast<float>(std::sin(
+                            2.0 * juce::MathConstants<double>::pi * hertz * time)));
+                    }
+                    juce::WavAudioFormat format;
+                    std::unique_ptr<juce::FileOutputStream> stream(wav.createOutputStream());
+                    std::unique_ptr<juce::AudioFormatWriter> writer(
+                        format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                    if (writer != nullptr)
+                    {
+                        stream.release();
+                        writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                    }
+                }
+                // The recording as a reader sees it, to hold what came out against.
+                juce::AudioBuffer<float> recorded;
+                {
+                    juce::AudioFormatManager formats;
+                    formats.registerBasicFormats();
+                    std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(wav));
+                    if (reader != nullptr)
+                    {
+                        recorded.setSize(1, static_cast<int>(reader->lengthInSamples));
+                        reader->read(&recorded, 0, recorded.getNumSamples(), 0, true, false);
+                    }
+                }
+                VoicebankOtoEntry entry;
+                entry.audioFile = wav;
+                entry.sourceName = "tone";
+                entry.alias = "tone";
+                entry.offsetMs = 500.0;
+                entry.consonantMs = 100.0;
+                entry.cutoffMs = -500.0;          // half a second from the offset
+                entry.preutteranceMs = 80.0;
+                entry.overlapMs = 40.0;
+
+                // The pitch of one part of what came out, from its upward zero
+                // crossings.
+                const auto hertzOf = [](const juce::AudioBuffer<float>& audio,
+                                        double sampleRate, int from, int to)
+                {
+                    to = std::min(to, audio.getNumSamples());
+                    auto crossings = 0;
+                    for (int index = std::max(1, from); index < to; ++index)
+                        if (audio.getSample(0, index - 1) < 0.0f && audio.getSample(0, index) >= 0.0f)
+                            ++crossings;
+                    return to > from ? crossings * sampleRate / (to - from) : 0.0;
+                };
+                // Back to silence before each case, so one that failed to stop
+                // cannot turn the next press into a stop.
+                const auto idle = [](OtoWaveformEditorComponent& editor)
+                {
+                    if (editor.diagnosticPreviewPlaying()) editor.diagnosticPressPlay();
+                };
+
+                // Every editor here is held on the heap: this lambda's frame
+                // still sits on top of initialise()'s, and three editors by
+                // value overflowed the stack.
+                const auto editorOwner = std::make_unique<OtoWaveformEditorComponent>(
+                    entry, false, false, [] {});
+                auto& editor = *editorOwner;
+                editor.setBounds(0, 0, 1460, 800);
+                editor.resized();
+                const auto idleCaption = editor.diagnosticPlayCaption();
+
+                // Pressed: the whole recording, at its own rate, so what comes
+                // out can be held against the file sample for sample.
+                editor.diagnosticPressPlay();
+                const auto started = editor.diagnosticPreviewPlaying();
+                const auto playingCaption = editor.diagnosticPlayCaption();
+                const auto playheadAtStart = editor.diagnosticPlayheadMs().value_or(-1.0);
+                juce::AudioBuffer<float> heard;
+                auto pulled = editor.diagnosticPullPreview(heard, rate, 0.25);
+                const auto playheadHalfway = editor.diagnosticPlayheadMs().value_or(-1.0);
+                pulled += editor.diagnosticPullPreview(heard, rate, 2.0);
+                const auto stoppedAtEnd = !editor.diagnosticPreviewPlaying()
+                    && editor.diagnosticPlayCaption() == idleCaption
+                    && !editor.diagnosticPlayheadMs().has_value();
+                auto exact = pulled == static_cast<int>(rate * 1.5)
+                    && recorded.getNumSamples() == pulled;
+                auto bothChannels = heard.getNumChannels() == 2 && pulled > 0;
+                for (int index = 0; exact && index < pulled; ++index)
+                    exact = std::abs(heard.getSample(0, index)
+                                     - recorded.getSample(0, index)) < 1.0e-6f;
+                for (int index = 0; bothChannels && index < pulled; ++index)
+                    bothChannels = heard.getSample(1, index) == heard.getSample(0, index);
+                idle(editor);
+
+                // Moving the entry does not move what plays: with the offset
+                // typed on to the last half second the whole file still comes
+                // out, high, low, high, here at a device's 48 kHz.
+                editor.diagnosticTypeParameter(0, "1000");
+                editor.diagnosticPressPlay();
+                juce::AudioBuffer<float> movedHeard;
+                const auto movedPulled = editor.diagnosticPullPreview(movedHeard, 48000.0, 3.0);
+                const auto firstHz = hertzOf(movedHeard, 48000.0, 0, 24000);
+                const auto middleHz = hertzOf(movedHeard, 48000.0, 24000, 48000);
+                const auto lastHz = hertzOf(movedHeard, 48000.0, 48000, 72000);
+                idle(editor);
+
+                // Pressed again part way through: stops, and nothing more comes.
+                editor.diagnosticPressPlay();
+                juce::AudioBuffer<float> partial;
+                editor.diagnosticPullPreview(partial, rate, 0.1);
+                editor.diagnosticPressPlay();
+                const auto stoppedByPress = !editor.diagnosticPreviewPlaying()
+                    && editor.diagnosticPlayCaption() == idleCaption
+                    && !editor.diagnosticPlayheadMs().has_value()
+                    && editor.diagnosticPullPreview(partial, rate, 0.1) == 0;
+                idle(editor);
+
+                // A host decides: nothing plays when it says no, or when it has
+                // no device left to give; with one, the player is handed to it
+                // and taken back when stopped.
+                const auto devicesOwner = std::make_unique<juce::AudioDeviceManager>();
+                auto& devices = *devicesOwner;
+                auto asked = 0;
+                const auto refusedOwner = std::make_unique<OtoWaveformEditorComponent>(
+                    entry, false, false, [] {});
+                auto& refused = *refusedOwner;
+                refused.setPlaybackHost({ [&devices] { return &devices; },
+                                          [&asked] { ++asked; return false; } });
+                refused.diagnosticPressPlay();
+                const auto refusedByHost = !refused.diagnosticPreviewPlaying() && asked == 1;
+                const auto orphanedOwner = std::make_unique<OtoWaveformEditorComponent>(
+                    entry, false, false, [] {});
+                auto& orphaned = *orphanedOwner;
+                orphaned.setPlaybackHost(
+                    { [] { return static_cast<juce::AudioDeviceManager*>(nullptr); },
+                      [] { return true; } });
+                orphaned.diagnosticPressPlay();
+                const auto refusedWithoutDevice = !orphaned.diagnosticPreviewPlaying();
+                auto hosted = std::make_unique<OtoWaveformEditorComponent>(
+                    entry, false, false, [] {});
+                hosted->setPlaybackHost({ [&devices] { return &devices; }, [] { return true; } });
+                hosted->diagnosticPressPlay();
+                const auto attached = hosted->diagnosticPreviewPlaying()
+                    && hosted->diagnosticPreviewAttached();
+                hosted->diagnosticPressPlay();
+                const auto detached = !hosted->diagnosticPreviewPlaying()
+                    && !hosted->diagnosticPreviewAttached();
+                // Closed while playing: the window goes, the device stays.
+                hosted->diagnosticPressPlay();
+                hosted.reset();
+
+                work.deleteRecursively();
+                std::cout << "caption_idle=" << idleCaption
+                          << "|started=" << (started ? 1 : 0)
+                          << "|caption_playing=" << playingCaption
+                          << "|playhead_start=" << playheadAtStart
+                          << "|playhead_halfway=" << playheadHalfway
+                          << "|pulled=" << pulled
+                          << "|exact=" << (exact ? 1 : 0)
+                          << "|both_channels=" << (bothChannels ? 1 : 0)
+                          << "|stopped_at_end=" << (stoppedAtEnd ? 1 : 0)
+                          << "|moved_offset_pulled=" << movedPulled
+                          << "|thirds_hz=" << firstHz << "/" << middleHz << "/" << lastHz
+                          << "|stopped_by_press=" << (stoppedByPress ? 1 : 0)
+                          << "|refused_by_host=" << (refusedByHost ? 1 : 0)
+                          << "|refused_without_device=" << (refusedWithoutDevice ? 1 : 0)
+                          << "|attached=" << (attached ? 1 : 0)
+                          << "|detached=" << (detached ? 1 : 0) << std::endl;
+                return idleCaption == juce::String::fromUTF8("播放原音")
+                    && started
+                    && playingCaption == juce::String::fromUTF8("停止播放")
+                    && std::abs(playheadAtStart) < 1.0e-6
+                    && std::abs(playheadHalfway - 250.0) < 1.0
+                    && exact && bothChannels && stoppedAtEnd
+                    && std::abs(movedPulled - 72000) <= 2
+                    && std::abs(firstHz - 880.0) < 880.0 * 0.03
+                    && std::abs(middleHz - 220.0) < 220.0 * 0.03
+                    && std::abs(lastHz - 880.0) < 880.0 * 0.03
+                    && stoppedByPress && refusedByHost && refusedWithoutDevice
+                    && attached && detached;
+            }();
+            setApplicationReturnValue(passed ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
@@ -1488,6 +1706,7 @@ public:
 
             // Give a note a curve and photograph the strip.
             const auto trackId = flagProject.snapshot().tracks.front().id;
+            flagProject.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
             flagProject.setTrackUtauMode(trackId, UtauMode::jie);
             const auto notes = flagProject.snapshot().tracks.front().clips.front().notes;
             std::vector<juce::String> ids;
@@ -2894,7 +3113,11 @@ public:
                 const auto edges = roll.diagnosticRegionEdges(probe);
                 const auto y = roll.diagnosticNoteY(probe);
                 auto offered = 0;
-                for (int boundary = 0; boundary < 3; ++boundary)
+                // Only the boundaries this entry really has.  Three are always
+                // handed back, whatever the class string says -- the ones past
+                // the count repeat the last one, and asking at the same place
+                // twice counted one handle twice.
+                for (int boundary = 0; boundary < drawn - 1; ++boundary)
                 {
                     const auto x = roll.diagnosticEdgeX(
                         edges[static_cast<std::size_t>(boundary)]);
@@ -2902,7 +3125,10 @@ public:
                 }
                 grabbable = grabbable && offered == juce::jmax(0, drawn - 2);
                 report += " " + classes + ":" + juce::String(drawn)
-                    + "/grab" + juce::String(offered);
+                    + "/grab" + juce::String(offered) + "@";
+                for (int boundary = 0; boundary < drawn - 1; ++boundary)
+                    report += juce::String(edges[static_cast<std::size_t>(boundary)], 3)
+                        + (boundary + 2 < drawn ? "," : "");
             }
 
             // A two-region entry whose last region is a consonant does not
@@ -3279,7 +3505,7 @@ public:
             // A lyric of RR is a rest: the note holds its stretch of the phrase
             // open and sounds nothing.  Not an empty lyric, which renders the
             // piano preview tone, and not an alias the voicebank happens not to
-            // have, which is reported as missing.
+            // have, which plays the piano too and is reported as missing.
             using backend::isRestLyric;
             auto readsTheWord = isRestLyric("RR") && isRestLyric("rr")
                 && isRestLyric("  Rr  ")
@@ -3384,9 +3610,9 @@ public:
             }
 
             // A rest is silent on purpose.  A lyric the voicebank has no
-            // sample for is silent too, but it is a mistake and is reported as
-            // one -- that report is the whole difference between the two, and
-            // without it "RR" was only ever a typo that happened to be quiet.
+            // sample for is a mistake and is reported as one -- it plays the
+            // piano meanwhile -- and without that report "RR" was only ever a
+            // typo that happened to be quiet.
             const auto warningFor = [&bank](const juce::String& second)
             {
                 backend::UtauRenderRequest request;
@@ -3437,6 +3663,323 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-missing-alias-piano")
+        {
+            // A lyric the voicebank has no sample for plays the piano at the
+            // note's own pitch, instead of leaving a hole in the melody.  It is
+            // still reported as missing, a rest still sounds nothing, and the
+            // notes that do have a sample sound exactly as they did.
+            const auto passed = [&]
+            {
+                const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-missing-piano-" + juce::Uuid().toDashedString());
+                const auto folder = work.getChildFile("bank");
+                folder.createDirectory();
+                constexpr auto rate = 44100.0;
+                {
+                    auto buffer = std::make_unique<juce::AudioBuffer<float>>(1, static_cast<int>(rate * 2.0));
+                    for (int index = 0; index < buffer->getNumSamples(); ++index)
+                        buffer->setSample(0, index, 0.5f * static_cast<float>(std::sin(
+                            2.0 * juce::MathConstants<double>::pi * 220.0
+                                * static_cast<double>(index) / rate)));
+                    juce::WavAudioFormat format;
+                    std::unique_ptr<juce::FileOutputStream> stream(
+                        folder.getChildFile("tone.wav").createOutputStream());
+                    std::unique_ptr<juce::AudioFormatWriter> writer(
+                        format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                    if (writer != nullptr)
+                    {
+                        stream.release();
+                        writer->writeFromAudioSampleBuffer(*buffer, 0, buffer->getNumSamples());
+                    }
+                }
+                // Two entries: a bank of one sample sings every lyric with it,
+                // on purpose, so nothing would be missing.
+                folder.getChildFile("oto.ini").replaceWithText(
+                    juce::String("tone.wav=aa,0,100,1500,80,40") + juce::newLine
+                    + "tone.wav=ii,500,100,1000,80,40" + juce::newLine);
+                backend::UtauRenderer::invalidateVoicebankCache();
+
+                struct Sung { const char* alias; double start; float midi; };
+                const auto render = [&folder](const std::vector<Sung>& notes)
+                {
+                    backend::UtauRenderRequest request;
+                    request.voicebankDirectory = folder;
+                    request.targetDurationSeconds = 4.0;
+                    for (const auto& sung : notes)
+                    {
+                        backend::UtauNoteRenderSpec spec;
+                        spec.alias = sung.alias;
+                        spec.startSeconds = sung.start;
+                        spec.durationSeconds = 0.5;
+                        spec.midiNote = sung.midi;
+                        request.notes.push_back(std::move(spec));
+                    }
+                    return std::make_unique<backend::UtauRenderResult>(
+                        backend::UtauRenderer::render(request));
+                };
+                const auto rms = [](const backend::UtauRenderResult& result, double from, double to)
+                {
+                    const auto first = juce::jlimit(0, result.buffer.getNumSamples(),
+                                                    static_cast<int>(from * result.sampleRate));
+                    const auto last = juce::jlimit(first, result.buffer.getNumSamples(),
+                                                   static_cast<int>(to * result.sampleRate));
+                    return last > first ? result.buffer.getRMSLevel(0, first, last - first) : 0.0f;
+                };
+                // The pitch a stretch sounds at, from where its autocorrelation
+                // peaks between 60 and 1200 Hz.
+                const auto pitchOf = [](const backend::UtauRenderResult& result, double from, double to)
+                {
+                    const auto rate = result.sampleRate;
+                    const auto first = static_cast<int>(from * rate);
+                    const auto count = std::min(static_cast<int>((to - from) * rate),
+                                                result.buffer.getNumSamples() - first);
+                    const auto* data = result.buffer.getReadPointer(0) + first;
+                    auto bestLag = 0;
+                    auto best = 0.0;
+                    for (auto lag = static_cast<int>(rate / 1200.0); lag <= static_cast<int>(rate / 60.0); ++lag)
+                    {
+                        auto sum = 0.0;
+                        for (auto index = 0; index + lag < count; ++index)
+                            sum += static_cast<double>(data[index]) * data[index + lag];
+                        if (sum > best) { best = sum; bestLag = lag; }
+                    }
+                    return bestLag > 0 ? 69.0 + 12.0 * std::log2(rate / bestLag / 440.0) : 0.0;
+                };
+
+                const auto song = render({ { "aa", 0.5, 57.0f }, { "ZZZZ", 1.5, 62.0f },
+                                           { "RR", 2.5, 60.0f }, { "QQQQ", 3.2, 69.0f } });
+                const auto alone = render({ { "aa", 0.5, 57.0f }, { "RR", 2.5, 60.0f } });
+                const auto missingSounds = rms(*song, 1.55, 1.95);
+                const auto secondSounds = rms(*song, 3.25, 3.65);
+                const auto restSounds = rms(*song, 2.55, 2.95);
+                const auto missingPitch = pitchOf(*song, 1.6, 1.9);
+                const auto secondPitch = pitchOf(*song, 3.3, 3.6);
+                // The note with a sample, sung the same with the piano beside
+                // it as without.
+                auto unchanged = song->buffer.getNumSamples() == alone->buffer.getNumSamples();
+                auto worst = 0.0f;
+                for (auto index = static_cast<int>(0.3 * rate); unchanged && index < static_cast<int>(1.45 * rate); ++index)
+                    worst = std::max(worst, std::abs(song->buffer.getSample(0, index)
+                                                     - alone->buffer.getSample(0, index)));
+                unchanged = unchanged && worst < 1.0e-6f && rms(*alone, 0.55, 0.95) > 0.01f;
+                const auto reported = song->warning.contains("2 alias(es) were not found");
+
+                std::cout << "missing_rms=" << missingSounds << " second_rms=" << secondSounds
+                          << " rest_rms=" << restSounds
+                          << "|pitches=" << juce::String(missingPitch, 2) << "," << juce::String(secondPitch, 2)
+                          << "|neighbour_worst=" << worst
+                          << "|backend=" << song->backend << "|warning=[" << song->warning << "]";
+                const auto sounds = missingSounds > 0.01f && secondSounds > 0.01f;
+                const auto atItsPitch = std::abs(missingPitch - 62.0) < 0.3
+                    && std::abs(secondPitch - 69.0) < 0.3;
+                const auto restSilent = restSounds < 1.0e-4f;
+                std::cout << "|a_missing_lyric_sounds=" << (sounds ? 1 : 0)
+                          << "|at_the_notes_pitch=" << (atItsPitch ? 1 : 0)
+                          << "|as_the_piano=" << (song->backend.contains("piano") ? 1 : 0)
+                          << "|still_reported_missing=" << (reported ? 1 : 0)
+                          << "|a_rest_stays_silent=" << (restSilent ? 1 : 0)
+                          << "|the_sung_note_is_unchanged=" << (unchanged ? 1 : 0);
+                work.deleteRecursively();
+                backend::UtauRenderer::invalidateVoicebankCache();
+                return sounds && atItsPitch && song->backend.contains("piano") && reported
+                    && restSilent && unchanged;
+            }();
+            std::cout << "|ok=" << (passed ? 1 : 0) << std::endl;
+            setApplicationReturnValue(passed ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-flag-curve-mode")
+        {
+            // 线性flag is a 界/谋 feature.  On a plain UTAU track the model turns
+            // the switch down and refuses the points, and 重置线性flag is greyed.
+            // A track moved to plain UTAU keeps what it drew -- moving back
+            // brings the curve with it -- and the engine is simply not told
+            // about it, which is the half a named resampler renders.
+            const auto passed = [&]
+            {
+                I18n strings;
+                const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-flag-mode-" + juce::Uuid().toDashedString());
+                const auto folder = work.getChildFile("bank");
+                folder.createDirectory();
+                constexpr auto rate = 44100.0;
+                {
+                    juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * 2.0));
+                    for (int index = 0; index < buffer.getNumSamples(); ++index)
+                        buffer.setSample(0, index, 0.5f * static_cast<float>(std::sin(
+                            2.0 * juce::MathConstants<double>::pi * 220.0
+                                * static_cast<double>(index) / rate)));
+                    juce::WavAudioFormat format;
+                    std::unique_ptr<juce::FileOutputStream> stream(
+                        folder.getChildFile("tone.wav").createOutputStream());
+                    std::unique_ptr<juce::AudioFormatWriter> writer(
+                        format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                    if (writer != nullptr)
+                    {
+                        stream.release();
+                        writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                    }
+                }
+                folder.getChildFile("oto.ini").replaceWithText("tone.wav=aa,0,100,1500,80,40\n");
+                backend::UtauRenderer::invalidateVoicebankCache();
+
+                ProjectModel project;
+                const auto clipId = project.addAudioFile(folder.getChildFile("tone.wav"),
+                                                         2.0, 0.0, {});
+                const auto trackId = project.snapshot().tracks.front().id;
+                project.setTrackCompose(trackId, true);
+                project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+                project.setTrackVoicebankDirectory(trackId, folder);
+                const auto noteId = project.addNote(clipId, 0.5, 0.5, 60.0f);
+                const auto besideId = project.addNote(clipId, 1.2, 0.5, 60.0f);
+                project.setNoteLabel(noteId, "aa");
+                project.setNoteLabel(besideId, "aa");
+                const auto trackNow = [&project, &trackId]
+                {
+                    const auto data = project.snapshot();
+                    for (const auto& track : data.tracks)
+                        if (track.id == trackId) return track;
+                    return TrackData {};
+                };
+                const auto noteNow = [&project](const juce::String& id)
+                {
+                    const auto data = project.snapshot();
+                    for (const auto& track : data.tracks)
+                        for (const auto& clip : track.clips)
+                            for (const auto& note : clip.notes)
+                                if (note.id == id) return note;
+                    return NoteData {};
+                };
+                const auto curveSize = [&noteNow](const juce::String& id)
+                {
+                    return flagCurvePointsFor(noteNow(id), "g").size();
+                };
+                const std::vector<FlagCurvePoint> swing { { 0.0, -50.0f }, { 0.4, 50.0f } };
+
+                // The rule itself, at both ends: what a track takes, and what
+                // the renderer writes its 16th argument by.
+                const auto ruleHolds = !utauModeUsesFlagCurves(UtauMode::classic)
+                    && utauModeUsesFlagCurves(UtauMode::jie)
+                    && utauModeUsesFlagCurves(UtauMode::mou)
+                    && !backend::UtauRenderer::sendsFlagCurves(false, true)
+                    && !backend::UtauRenderer::sendsFlagCurves(true, false)
+                    && backend::UtauRenderer::sendsFlagCurves(true, true);
+
+                // Plain UTAU: the switch does not go on, and points do not land.
+                project.setNotesUtauFlagCurveEnabled({ noteId }, true);
+                const auto refusedSwitch = !noteNow(noteId).utauFlagCurveEnabled
+                    && !trackTakesFlagCurves(trackNow());
+                const auto refusedPoints = !project.setNoteUtauFlagCurve(noteId, "g", swing)
+                    && curveSize(noteId) == 0;
+
+                // 界 takes both; 谋 takes the switch on the note beside it.
+                project.setTrackUtauMode(trackId, UtauMode::jie);
+                project.setNotesUtauFlagCurveEnabled({ noteId }, true);
+                const auto drawn = project.setNoteUtauFlagCurve(noteId, "g", swing);
+                const auto takesInJie = trackTakesFlagCurves(trackNow()) && drawn
+                    && noteNow(noteId).utauFlagCurveEnabled
+                    && curveSize(noteId) == swing.size();
+                project.setTrackUtauMode(trackId, UtauMode::mou);
+                project.setNotesUtauFlagCurveEnabled({ besideId }, true);
+                const auto takesInMou = trackTakesFlagCurves(trackNow())
+                    && noteNow(besideId).utauFlagCurveEnabled;
+
+                // 重置线性flag follows the same rule.
+                const auto roll = std::make_unique<PianoRollComponent>(project, strings);
+                roll->setBounds(0, 0, 1400, 700);
+                roll->setPixelsPerSecond(200.0f);
+                roll->setFocusedTrack(trackId);
+                roll->setFocusedClip(clipId);
+                roll->diagnosticRefresh();
+                const auto resetOffered = [&roll](const juce::String& id)
+                {
+                    const auto ids = roll->diagnosticEnabledNoteMenuIds(id);
+                    return std::find(ids.begin(), ids.end(), 14) != ids.end();
+                };
+                const auto resetOfferedInMou = resetOffered(noteId);
+                project.setTrackUtauMode(trackId, UtauMode::classic);
+                roll->diagnosticRefresh();
+                const auto resetGreyedInPlain = !resetOffered(noteId);
+
+                // Moved to plain UTAU the note keeps what it drew, the switch
+                // can still be put away there, and moving back brings the curve
+                // along with it.
+                const auto keptThroughTheMove = noteNow(noteId).utauFlagCurveEnabled
+                    && curveSize(noteId) == swing.size();
+                project.setNotesUtauFlagCurveEnabled({ noteId }, false);
+                const auto switchedOffInPlain = !noteNow(noteId).utauFlagCurveEnabled;
+                project.setTrackUtauMode(trackId, UtauMode::jie);
+                project.setNotesUtauFlagCurveEnabled({ noteId }, true);
+                const auto backInJie = noteNow(noteId).utauFlagCurveEnabled
+                    && curveSize(noteId) == swing.size();
+
+                // Heard, when a resampler is named: in 界 the curve changes what
+                // comes back, and on a plain UTAU track the very same note
+                // renders exactly as it does with the curve switched off.
+                auto heardInJie = true, ignoredInPlain = true;
+                juce::String renderedSizes;
+                if (arguments.size() >= 2)
+                {
+                    const juce::File resampler(arguments[1].unquoted());
+                    const auto rendered = [&](const juce::String& only)
+                    {
+                        AudioEngine engine;
+                        engine.setUtauResamplerFile(resampler);
+                        engine.setUtauRenderNoteSelection({ only });
+                        engine.syncProject(project.snapshot());
+                        for (int spin = 0; spin < 600 && !engine.renderProgress(); ++spin)
+                            juce::Thread::sleep(5);
+                        for (int spin = 0; spin < 1200 && engine.renderProgress(); ++spin)
+                            juce::Thread::sleep(50);
+                        juce::Thread::sleep(200);
+                        const auto output = work.getChildFile("out.wav");
+                        output.deleteFile();
+                        juce::String error;
+                        juce::MemoryBlock bytes;
+                        if (engine.exportWav(output, error)) output.loadFileAsData(bytes);
+                        output.deleteFile();
+                        return bytes;
+                    };
+                    const auto jieWithCurve = rendered(noteId);
+                    project.setNotesUtauFlagCurveEnabled({ noteId }, false);
+                    const auto jieWithout = rendered(noteId);
+                    project.setNotesUtauFlagCurveEnabled({ noteId }, true);
+                    project.setTrackUtauMode(trackId, UtauMode::classic);
+                    const auto plainWithCurve = rendered(noteId);
+                    project.setNotesUtauFlagCurveEnabled({ noteId }, false);
+                    const auto plainWithout = rendered(noteId);
+                    heardInJie = jieWithCurve.getSize() > 0 && jieWithCurve != jieWithout;
+                    ignoredInPlain = plainWithCurve.getSize() > 0
+                        && plainWithCurve == plainWithout;
+                    renderedSizes = "|jie_bytes=" + juce::String(jieWithCurve.getSize())
+                        + "|plain_bytes=" + juce::String(plainWithCurve.getSize());
+                }
+
+                work.deleteRecursively();
+                std::cout << "rule_holds=" << (ruleHolds ? 1 : 0)
+                          << "|refused_switch=" << (refusedSwitch ? 1 : 0)
+                          << "|refused_points=" << (refusedPoints ? 1 : 0)
+                          << "|takes_in_jie=" << (takesInJie ? 1 : 0)
+                          << "|takes_in_mou=" << (takesInMou ? 1 : 0)
+                          << "|reset_offered_in_mou=" << (resetOfferedInMou ? 1 : 0)
+                          << "|reset_greyed_in_plain=" << (resetGreyedInPlain ? 1 : 0)
+                          << "|kept_through_the_move=" << (keptThroughTheMove ? 1 : 0)
+                          << "|switched_off_in_plain=" << (switchedOffInPlain ? 1 : 0)
+                          << "|back_in_jie=" << (backInJie ? 1 : 0)
+                          << "|heard_in_jie=" << (heardInJie ? 1 : 0)
+                          << "|ignored_in_plain=" << (ignoredInPlain ? 1 : 0)
+                          << renderedSizes << std::endl;
+                return ruleHolds && refusedSwitch && refusedPoints && takesInJie
+                    && takesInMou && resetOfferedInMou && resetGreyedInPlain
+                    && keptThroughTheMove && switchedOffInPlain && backInJie
+                    && heardInJie && ignoredInPlain;
+            }();
+            setApplicationReturnValue(passed ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 2 && arguments[0] == "--smoke-flag-point-value")
         {
             // Right-clicking a handle offers to type its value, and what the
@@ -3454,6 +3997,8 @@ public:
             }
             const auto trackId = project.snapshot().tracks.front().id;
             project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+            // 线性flag is a 界/谋 feature, and this check draws one.
+            project.setTrackUtauMode(trackId, UtauMode::jie);
             PianoRollComponent roll(project, strings);
             roll.setBounds(0, 0, 1600, 900);
             roll.resized();
@@ -3543,6 +4088,8 @@ public:
             }
             const auto trackId = project.snapshot().tracks.front().id;
             project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+            // 线性flag is a 界/谋 feature, and this check draws one.
+            project.setTrackUtauMode(trackId, UtauMode::jie);
             // A real voicebank, so the lead-in is a real one: the stretch two
             // notes share is as wide as the oto says, rather than the sliver a
             // bankless project leaves -- and a sliver is narrower than the
@@ -3777,7 +4324,7 @@ public:
             // so each menu is two longer than the original UTAU-only split.
             // Pinyin lead-in (24) is UTAU-only, so it lifts the UTAU count too.
             const auto plainStillShort = plain.size() == 12;
-            const auto utauStillWhole = utau.size() == 21;
+            const auto utauStillWhole = utau.size() == 23;
 
             ProjectModel project;
             const auto ust = juce::File::getSpecialLocation(juce::File::tempDirectory)
@@ -4791,7 +5338,8 @@ public:
             // Everything the handler can be asked to do has to appear in at
             // least one of the menus, or an item exists that nothing offers.
             const std::vector<int> handled { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                             11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24 };
+                                             11, 12, 13, 14, 15, 16, 17, 18, 19,
+                                             20, 21, 22, 23, 24 };
             auto allReachable = true;
             for (const auto id : handled)
                 if (!has(utau, id) && !has(plain, id)) allReachable = false;
@@ -4801,7 +5349,7 @@ public:
 
             // The plain menu is the general pitch/note edits, including
             // vibrato, plus the plain-only pitch-line reset.
-            const std::vector<int> general { 1, 2, 5, 6, 7, 8, 13, 18, 11, 10, 20, 23 };
+            const std::vector<int> general { 1, 2, 5, 6, 7, 8, 13, 18, 11, 10, 24, 23 };
             auto plainIsGeneral = plain.size() == general.size();
             for (const auto id : general)
                 if (!has(plain, id)) plainIsGeneral = false;
@@ -4874,9 +5422,11 @@ public:
             roll.setPixelsPerSecond(200.0f);
             roll.setFocusedTrack(trackId);
             const auto shownOnUtau = roll.diagnosticNoteMenuIds(noteId);
+            const auto layoutOnUtau = roll.diagnosticNoteMenuLayout(noteId);
             project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::mld5);
             roll.diagnosticRefresh();
             const auto shownOnPlain = roll.diagnosticNoteMenuIds(noteId);
+            const auto layoutOnPlain = roll.diagnosticNoteMenuLayout(noteId);
 
             // 6 and 7 are the two faces of one item, so only one is ever built.
             const auto builtUtauMatches = shownOnUtau.size() == utau.size() - 1;
@@ -4892,12 +5442,34 @@ public:
             const auto builtDropsTheUtauOnes = !has(shownOnPlain, 3)
                 && !has(shownOnPlain, 9) && !has(shownOnPlain, 17);
 
+            // 高级: STP, 单独OTO编辑, 恢复为音源OTO and flag 拆分 one level down,
+            // in that order, opening right after 区域编辑器 -- and none of the
+            // four left on the menu itself.
+            const auto advancedRow = juce::String::fromUTF8("高级[19,21,22,9]");
+            const auto advancedAt = std::find(layoutOnUtau.begin(), layoutOnUtau.end(),
+                                              advancedRow);
+            const auto advancedHoldsTheFour = advancedAt != layoutOnUtau.end();
+            const auto advancedAfterRegionEditor = advancedHoldsTheFour
+                && advancedAt != layoutOnUtau.begin()
+                && *(advancedAt - 1) == juce::String("4");
+            auto advancedNotAtTopLevel = true;
+            for (const auto* id : { "19", "21", "22", "9" })
+                if (std::find(layoutOnUtau.begin(), layoutOnUtau.end(), juce::String(id))
+                    != layoutOnUtau.end())
+                    advancedNotAtTopLevel = false;
+            // Off UTAU none of them is offered, so there is no 高级 at all.
+            const auto plainHasNoAdvanced = std::none_of(layoutOnPlain.begin(),
+                layoutOnPlain.end(), [](const juce::String& row)
+                { return row.startsWith(juce::String::fromUTF8("高级")); });
+
             const auto ok = utauKeepsEverything && plainIsGeneral && timingGone
                 && regionEditorGone && vibratoShared && flagsGone
                 && consonantResetGone && gapsGone && lyricsGone && splitStays
                 && deleteStays && transposeStays && sameOrder && noDuplicates
                 && builtUtauMatches && builtPlainIsGeneral && builtDropsTheUtauOnes
-                && builtPlainHasTheFlatten;
+                && builtPlainHasTheFlatten && advancedHoldsTheFour
+                && advancedAfterRegionEditor && advancedNotAtTopLevel
+                && plainHasNoAdvanced;
             std::cout << "utau_keeps_everything=" << (utauKeepsEverything ? 1 : 0)
                       << "|plain_is_the_general_edits=" << (plainIsGeneral ? 1 : 0)
                       << "|timing_gone=" << (timingGone ? 1 : 0)
@@ -4918,6 +5490,14 @@ public:
                       << "|built_plain_menu_has_the_flatten=" << (builtPlainHasTheFlatten ? 1 : 0)
                       << "|counts=" << utau.size() << "/" << plain.size()
                       << "|built=" << shownOnUtau.size() << "/" << shownOnPlain.size()
+                      << "|advanced_holds_the_four=" << (advancedHoldsTheFour ? 1 : 0)
+                      << "|advanced_after_region_editor=" << (advancedAfterRegionEditor ? 1 : 0)
+                      << "|advanced_not_at_top_level=" << (advancedNotAtTopLevel ? 1 : 0)
+                      << "|plain_has_no_advanced=" << (plainHasNoAdvanced ? 1 : 0)
+                      << "|layout=" << juce::StringArray(layoutOnUtau.data(),
+                             static_cast<int>(layoutOnUtau.size())).joinIntoString(" ")
+                      << "|plain_layout=" << juce::StringArray(layoutOnPlain.data(),
+                             static_cast<int>(layoutOnPlain.size())).joinIntoString(" ")
                       << std::endl;
             setApplicationReturnValue(ok ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
@@ -5017,6 +5597,206 @@ public:
                       << std::endl;
             setApplicationReturnValue(ok ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-lyric-tab")
+        {
+            // Naming a run of notes meant a double-click and Return for every
+            // one of them.  Tab in the lyric box now keeps that lyric and
+            // opens the box on the next note on the track; Shift+Tab goes
+            // back one; Tab on the last note ends it as Return does.
+            //
+            // The roll sits in a viewport on the desktop and Tab goes in
+            // through the peer, which is the path a real key takes: the box
+            // first, then its parents, then the window's focus traversal.  A
+            // keyPressed called on the roll directly would say nothing about
+            // whether the box lets Tab through or the window gets it first.
+            //
+            // In two halves with the message loop between them.  The editor
+            // reports losing focus by message, so a box that let go of focus
+            // for a moment on the way to the next note would only close
+            // itself after the first half had already looked.
+            [this]
+            {
+                struct Fixture
+                {
+                    I18n strings;
+                    ProjectModel project;
+                    std::unique_ptr<PianoRollComponent> roll;
+                    std::unique_ptr<juce::Viewport> viewport;
+                    std::vector<NoteData> notes;
+                    int namings = 0;
+                };
+                auto fixture = std::make_shared<Fixture>();
+                const auto ust = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-tab-" + juce::Uuid().toDashedString() + ".ust");
+                ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\n"
+                                    "Tempo=120.00\r\nTracks=1\r\nProjectName=tab\r\n"
+                                    "[#0000]\r\nLength=480\r\nLyric=a\r\nNoteNum=60\r\n"
+                                    "[#0001]\r\nLength=480\r\nLyric=i\r\nNoteNum=62\r\n"
+                                    "[#0002]\r\nLength=480\r\nLyric=u\r\nNoteNum=64\r\n"
+                                    "[#TRACKEND]\r\n");
+                juce::String ustError;
+                juce::StringArray ustWarnings;
+                const auto built = fixture->project.addUstFile(ust, ustError, ustWarnings);
+                ust.deleteFile();
+                if (!built)
+                {
+                    std::cout << "built=0|error=" << ustError << std::endl;
+                    setApplicationReturnValue(3);
+                    juce::MessageManager::callAsync([this] { quit(); });
+                    return;
+                }
+                const auto data = fixture->project.snapshot();
+                const auto trackId = data.tracks.front().id;
+                const auto clipId = data.tracks.front().clips.front().id;
+                fixture->notes = data.tracks.front().clips.front().notes;
+
+                fixture->roll = std::make_unique<PianoRollComponent>(
+                    fixture->project, fixture->strings);
+                auto& roll = *fixture->roll;
+                // Wide enough that the third note starts past the right edge
+                // of the view, so going on to it has to bring it into sight.
+                roll.setPixelsPerSecond(2400.0f);
+                roll.setFocusedTrack(trackId);
+                roll.setFocusedClip(clipId);
+                roll.setTool(PianoRollComponent::Tool::note);
+                roll.onNoteAliasCommitted = [raw = fixture.get()](const juce::String&)
+                {
+                    ++raw->namings;
+                };
+                fixture->viewport = std::make_unique<juce::Viewport>();
+                fixture->viewport->setViewedComponent(&roll, false);
+                fixture->viewport->setBounds(40, 40, 1000, 520);
+                fixture->viewport->addToDesktop(juce::ComponentPeer::windowIsTemporary);
+                fixture->viewport->setVisible(true);
+
+                const auto labelOf = [raw = fixture.get()](const juce::String& id)
+                {
+                    const auto now = raw->project.snapshot();
+                    for (const auto& track : now.tracks)
+                        for (const auto& clip : track.clips)
+                            for (const auto& note : clip.notes)
+                                if (note.id == id) return note.label;
+                    return juce::String("<gone>");
+                };
+                const auto press = [raw = fixture.get()](bool shift)
+                {
+                    const juce::KeyPress key(juce::KeyPress::tabKey,
+                        shift ? juce::ModifierKeys::shiftModifier : 0, 0);
+                    return raw->viewport->getPeer() != nullptr
+                        && raw->viewport->getPeer()->handleKeyPress(key);
+                };
+                const auto openOn = [raw = fixture.get()](int index, const juce::String& text)
+                {
+                    const auto& r = *raw->roll;
+                    return r.diagnosticAliasEditorNoteId()
+                            == raw->notes[static_cast<std::size_t>(index)].id
+                        && r.diagnosticAliasEditorText() == text
+                        && r.diagnosticAliasEditorHasFocus()
+                        && r.diagnosticAliasEditorAllSelected();
+                };
+                const auto selected = [raw = fixture.get()](int index)
+                {
+                    const auto ids = raw->roll->selectedNoteIds();
+                    return ids.size() == 1
+                        && ids.front() == raw->notes[static_cast<std::size_t>(index)].id;
+                };
+                const auto inView = [raw = fixture.get()]
+                {
+                    const auto view = raw->viewport->getViewArea();
+                    const auto box = raw->roll->diagnosticAliasEditorBounds();
+                    return box.getX() >= view.getX() + 58 && box.getX() + 84 <= view.getRight()
+                        && box.getY() >= view.getY() && box.getBottom() <= view.getBottom();
+                };
+
+                // The premise: the third note is out of sight to begin with.
+                fixture->viewport->setViewPosition(0,
+                    juce::roundToInt(roll.diagnosticYForMidi(62.0f)) - 260);
+                const auto thirdStartsHidden = 58.0f
+                    + static_cast<float>(fixture->notes[2].startSeconds) * 2400.0f
+                    > static_cast<float>(fixture->viewport->getViewArea().getRight());
+
+                const auto& first = fixture->notes[0];
+                const juce::Point<float> where(
+                    58.0f + static_cast<float>(first.startSeconds
+                        + first.durationSeconds * 0.5) * 2400.0f,
+                    roll.diagnosticYForMidi(first.midiNote));
+                const juce::MouseEvent event(
+                    juce::Desktop::getInstance().getMainMouseSource(), where,
+                    juce::ModifierKeys(), 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                    &roll, &roll, juce::Time::getCurrentTime(), where,
+                    juce::Time::getCurrentTime(), 2, false);
+                roll.mouseDoubleClick(event);
+                const auto opensOnFirst = openOn(0, "a");
+
+                roll.diagnosticTypeInAliasEditor("ka");
+                const auto tabTaken = press(false);
+                const auto firstNamed = labelOf(fixture->notes[0].id) == "ka";
+                const auto onSecond = openOn(1, "i");
+                const auto secondSelected = selected(1);
+                const auto secondUntouched = labelOf(fixture->notes[1].id) == "i";
+
+                juce::Timer::callAfterDelay(400,
+                    [this, fixture, labelOf, press, openOn, selected, inView,
+                     thirdStartsHidden, opensOnFirst, tabTaken, firstNamed,
+                     onSecond, secondSelected, secondUntouched]
+                {
+                    auto& roll = *fixture->roll;
+                    // Still there once the loop has run: nothing it posted on
+                    // the way over closed it.
+                    const auto stillOnSecond = openOn(1, "i");
+
+                    roll.diagnosticTypeInAliasEditor("sa");
+                    const auto backTaken = press(true);
+                    const auto secondNamed = labelOf(fixture->notes[1].id) == "sa";
+                    const auto backOnFirst = openOn(0, "ka");
+
+                    press(false);
+                    const auto forwardAgain = openOn(1, "sa")
+                        && labelOf(fixture->notes[0].id) == "ka";
+                    press(false);
+                    const auto onThird = openOn(2, "u") && selected(2);
+                    const auto thirdInView = inView();
+
+                    roll.diagnosticTypeInAliasEditor("ta");
+                    press(false);
+                    const auto thirdNamed = labelOf(fixture->notes[2].id) == "ta";
+                    const auto closesAtEnd = !roll.diagnosticAliasEditorOpen();
+                    // Every lyric reached the window, as Return's do: that is
+                    // what renders the note and binds a voicebank.
+                    const auto everyNamingHeard = fixture->namings == 5;
+                    const auto secondKept = labelOf(fixture->notes[1].id) == "sa";
+
+                    fixture->viewport->removeFromDesktop();
+                    const auto ok = thirdStartsHidden && opensOnFirst && tabTaken
+                        && firstNamed && onSecond && secondSelected && secondUntouched
+                        && stillOnSecond && backTaken && secondNamed && backOnFirst
+                        && forwardAgain && onThird && thirdInView && thirdNamed
+                        && closesAtEnd && everyNamingHeard && secondKept;
+                    std::cout << "third_starts_hidden=" << (thirdStartsHidden ? 1 : 0)
+                              << "|opens_on_first=" << (opensOnFirst ? 1 : 0)
+                              << "|tab_taken=" << (tabTaken ? 1 : 0)
+                              << "|first_named=" << (firstNamed ? 1 : 0)
+                              << "|box_on_second=" << (onSecond ? 1 : 0)
+                              << "|second_selected=" << (secondSelected ? 1 : 0)
+                              << "|second_untouched=" << (secondUntouched ? 1 : 0)
+                              << "|still_on_second_after_loop=" << (stillOnSecond ? 1 : 0)
+                              << "|shift_tab_taken=" << (backTaken ? 1 : 0)
+                              << "|second_named=" << (secondNamed ? 1 : 0)
+                              << "|back_on_first=" << (backOnFirst ? 1 : 0)
+                              << "|forward_again=" << (forwardAgain ? 1 : 0)
+                              << "|box_on_third=" << (onThird ? 1 : 0)
+                              << "|third_scrolled_into_view=" << (thirdInView ? 1 : 0)
+                              << "|third_named=" << (thirdNamed ? 1 : 0)
+                              << "|tab_on_last_closes=" << (closesAtEnd ? 1 : 0)
+                              << "|namings=" << fixture->namings
+                              << "|second_kept=" << (secondKept ? 1 : 0)
+                              << std::endl;
+                    setApplicationReturnValue(ok ? 0 : 4);
+                    juce::MessageManager::callAsync([this] { quit(); });
+                });
+            }();
             return;
         }
         if (arguments.size() >= 1 && arguments[0] == "--smoke-syllable-cuts")
@@ -5660,8 +6440,8 @@ public:
             ProjectModel plain;
             const auto plainTrack = plain.addTrack("plain", true);
             const auto startsWithNoClips = plain.snapshot().tracks.back().clips.empty();
-            const auto startsAsMld5 = plain.snapshot().tracks.back().pitchAlgorithm
-                == PitchAlgorithm::mld5;
+            const auto startsWithNativeDefault = plain.snapshot().tracks.back().pitchAlgorithm
+                == defaultPitchAlgorithm();
 
             PianoRollComponent plainRoll(plain, strings);
             plainRoll.setBounds(0, 0, 1400, 700);
@@ -5733,12 +6513,12 @@ public:
             const auto audioTrack = audio.addTrack("audio", false);
             const auto audioRefused = audio.addClip(audioTrack, 0.0, 1.0).isEmpty();
 
-            const auto ok = startsWithNoClips && startsAsMld5 && clickMadeANote
+            const auto ok = startsWithNoClips && startsWithNativeDefault && clickMadeANote
                 && clipAppeared && clipStartsAtZero && grewToFit
                 && utauDrawStarted && utauMadeANote && utauClipAppeared
                 && audioRefused;
             std::cout << "starts_with_no_clips=" << (startsWithNoClips ? 1 : 0)
-                      << "|starts_as_mld5=" << (startsAsMld5 ? 1 : 0)
+                      << "|starts_with_native_default=" << (startsWithNativeDefault ? 1 : 0)
                       << "|click_made_a_note=" << (clickMadeANote ? 1 : 0)
                       << "|clip_appeared=" << (clipAppeared ? 1 : 0)
                       << "|clip_starts_at_zero=" << (clipStartsAtZero ? 1 : 0)
@@ -6345,14 +7125,140 @@ public:
             // check until this line was added.
             const auto stillPaintsTheRoll = inked(offImage) > 0;
 
+            // ---- the rest of the pitch line: the joins between notes, and
+            //      the vibrato.  The fixture above has one sounding note and no
+            //      vibrato, so neither was ever drawn in it -- and both were
+            //      drawn whatever the switch said, which is the residue left on
+            //      a track after the line was turned off.
+            const auto twoNotes = [](bool withVibrato)
+            {
+                ProjectData data;
+                TrackData track;
+                track.id = "track";
+                track.name = "utau";
+                track.compose = true;
+                track.pitchAlgorithm = PitchAlgorithm::utau;
+                ClipData clip;
+                clip.id = "clip";
+                clip.startSeconds = 0.0;
+                clip.durationSeconds = 4.0;
+                for (int index = 0; index < 2; ++index)
+                {
+                    NoteData made;
+                    made.id = "note" + juce::String(index);
+                    made.label = "a";
+                    made.startSeconds = 0.5 + 0.6 * index;
+                    made.durationSeconds = 0.6;
+                    // A seventh apart, so the rows between them are wide enough
+                    // to look at on their own.
+                    made.midiNote = 60.0f + 11.0f * index;
+                    made.sourceMidiCenter = made.midiNote;
+                    made.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                    made.contour.push_back({ made.durationSeconds, 0.0f, 0.0f, true });
+                    if (withVibrato && index == 1)
+                    {
+                        made.vibratoEnabled = true;
+                        made.vibratoLengthPercent = 100.0;
+                        made.vibratoCycleMs = 150.0;
+                        made.vibratoDepthCents = 80.0;
+                    }
+                    clip.notes.push_back(std::move(made));
+                }
+                track.clips.push_back(std::move(clip));
+                data.tracks.push_back(std::move(track));
+                return data;
+            };
+            const auto pictureOf = [&strings](const ProjectData& data, bool lineShown,
+                                              std::unique_ptr<ProjectModel>& keptModel,
+                                              std::unique_ptr<PianoRollComponent>& keptRoll)
+            {
+                keptModel = std::make_unique<ProjectModel>();
+                keptModel->replace(data);
+                keptRoll = std::make_unique<PianoRollComponent>(*keptModel, strings);
+                keptRoll->setBounds(0, 0, 900, 500);
+                keptRoll->setPixelsPerSecond(200.0f);
+                keptRoll->setFocusedTrack(data.tracks.front().id);
+                keptRoll->setShowPitchLine(lineShown);
+                keptRoll->diagnosticRefresh();
+                juce::Image image(juce::Image::RGB, keptRoll->getWidth(),
+                                  keptRoll->getHeight(), true);
+                juce::Graphics graphics(image);
+                keptRoll->paintEntireComponent(graphics, true);
+                return image;
+            };
+            // The join is compared the way the vibrato is below: against the
+            // same two notes with the automatic transition turned off, which
+            // is the one thing that decides whether a join is drawn at all.
+            // Counting ink between the rows instead counts the grid there too,
+            // and the grid is the same in both pictures.
+            const auto withoutTheJoin = [&twoNotes](bool withVibrato)
+            {
+                auto data = twoNotes(withVibrato);
+                for (auto& note : data.tracks.front().clips.front().notes)
+                    note.utauAutoPitchTransition = false;
+                return data;
+            };
+            std::unique_ptr<ProjectModel> joinedModel, brokenModel;
+            std::unique_ptr<PianoRollComponent> joinedRoll, brokenRoll;
+            const auto joinedOn = pictureOf(twoNotes(false), true, joinedModel, joinedRoll);
+            const auto brokenOn = pictureOf(withoutTheJoin(false), true, brokenModel, brokenRoll);
+            std::unique_ptr<ProjectModel> joinedOffModel, brokenOffModel;
+            std::unique_ptr<PianoRollComponent> joinedOffRoll, brokenOffRoll;
+            const auto joinedOff = pictureOf(twoNotes(false), false, joinedOffModel, joinedOffRoll);
+            const auto brokenOff = pictureOf(withoutTheJoin(false), false, brokenOffModel,
+                                             brokenOffRoll);
+            const auto joinInk = differing(joinedOn, brokenOn);
+            const auto joinInkOff = differing(joinedOff, brokenOff);
+            const auto joinIsDrawn = joinInk > 20;
+            const auto joinGoesWithTheLine = joinInkOff == 0;
+
+            // And the notes themselves survive the switch.  Everything else
+            // here compares two pictures that both lose whatever a break takes
+            // away -- gate the note loop on the switch and every comparison
+            // above still holds, because the reference loses its notes too.
+            const auto noNotes = [&twoNotes]
+            {
+                auto data = twoNotes(false);
+                data.tracks.front().clips.front().notes.clear();
+                return data;
+            };
+            std::unique_ptr<ProjectModel> emptyModel;
+            std::unique_ptr<PianoRollComponent> emptyRoll;
+            const auto emptyOff = pictureOf(noNotes(), false, emptyModel, emptyRoll);
+            const auto notesSurvive = differing(joinedOff, emptyOff) > 100;
+
+            // The vibrato: with the line hidden, a note carrying one has to
+            // look exactly like the same note without one.
+            std::unique_ptr<ProjectModel> swungModel, straightModel;
+            std::unique_ptr<PianoRollComponent> swungRoll, straightRoll;
+            const auto swungOff = pictureOf(twoNotes(true), false, swungModel, swungRoll);
+            const auto straightOff = pictureOf(twoNotes(false), false, straightModel, straightRoll);
+            const auto vibratoGoesWithTheLine = differing(swungOff, straightOff) == 0;
+            // And it really is drawn while the line is shown, or the comparison
+            // above is satisfied by a vibrato nothing ever draws.
+            std::unique_ptr<ProjectModel> swungOnModel, straightOnModel;
+            std::unique_ptr<PianoRollComponent> swungOnRoll, straightOnRoll;
+            const auto swungOn = pictureOf(twoNotes(true), true, swungOnModel, swungOnRoll);
+            const auto straightOn = pictureOf(twoNotes(false), true, straightOnModel,
+                                              straightOnRoll);
+            const auto vibratoIsDrawn = differing(swungOn, straightOn) > 0;
+
             const auto ok = curveSet && startsOn && hidesSomething && comesBack
-                && fixtureIsReal && hidesOnlyTheLine && stillPaintsTheRoll;
+                && fixtureIsReal && hidesOnlyTheLine && stillPaintsTheRoll
+                && joinIsDrawn && joinGoesWithTheLine && notesSurvive
+                && vibratoIsDrawn && vibratoGoesWithTheLine;
             std::cout << "curve_set=" << (curveSet ? 1 : 0)
                       << "|starts_on=" << (startsOn ? 1 : 0)
                       << "|hiding_changes_the_picture=" << (hidesSomething ? 1 : 0)
                       << "|comes_back_identical=" << (comesBack ? 1 : 0)
                       << "|fixture_is_real=" << (fixtureIsReal ? 1 : 0)
                       << "|hides_only_the_line=" << (hidesOnlyTheLine ? 1 : 0)
+                      << "|join_between_notes_is_drawn=" << (joinIsDrawn ? 1 : 0)
+                      << "|join_goes_with_the_line=" << (joinGoesWithTheLine ? 1 : 0)
+                      << "|notes_survive_the_switch=" << (notesSurvive ? 1 : 0)
+                      << "|vibrato_is_drawn=" << (vibratoIsDrawn ? 1 : 0)
+                      << "|vibrato_goes_with_the_line=" << (vibratoGoesWithTheLine ? 1 : 0)
+                      << "|join_ink=" << joinInk << "/" << joinInkOff
                       << "|still_paints_the_roll=" << (stillPaintsTheRoll ? 1 : 0)
                       << "|line_pixels=" << lineCost
                       << "|curve_pixels=" << curveCost
@@ -6490,7 +7396,7 @@ public:
                       << "|vst3_detail=" << vst3.detail
                       << "|status=" << backend::MelodyneProvider::statusText()
                       << std::endl;
-            setApplicationReturnValue(candidate && disabled ? 0 : 4);
+            setApplicationReturnValue(disabled && (!detected || candidate) ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
@@ -6560,6 +7466,21 @@ public:
             std::cout << "converted=" << converted << "|separate_boundaries=" << boundaries
                       << "|velocity_remaps_time=" << timing << "|undo=" << restored << std::endl;
             setApplicationReturnValue(converted && boundaries && timing && restored ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 2 && arguments[0] == "--smoke-integrated-ui")
+        {
+            MainComponent component;
+            const auto ok = component.diagnosticIntegratedLayout(juce::File(arguments[1].unquoted()));
+            std::cout << "integrated_layout=" << ok << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-integrated")
+        {
+            setApplicationReturnValue(runIntegratedSmoke() ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
@@ -6856,7 +7777,11 @@ public:
             auto waveforms = std::make_shared<std::vector<UtauNoteWaveform>>();
             UtauNoteWaveform drawn;
             drawn.noteId = note.id;
+            // Both hashes and both layers, as the engine hands every waveform
+            // over: the row draws the piece before the envelope, shaped by the
+            // envelope on screen, and knows it by the audio hash.
             drawn.renderHash = AudioEngine::utauNoteRenderHash(note);
+            drawn.audioHash = AudioEngine::utauNoteAudioHash(note);
             drawn.startSeconds = note.startSeconds;
             drawn.durationSeconds = note.durationSeconds;
             for (int bucket = 0; bucket < 1000; ++bucket)
@@ -6864,6 +7789,8 @@ public:
                 const auto value = 0.9f * std::sin(static_cast<float>(bucket) * 0.3f);
                 drawn.minima.push_back(-std::abs(value));
                 drawn.maxima.push_back(std::abs(value));
+                drawn.unshapedMinima.push_back(-std::abs(value));
+                drawn.unshapedMaxima.push_back(std::abs(value));
             }
             waveforms->push_back(std::move(drawn));
 
@@ -6924,6 +7851,2347 @@ public:
                       << std::endl;
             setApplicationReturnValue(ok ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-envelope-base")
+        {
+            // 包络基础值: the envelope's height as a whole, in UTAU's own linear
+            // percent.  200 is twice as loud, not twice the dB -- the two are
+            // 6 dB apart, and a note raised by 12 dB where 6 was asked for is
+            // the mistake this exists to keep out.  Silence has to stay silence
+            // whatever it is multiplied by, or the two ends of every UST
+            // envelope would start to sound.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                I18n strings;
+
+                // ---- the scaling itself, in percent and not in decibels
+                const auto db = [](float value) { return scaledEnvelopeGainDb(0.0f, value); };
+                report.add("0dB_at_200=" + juce::String(db(2.0f), 2)
+                           + ",at_110=" + juce::String(db(1.1f), 2)
+                           + ",silence_at_200=" + juce::String(scaledEnvelopeGainDb(-60.0f, 2.0), 1));
+                expect("twice_as_loud_is_six_decibels",
+                       std::abs(db(2.0f) - 6.0206f) < 0.01f
+                       && std::abs(db(1.1f) - 0.8279f) < 0.01f);
+                expect("silence_stays_silence",
+                       std::abs(scaledEnvelopeGainDb(-60.0f, 2.0) + 60.0f) < 0.01f
+                       && std::abs(scaledEnvelopeGainDb(0.0f, 0.0) + 60.0f) < 0.01f);
+                // Half of a doubling is the shape as drawn again.
+                const std::vector<AmplitudeEnvelopePoint> drawn {
+                    { -0.05, -60.0f }, { 0.05, 0.0f }, { 0.40, -6.0f }, { 0.50, -60.0f } };
+                const auto up = scaledAmplitudeEnvelope(drawn, 200.0f);
+                const auto back = unscaledAmplitudeEnvelope(up, 200.0f);
+                auto sameAgain = back.size() == drawn.size();
+                for (std::size_t index = 0; index < drawn.size() && sameAgain; ++index)
+                    sameAgain = std::abs(back[index].gainDb - drawn[index].gainDb) < 0.01f;
+                expect("and_it_goes_back", sameAgain);
+
+                // ---- the menu offers it on a UTAU track and nowhere else
+                const auto utauMenu = PianoRollComponent::noteMenuItemsFor(true);
+                const auto plainMenu = PianoRollComponent::noteMenuItemsFor(false);
+                expect("in_the_utau_menu",
+                       std::find(utauMenu.begin(), utauMenu.end(), 23) != utauMenu.end());
+                expect("also_in_the_plain_menu",
+                       std::find(plainMenu.begin(), plainMenu.end(), 23) != plainMenu.end());
+
+                // ---- a project to set it on
+                ProjectData data;
+                TrackData track;
+                track.id = "track";
+                track.compose = true;
+                track.pitchAlgorithm = PitchAlgorithm::utau;
+                ClipData clip;
+                clip.id = "clip";
+                clip.startSeconds = 0.0;
+                clip.durationSeconds = 4.0;
+                for (int index = 0; index < 2; ++index)
+                {
+                    NoteData note;
+                    note.id = "note" + juce::String(index);
+                    note.label = "a";
+                    note.startSeconds = 1.0 + index;
+                    note.durationSeconds = 1.0;
+                    note.midiNote = 60.0f;
+                    note.sourceMidiCenter = note.midiNote;
+                    note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                    note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                    // The first note carries a drawn envelope; the second has
+                    // none, which is the case a base value has to reach too.
+                    if (index == 0)
+                        note.amplitudeEnvelope = { { -0.05, -60.0f }, { 0.05, 0.0f },
+                                                   { 0.90, 0.0f }, { 1.00, -60.0f } };
+                    clip.notes.push_back(std::move(note));
+                }
+                track.clips.push_back(std::move(clip));
+                data.tracks.push_back(std::move(track));
+
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(data);
+                expect("it_starts_at_a_hundred",
+                       std::abs(model->snapshot().tracks.front().clips.front()
+                                    .notes.front().amplitudeEnvelopeBasePercent - 100.0f) < 1.0e-6f);
+                model->setNotesAmplitudeEnvelopeBase({ "note0", "note1" }, 200.0f);
+
+                // ---- what the engine is sent
+                const auto after = model->snapshot();
+                const auto specs = AudioEngine::diagnosticUtauRequestNotes(after, "clip");
+                auto plateau = -99.0f, flat = -99.0f, ends = 0.0f;
+                if (specs.size() == 2)
+                {
+                    for (const auto& point : specs[0].amplitudeEnvelope)
+                    {
+                        if (std::abs(point.timeSeconds - 0.90) < 0.06)
+                            plateau = std::max(plateau, point.gainDb);
+                        if (point.gainDb <= -59.9f) ends += 1.0f;
+                    }
+                    // The note with no envelope gets the flat 100% one it has
+                    // implicitly, raised by the base.
+                    for (const auto& point : specs[1].amplitudeEnvelope) flat = point.gainDb;
+                }
+                report.add("sent_plateau=" + juce::String(plateau, 2)
+                           + ",sent_flat=" + juce::String(flat, 2)
+                           + ",silent_ends=" + juce::String(ends, 0));
+                expect("the_engine_gets_the_raised_envelope",
+                       specs.size() == 2 && std::abs(plateau - 6.0206f) < 0.05f);
+                expect("and_a_note_without_one_gets_a_raised_flat_line",
+                       std::abs(flat - 6.0206f) < 0.05f);
+                expect("with_its_ends_still_silent", ends >= 2.0f);
+
+                // ---- and what the lane shows
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 900, 520);
+                roll->setPixelsPerSecond(200.0f);
+                roll->setFocusedTrack("track");
+                roll->setTool(PianoRollComponent::Tool::amplitude);
+                roll->diagnosticRefresh();
+                const auto shown = roll->diagnosticDisplayEnvelope("note0");
+                auto shownPlateau = -99.0f, shownEnds = 0.0f;
+                for (const auto& point : shown)
+                {
+                    if (std::abs(point.timeSeconds - 0.90) < 0.06)
+                        shownPlateau = std::max(shownPlateau, point.gainDb);
+                    if (point.gainDb <= -59.9f) shownEnds += 1.0f;
+                }
+                report.add("shown_plateau=" + juce::String(shownPlateau, 2));
+                expect("the_lane_shows_what_will_be_heard",
+                       std::abs(shownPlateau - 6.0206f) < 0.05f && shownEnds >= 2.0f);
+
+                // ---- dragging a point with a base on: the line follows the
+                //      pointer, and the note keeps the shape without the base.
+                //      Stored scaled as well, the base would go in twice.
+                model->setNotesAmplitudeEnvelopeBase({ "note0" }, 200.0f);
+                roll->diagnosticRefresh();
+                {
+                    const auto source = juce::Desktop::getInstance().getMainMouseSource();
+                    const auto eventAt = [&](juce::Point<float> where)
+                    {
+                        return juce::MouseEvent(source, where,
+                            juce::ModifierKeys::leftButtonModifier,
+                            juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f,
+                            roll.get(), roll.get(), juce::Time::getCurrentTime(), where,
+                            juce::Time::getCurrentTime(), 1, false);
+                    };
+                    const juce::Point<float> handle(roll->diagnosticEdgeX(1.0 + 0.90),
+                        roll->diagnosticAmplitudeLaneY(6.0206f));
+                    const juce::Point<float> target(handle.x,
+                        roll->diagnosticAmplitudeLaneY(0.0f));
+                    roll->mouseDown(eventAt(handle));
+                    roll->mouseDrag(eventAt(target));
+                    roll->mouseUp(eventAt(target));
+                    roll->diagnosticRefresh();
+                    auto shownNow = -99.0f, storedNow = -99.0f;
+                    for (const auto& point : roll->diagnosticDisplayEnvelope("note0"))
+                        if (std::abs(point.timeSeconds - 0.90) < 0.06)
+                            shownNow = std::max(shownNow, point.gainDb);
+                    // The loudest stored point: a drag re-times the shape as
+                    // well as moving it, so the plateau is found by level
+                    // rather than by the time it used to sit at.
+                    juce::StringArray storedPoints;
+                    // By value: a range-for over a member of the temporary the
+                    // snapshot returns is reading freed memory.
+                    const auto storedData = model->snapshot();
+                    for (const auto& note : storedData.tracks.front().clips.front().notes)
+                        if (note.id == "note0")
+                            for (const auto& point : note.amplitudeEnvelope)
+                            {
+                                // The point that was dragged, not the loudest:
+                                // the other plateau point was left alone and is
+                                // still the louder of the two.
+                                if (std::abs(point.timeSeconds - 0.90) < 0.06)
+                                    storedNow = std::max(storedNow, point.gainDb);
+                                storedPoints.add(juce::String(point.timeSeconds, 2) + ":"
+                                                 + juce::String(point.gainDb, 1));
+                            }
+                    report.add("stored_points=" + storedPoints.joinIntoString(" "));
+                    report.add("dragged_to=0.00,shown=" + juce::String(shownNow, 2)
+                               + ",stored=" + juce::String(storedNow, 2));
+                    expect("a_drag_lands_where_the_pointer_did",
+                           std::abs(shownNow) < 0.6f);
+                    expect("and_the_note_keeps_the_shape_without_the_base",
+                           std::abs(storedNow + 6.0206f) < 0.6f);
+                }
+
+                // ---- the number at the note's top left corner
+                //
+                // It belongs to the envelope display, so it comes and goes with
+                // it, and it says nothing at 100 -- a number on every note
+                // would cover the roll and tell no one anything.
+                //
+                // Its own one-note project, off the beat: a bar line is the
+                // same orange as the number, and one sitting under the band
+                // would be counted as well -- worse, the envelope shape moves
+                // with the base and covers a different part of it each time.
+                ProjectData alone;
+                {
+                    TrackData one;
+                    one.id = "track";
+                    one.compose = true;
+                    one.pitchAlgorithm = PitchAlgorithm::utau;
+                    ClipData oneClip;
+                    oneClip.id = "clip";
+                    oneClip.startSeconds = 0.0;
+                    oneClip.durationSeconds = 4.0;
+                    NoteData only;
+                    only.id = "note0";
+                    only.label = "a";
+                    only.startSeconds = 1.13;
+                    only.durationSeconds = 0.8;
+                    only.midiNote = 72.0f;
+                    only.sourceMidiCenter = only.midiNote;
+                    only.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                    only.contour.push_back({ only.durationSeconds, 0.0f, 0.0f, true });
+                    oneClip.notes.push_back(std::move(only));
+                    one.clips.push_back(std::move(oneClip));
+                    alone.tracks.push_back(std::move(one));
+                }
+                auto labelModel = std::make_unique<ProjectModel>();
+                labelModel->replace(alone);
+                auto labelRoll = std::make_unique<PianoRollComponent>(*labelModel, strings);
+                labelRoll->setBounds(0, 0, 900, 520);
+                labelRoll->setPixelsPerSecond(200.0f);
+                labelRoll->setFocusedTrack("track");
+                labelRoll->diagnosticRefresh();
+                const auto labelShot = [&labelRoll]
+                {
+                    labelRoll->diagnosticRefresh();
+                    juce::Image image(juce::Image::RGB, labelRoll->getWidth(),
+                                      labelRoll->getHeight(), true);
+                    juce::Graphics graphics(image);
+                    labelRoll->paintEntireComponent(graphics, true);
+                    return image;
+                };
+                // The number's own colour, in the band above the note: how
+                // many pixels of it there are, and how high the topmost sits.
+                // diagnosticNoteY is the row's middle, and the note's block is
+                // this same orange, so the band has to stay above its top edge
+                // -- half a row up, at the default rowHeight of 22.
+                const auto numberInk = [&labelRoll](const juce::Image& image)
+                {
+                    const auto y = static_cast<int>(labelRoll->diagnosticNoteY(0)) - 11;
+                    const auto x = static_cast<int>(labelRoll->diagnosticEdgeX(1.13));
+                    auto count = 0;
+                    auto highest = 9999;
+                    for (auto row = std::max(0, y - 44); row < y; ++row)
+                        for (auto column = std::max(0, x); column < x + 44
+                             && column < image.getWidth(); ++column)
+                        {
+                            const auto pixel = image.getPixelAt(column, row);
+                            if (pixel.getRed() > 150 && pixel.getRed() > pixel.getGreen() + 30
+                                && pixel.getGreen() > pixel.getBlue())
+                            {
+                                ++count;
+                                highest = std::min(highest, y - row);
+                            }
+                        }
+                    return std::make_pair(count, highest);
+                };
+                labelRoll->setShowEnvelope(true);
+                const auto inkAtHundred = numberInk(labelShot()).first;
+                labelModel->setNotesAmplitudeEnvelopeBase({ "note0" }, 150.0f);
+                const auto inkAtOneFifty = numberInk(labelShot()).first;
+                labelRoll->setShowEnvelope(false);
+                const auto inkWithEnvelopeOff = numberInk(labelShot()).first;
+                report.add("label_ink=" + juce::String(inkAtOneFifty)
+                           + ",at_100=" + juce::String(inkAtHundred)
+                           + ",envelope_off=" + juce::String(inkWithEnvelopeOff));
+                // Nothing of that colour is up there until the number is.
+                expect("the_base_is_written_by_the_note", inkAtOneFifty > 20);
+                expect("nothing_is_written_at_a_hundred", inkAtHundred == 0);
+                expect("and_only_while_the_envelope_is_shown", inkWithEnvelopeOff == 0);
+                // The shape grows upward out of the note as the base rises, so
+                // the number has to climb with it rather than sit where the
+                // line now runs: at 200 the shape stands a whole block above
+                // the note, at 110 barely off its top edge.
+                labelRoll->setShowEnvelope(true);
+                labelModel->setNotesAmplitudeEnvelopeBase({ "note0" }, 110.0f);
+                const auto lowRise = numberInk(labelShot()).second;
+                labelModel->setNotesAmplitudeEnvelopeBase({ "note0" }, 200.0f);
+                const auto highRise = numberInk(labelShot()).second;
+                report.add("above_the_note_at_110=" + juce::String(lowRise)
+                           + ",at_200=" + juce::String(highRise));
+                expect("and_it_climbs_with_the_shape", highRise > lowRise + 8);
+
+                // ---- 0 is silence, and the range is held to 0..200
+                model->setNotesAmplitudeEnvelopeBase({ "note0" }, 0.0f);
+                const auto silenced = AudioEngine::diagnosticUtauRequestNotes(
+                    model->snapshot(), "clip");
+                auto allSilent = !silenced.empty();
+                for (const auto& point : silenced.front().amplitudeEnvelope)
+                    allSilent = allSilent && point.gainDb <= -59.9f;
+                expect("zero_is_silence", allSilent);
+                model->setNotesAmplitudeEnvelopeBase({ "note0" }, 500.0f);
+                expect("and_the_range_is_held",
+                       std::abs(model->snapshot().tracks.front().clips.front()
+                                    .notes.front().amplitudeEnvelopeBasePercent - 200.0f) < 1.0e-6f);
+
+                // ---- it survives saving, and an older project reads as 100
+                const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-base-" + juce::Uuid().toDashedString());
+                folder.createDirectory();
+                const auto saved = folder.getChildFile("base.hjpx");
+                juce::String error;
+                model->setNotesAmplitudeEnvelopeBase({ "note0" }, 150.0f);
+                const auto wrote = model->save(saved, error);
+                auto reopened = std::make_unique<ProjectModel>();
+                const auto read = reopened->load(saved, error);
+                const auto reopenedData = reopened->snapshot();
+                expect("it_survives_saving",
+                       wrote && read && !reopenedData.tracks.empty()
+                       && std::abs(reopenedData.tracks.front().clips.front().notes.front()
+                                       .amplitudeEnvelopeBasePercent - 150.0f) < 1.0e-4f);
+                folder.deleteRecursively();
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-amplitude-waveform")
+        {
+            // The loudness lane draws the audio the envelope is being drawn
+            // over.  Without it the lane is a curve against an empty grid:
+            // where the consonant ends, where the tail dies away, whether a
+            // point sits on sound or on silence -- none of it can be seen, and
+            // those are the moments an envelope is placed by.
+            //
+            // The waveform is handed in rather than rendered: a shape chosen
+            // here says exactly which buckets the lane reads and where they
+            // land, which no recording could.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                I18n strings;
+                ProjectData data;
+                TrackData track;
+                track.id = "track";
+                track.name = "utau";
+                track.compose = true;
+                track.pitchAlgorithm = PitchAlgorithm::utau;
+                ClipData clip;
+                clip.id = "clip";
+                clip.startSeconds = 0.0;
+                clip.durationSeconds = 4.0;
+                NoteData note;
+                note.id = "note0";
+                note.label = "a";
+                note.startSeconds = 1.0;
+                note.durationSeconds = 1.0;
+                note.midiNote = 60.0f;
+                note.sourceMidiCenter = note.midiNote;
+                note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                // An envelope that silences the note's second half.  The lane
+                // has to go on showing the audio there: that is what the point
+                // being dragged is acting on.
+                note.amplitudeEnvelope = { { -0.05, 0.0f }, { 0.45, 0.0f },
+                                           { 0.50, -60.0f }, { 1.00, -60.0f } };
+                clip.notes.push_back(std::move(note));
+                track.clips.push_back(std::move(clip));
+                data.tracks.push_back(std::move(track));
+
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(data);
+                // By value: the snapshot comes back by value, and a reference
+                // reaching into it dangles the moment the call returns.
+                const auto placedData = model->snapshot();
+                const auto placed = placedData.tracks.front().clips.front().notes.front();
+
+                // Loud for the first half of the piece, silent for the second.
+                // The shaped buckets -- what the note's own row draws -- are
+                // left empty on purpose: if the lane read those it would draw
+                // nothing at all, and this check would say so.
+                auto waveforms = std::make_shared<std::vector<UtauNoteWaveform>>();
+                UtauNoteWaveform made;
+                made.noteId = placed.id;
+                made.renderHash = AudioEngine::utauNoteRenderHash(placed);
+                made.audioHash = AudioEngine::utauNoteAudioHash(placed);
+                made.startSeconds = 1.0;
+                made.leadInSeconds = 0.0;
+                made.durationSeconds = 1.0;
+                for (int bucket = 0; bucket < 1000; ++bucket)
+                {
+                    const auto loud = bucket < 500;
+                    made.unshapedMaxima.push_back(loud ? 0.8f : 0.0f);
+                    made.unshapedMinima.push_back(loud ? -0.8f : 0.0f);
+                    made.maxima.push_back(0.0f);
+                    made.minima.push_back(0.0f);
+                }
+                waveforms->push_back(std::move(made));
+
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 900, 520);
+                roll->setPixelsPerSecond(200.0f);
+                roll->setFocusedTrack("track");
+                roll->setTool(PianoRollComponent::Tool::amplitude);
+                roll->setUtauNoteWaveforms(waveforms);
+                roll->diagnosticRefresh();
+
+                const auto paint = [&roll]
+                {
+                    juce::Image image(juce::Image::RGB, roll->getWidth(), roll->getHeight(), true);
+                    juce::Graphics graphics(image);
+                    roll->paintEntireComponent(graphics, true);
+                    return image;
+                };
+                // The lane sits at the bottom of the roll.  Only its lower part
+                // is looked at, which is where a level drawn up from silence is
+                // and where nothing else reaches.
+                // What the switch puts there, rather than what is there: the
+                // lane has a panel of its own behind it, so every pixel inside
+                // it differs from the roll's background whether or not any
+                // audio is drawn.
+                const auto laneDifference = [&roll](const juce::Image& left,
+                                                    const juce::Image& right,
+                                                    double fromSeconds, double toSeconds)
+                {
+                    const auto from = static_cast<int>(roll->diagnosticEdgeX(fromSeconds));
+                    const auto to = static_cast<int>(roll->diagnosticEdgeX(toSeconds));
+                    auto count = 0;
+                    for (auto y = left.getHeight() - 60; y < left.getHeight() - 20; ++y)
+                        for (auto x = std::max(0, from); x < to && x < left.getWidth(); ++x)
+                            if (left.getPixelAt(x, y) != right.getPixelAt(x, y)) ++count;
+                    return count;
+                };
+
+                roll->setShowUtauWaveforms(true);
+                const auto shown = paint();
+                roll->setShowUtauWaveforms(false);
+                const auto hidden = paint();
+
+                const auto loudShown = laneDifference(shown, hidden, 1.05, 1.45);
+                const auto quietShown = laneDifference(shown, hidden, 1.55, 1.95);
+                report.add("loud=" + juce::String(loudShown)
+                           + ",quiet=" + juce::String(quietShown));
+                // Drawn where the audio is loud, and nowhere else.
+                expect("the_audio_is_in_the_lane", loudShown > 200);
+                expect("and_only_where_there_is_audio", quietShown == 0);
+                // The shaped buckets are empty, so anything drawn came from the
+                // unshaped ones -- the audio as it is before the envelope, which
+                // is what the envelope is being drawn over.
+                expect("it_is_the_audio_the_envelope_acts_on",
+                       loudShown > 200 && placed.amplitudeEnvelope.size() >= 4);
+
+                // A note that has been edited since it was rendered draws
+                // nothing, exactly as in its own row: a waveform that outlives
+                // its note is a picture of a sound that will not be heard.
+                auto edited = data;
+                edited.tracks.front().clips.front().notes.front().midiNote = 64.0f;
+                auto editedModel = std::make_unique<ProjectModel>();
+                editedModel->replace(edited);
+                auto editedRoll = std::make_unique<PianoRollComponent>(*editedModel, strings);
+                editedRoll->setBounds(0, 0, 900, 520);
+                editedRoll->setPixelsPerSecond(200.0f);
+                editedRoll->setFocusedTrack("track");
+                editedRoll->setTool(PianoRollComponent::Tool::amplitude);
+                editedRoll->setShowUtauWaveforms(true);
+                editedRoll->setUtauNoteWaveforms(waveforms);
+                editedRoll->diagnosticRefresh();
+                juce::Image editedImage(juce::Image::RGB, editedRoll->getWidth(),
+                                        editedRoll->getHeight(), true);
+                {
+                    juce::Graphics graphics(editedImage);
+                    editedRoll->paintEntireComponent(graphics, true);
+                }
+                editedRoll->setShowUtauWaveforms(false);
+                juce::Image editedHidden(juce::Image::RGB, editedRoll->getWidth(),
+                                         editedRoll->getHeight(), true);
+                {
+                    juce::Graphics graphics(editedHidden);
+                    editedRoll->paintEntireComponent(graphics, true);
+                }
+                auto editedInk = 0;
+                for (auto y = editedImage.getHeight() - 60; y < editedImage.getHeight() - 20; ++y)
+                    for (auto x = static_cast<int>(editedRoll->diagnosticEdgeX(1.05));
+                         x < static_cast<int>(editedRoll->diagnosticEdgeX(1.45))
+                             && x < editedImage.getWidth(); ++x)
+                        if (editedImage.getPixelAt(x, y) != editedHidden.getPixelAt(x, y))
+                            ++editedInk;
+                report.add("after_an_edit=" + juce::String(editedInk));
+                expect("an_edited_note_draws_nothing", editedInk == 0);
+
+                // ---- an envelope edit reshapes the audio already rendered
+                //
+                // An envelope decides how loud the audio is and nothing else
+                // about it, so a note whose envelope alone has changed still
+                // has its piece: the picture is reshaped from it at once,
+                // rather than blinking out until a render catches up.  Its own
+                // fixture, because the one above leaves the shaped buckets
+                // empty on purpose and a row drawn from those shows nothing.
+                auto loudModel = std::make_unique<ProjectModel>();
+                {
+                    // Starting with no envelope, so the one applied below is a
+                    // change rather than the shape the fixture already had.
+                    auto bare = data;
+                    bare.tracks.front().clips.front().notes.front().amplitudeEnvelope.clear();
+                    loudModel->replace(bare);
+                }
+                const auto loudData = loudModel->snapshot();
+                const auto loudNote = loudData.tracks.front().clips.front().notes.front();
+                auto loudWaves = std::make_shared<std::vector<UtauNoteWaveform>>();
+                UtauNoteWaveform loud;
+                loud.noteId = loudNote.id;
+                loud.renderHash = AudioEngine::utauNoteRenderHash(loudNote);
+                loud.audioHash = AudioEngine::utauNoteAudioHash(loudNote);
+                loud.startSeconds = 1.0;
+                loud.leadInSeconds = 0.0;
+                loud.durationSeconds = 1.0;
+                for (int bucket = 0; bucket < 1000; ++bucket)
+                {
+                    loud.unshapedMaxima.push_back(0.8f);
+                    loud.unshapedMinima.push_back(-0.8f);
+                    loud.maxima.push_back(0.8f);
+                    loud.minima.push_back(-0.8f);
+                }
+                loudWaves->push_back(std::move(loud));
+
+                auto rowRoll = std::make_unique<PianoRollComponent>(*loudModel, strings);
+                rowRoll->setBounds(0, 0, 900, 520);
+                rowRoll->setPixelsPerSecond(200.0f);
+                rowRoll->setFocusedTrack("track");
+                rowRoll->setUtauNoteWaveforms(loudWaves);
+                rowRoll->diagnosticRefresh();
+                const auto rowPaint = [&rowRoll](bool waveformsShown)
+                {
+                    rowRoll->setShowUtauWaveforms(waveformsShown);
+                    rowRoll->diagnosticRefresh();
+                    juce::Image image(juce::Image::RGB, rowRoll->getWidth(),
+                                      rowRoll->getHeight(), true);
+                    juce::Graphics graphics(image);
+                    rowRoll->paintEntireComponent(graphics, true);
+                    return image;
+                };
+                // The note's own row, where its waveform is drawn.
+                const auto rowDifference = [&rowRoll](const juce::Image& left,
+                                                      const juce::Image& right,
+                                                      double fromSeconds, double toSeconds)
+                {
+                    const auto centre = static_cast<int>(rowRoll->diagnosticNoteY(0));
+                    const auto from = static_cast<int>(rowRoll->diagnosticEdgeX(fromSeconds));
+                    const auto to = static_cast<int>(rowRoll->diagnosticEdgeX(toSeconds));
+                    auto count = 0;
+                    for (auto y = std::max(0, centre - 40);
+                         y < centre + 40 && y < left.getHeight(); ++y)
+                        for (auto x = std::max(0, from); x < to && x < left.getWidth(); ++x)
+                            if (left.getPixelAt(x, y) != right.getPixelAt(x, y)) ++count;
+                    return count;
+                };
+                const auto rowOn = rowPaint(true);
+                const auto rowOff = rowPaint(false);
+                const auto firstHalfBefore = rowDifference(rowOn, rowOff, 1.05, 1.45);
+                const auto secondHalfBefore = rowDifference(rowOn, rowOff, 1.55, 1.95);
+
+                // Silence the second half, which is an envelope edit and
+                // nothing else.
+                loudModel->setNoteAmplitudeEnvelope(loudNote.id,
+                    { { -0.05, 0.0f }, { 0.45, 0.0f }, { 0.50, -60.0f }, { 1.00, -60.0f } });
+                rowRoll->diagnosticRefresh();
+                const auto editedOn = rowPaint(true);
+                const auto editedOff = rowPaint(false);
+                const auto firstHalfAfter = rowDifference(editedOn, editedOff, 1.05, 1.45);
+                const auto secondHalfAfter = rowDifference(editedOn, editedOff, 1.55, 1.95);
+                report.add("row_before=" + juce::String(firstHalfBefore) + "/"
+                           + juce::String(secondHalfBefore)
+                           + ",row_after=" + juce::String(firstHalfAfter) + "/"
+                           + juce::String(secondHalfAfter));
+                expect("the_picture_survives_an_envelope_edit", firstHalfAfter > 100);
+                // Silenced, not gone: every column keeps a hairline a pixel
+                // tall, which is what says the piece is there and quiet rather
+                // than not there at all.  Eighty columns, eighty pixels.
+                expect("and_is_reshaped_by_it",
+                       secondHalfBefore > 1000 && secondHalfAfter * 10 < secondHalfBefore
+                       && firstHalfBefore > 1000 && firstHalfAfter > 1000);
+
+                // The lane goes on showing the same audio: what it draws is
+                // what the envelope acts on, which an envelope cannot change.
+                auto laneModel = std::make_unique<ProjectModel>();
+                laneModel->replace(data);
+                auto laneRoll = std::make_unique<PianoRollComponent>(*laneModel, strings);
+                laneRoll->setBounds(0, 0, 900, 520);
+                laneRoll->setPixelsPerSecond(200.0f);
+                laneRoll->setFocusedTrack("track");
+                laneRoll->setTool(PianoRollComponent::Tool::amplitude);
+                laneRoll->setUtauNoteWaveforms(waveforms);
+                laneRoll->setShowUtauWaveforms(true);
+                laneRoll->diagnosticRefresh();
+                const auto lanePaint = [&laneRoll]
+                {
+                    juce::Image image(juce::Image::RGB, laneRoll->getWidth(),
+                                      laneRoll->getHeight(), true);
+                    juce::Graphics graphics(image);
+                    laneRoll->paintEntireComponent(graphics, true);
+                    return image;
+                };
+                const auto laneWithWaveform = [&laneRoll, &lanePaint](bool shown)
+                {
+                    laneRoll->setShowUtauWaveforms(shown);
+                    laneRoll->diagnosticRefresh();
+                    return lanePaint();
+                };
+                const auto beforeOn = laneWithWaveform(true);
+                const auto beforeOff = laneWithWaveform(false);
+                laneModel->setNoteAmplitudeEnvelope(placed.id,
+                    { { -0.05, 0.0f }, { 0.20, -60.0f }, { 1.00, -60.0f } });
+                const auto afterOn = laneWithWaveform(true);
+                const auto afterOff = laneWithWaveform(false);
+                // Only the waveform's own ink is looked at: the envelope's line
+                // moves with the envelope, which is what it is there for, and
+                // it is drawn in both pictures so it is not waveform ink.
+                //
+                // Two things have to hold at once.  The audio follows the
+                // envelope -- where a stretch has been pulled to silence the
+                // solid level goes with it -- and the piece it acts on is still
+                // there behind it, faintly, or the lane would say nothing about
+                // what was silenced.
+                auto laneFollows = 0;
+                auto ghostRemains = 0;
+                for (auto y = beforeOn.getHeight() - 60; y < beforeOn.getHeight() - 20; ++y)
+                    for (auto x = static_cast<int>(laneRoll->diagnosticEdgeX(1.05));
+                         x < static_cast<int>(laneRoll->diagnosticEdgeX(1.45))
+                             && x < beforeOn.getWidth(); ++x)
+                    {
+                        const auto had = beforeOn.getPixelAt(x, y) != beforeOff.getPixelAt(x, y);
+                        const auto has = afterOn.getPixelAt(x, y) != afterOff.getPixelAt(x, y);
+                        if (has) ++ghostRemains;
+                        // Where both pictures hold audio, the audio itself has
+                        // to look different: that is the envelope reaching it.
+                        if (had && has && beforeOn.getPixelAt(x, y) != afterOn.getPixelAt(x, y))
+                            ++laneFollows;
+                    }
+                report.add("lane_follows=" + juce::String(laneFollows)
+                           + ",ghost=" + juce::String(ghostRemains));
+                expect("the_lane_follows_the_envelope", laneFollows > 200);
+                expect("and_still_shows_what_it_acts_on", ghostRemains > 200);
+
+                // ---- and it follows the point while it is still held
+                //
+                // Mid-drag the project still holds the old envelope: what is on
+                // screen is the stroke under the pointer, and the audio has to
+                // follow that or the preview only arrives once the drag is let
+                // go, which is exactly when it stops being a preview.
+                auto dragModel = std::make_unique<ProjectModel>();
+                {
+                    auto flat = data;
+                    flat.tracks.front().clips.front().notes.front().amplitudeEnvelope =
+                        { { -0.05, 0.0f }, { 0.95, 0.0f } };
+                    dragModel->replace(flat);
+                }
+                const auto dragData = dragModel->snapshot();
+                const auto dragNote = dragData.tracks.front().clips.front().notes.front();
+                auto dragWaves = std::make_shared<std::vector<UtauNoteWaveform>>();
+                UtauNoteWaveform forDrag;
+                forDrag.noteId = dragNote.id;
+                forDrag.renderHash = AudioEngine::utauNoteRenderHash(dragNote);
+                forDrag.audioHash = AudioEngine::utauNoteAudioHash(dragNote);
+                forDrag.startSeconds = 1.0;
+                forDrag.leadInSeconds = 0.0;
+                forDrag.durationSeconds = 1.0;
+                for (int bucket = 0; bucket < 1000; ++bucket)
+                {
+                    forDrag.unshapedMaxima.push_back(0.8f);
+                    forDrag.unshapedMinima.push_back(-0.8f);
+                    forDrag.maxima.push_back(0.8f);
+                    forDrag.minima.push_back(-0.8f);
+                }
+                dragWaves->push_back(std::move(forDrag));
+
+                auto dragRoll = std::make_unique<PianoRollComponent>(*dragModel, strings);
+                dragRoll->setBounds(0, 0, 900, 520);
+                dragRoll->setPixelsPerSecond(200.0f);
+                dragRoll->setFocusedTrack("track");
+                dragRoll->setTool(PianoRollComponent::Tool::amplitude);
+                dragRoll->setUtauNoteWaveforms(dragWaves);
+                dragRoll->diagnosticRefresh();
+                const auto dragInk = [&dragRoll](double fromSeconds, double toSeconds)
+                {
+                    const auto shot = [&dragRoll](bool shown)
+                    {
+                        dragRoll->setShowUtauWaveforms(shown);
+                        juce::Image image(juce::Image::RGB, dragRoll->getWidth(),
+                                          dragRoll->getHeight(), true);
+                        juce::Graphics graphics(image);
+                        dragRoll->paintEntireComponent(graphics, true);
+                        return image;
+                    };
+                    const auto on = shot(true);
+                    const auto off = shot(false);
+                    const auto centre = static_cast<int>(dragRoll->diagnosticNoteY(0));
+                    const auto from = static_cast<int>(dragRoll->diagnosticEdgeX(fromSeconds));
+                    const auto to = static_cast<int>(dragRoll->diagnosticEdgeX(toSeconds));
+                    auto count = 0;
+                    for (auto y = std::max(0, centre - 40); y < centre + 40 && y < on.getHeight(); ++y)
+                        for (auto x = std::max(0, from); x < to && x < on.getWidth(); ++x)
+                            if (on.getPixelAt(x, y) != off.getPixelAt(x, y)) ++count;
+                    return count;
+                };
+                const auto beforeTheDrag = dragInk(1.70, 1.94);
+                // The lane is where the point is being dragged, so it is the
+                // one being watched: its audio has to follow the stroke too.
+                const auto laneShot = [&dragRoll](bool shown)
+                {
+                    dragRoll->setShowUtauWaveforms(shown);
+                    juce::Image image(juce::Image::RGB, dragRoll->getWidth(),
+                                      dragRoll->getHeight(), true);
+                    juce::Graphics graphics(image);
+                    dragRoll->paintEntireComponent(graphics, true);
+                    return image;
+                };
+                const auto laneHeldOnBefore = laneShot(true);
+                const auto laneHeldOffBefore = laneShot(false);
+
+                // Take hold of the last envelope point, in the lane, and pull
+                // it down to silence without letting go.
+                const auto source = juce::Desktop::getInstance().getMainMouseSource();
+                const auto eventAt = [&](juce::Point<float> where)
+                {
+                    return juce::MouseEvent(source, where,
+                        juce::ModifierKeys::leftButtonModifier,
+                        juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f,
+                        dragRoll.get(), dragRoll.get(), juce::Time::getCurrentTime(), where,
+                        juce::Time::getCurrentTime(), 1, false);
+                };
+                const juce::Point<float> handle(dragRoll->diagnosticEdgeX(1.95),
+                    dragRoll->diagnosticAmplitudeLaneY(0.0f));
+                const juce::Point<float> pulled(handle.x,
+                    dragRoll->diagnosticAmplitudeLaneY(-60.0f));
+                dragRoll->mouseDown(eventAt(handle));
+                dragRoll->mouseDrag(eventAt(pulled));
+                const auto duringTheDrag = dragInk(1.70, 1.94);
+                const auto laneHeldOnDuring = laneShot(true);
+                const auto laneHeldOffDuring = laneShot(false);
+                auto laneHeldFollows = 0;
+                for (auto y = laneHeldOnBefore.getHeight() - 60;
+                     y < laneHeldOnBefore.getHeight() - 20; ++y)
+                    for (auto x = static_cast<int>(dragRoll->diagnosticEdgeX(1.70));
+                         x < static_cast<int>(dragRoll->diagnosticEdgeX(1.94))
+                             && x < laneHeldOnBefore.getWidth(); ++x)
+                    {
+                        const auto had = laneHeldOnBefore.getPixelAt(x, y)
+                            != laneHeldOffBefore.getPixelAt(x, y);
+                        const auto has = laneHeldOnDuring.getPixelAt(x, y)
+                            != laneHeldOffDuring.getPixelAt(x, y);
+                        if (had && has && laneHeldOnBefore.getPixelAt(x, y)
+                                != laneHeldOnDuring.getPixelAt(x, y))
+                            ++laneHeldFollows;
+                    }
+                dragRoll->mouseUp(eventAt(pulled));
+                report.add("lane_while_held=" + juce::String(laneHeldFollows));
+                expect("and_the_lane_follows_it_while_held", laneHeldFollows > 200);
+                report.add("dragging=" + juce::String(beforeTheDrag) + "->"
+                           + juce::String(duringTheDrag));
+                expect("the_picture_follows_the_point_being_held",
+                       beforeTheDrag > 1000 && duringTheDrag * 3 < beforeTheDrag);
+
+                // A change that really does change the sound still hides it:
+                // the preview is for loudness, and only for loudness.
+                loudModel->setNotesMidi({ loudNote.id }, 67.0f);
+                rowRoll->diagnosticRefresh();
+                const auto movedOn = rowPaint(true);
+                const auto movedOff = rowPaint(false);
+                const auto afterTheMove = rowDifference(movedOn, movedOff, 1.05, 1.45)
+                    + rowDifference(movedOn, movedOff, 1.55, 1.95);
+                report.add("after_a_real_edit=" + juce::String(afterTheMove));
+                expect("a_changed_sound_still_hides_it", afterTheMove == 0);
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-vibrato-end")
+        {
+            // Where a vibrato stops, movable.  UTAU's always stops at the note's
+            // end -- the VBR length is measured back from there -- so that is
+            // where it starts out, and a handle at the end of the swing moves
+            // it: the end alone, the start staying where it is.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                ProjectData data;
+                {
+                    TrackData track;
+                    track.id = "track";
+                    track.name = "utau";
+                    track.compose = true;
+                    track.pitchAlgorithm = PitchAlgorithm::utau;
+                    ClipData clip;
+                    clip.id = "clip";
+                    clip.durationSeconds = 4.0;
+                    NoteData note;
+                    note.id = "a";
+                    note.label = "a";
+                    note.startSeconds = 1.0;
+                    note.durationSeconds = 1.0;
+                    note.midiNote = 60.0f;
+                    note.sourceMidiCenter = 60.0f;
+                    note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                    note.contour.push_back({ 1.0, 0.0f, 0.0f, true });
+                    note.vibratoEnabled = true;
+                    note.vibratoLengthPercent = 50.0;
+                    note.vibratoCycleMs = 200.0;
+                    note.vibratoDepthCents = 50.0;
+                    note.vibratoFadeInPercent = 20.0;
+                    note.vibratoFadeOutPercent = 20.0;
+                    clip.notes.push_back(std::move(note));
+                    track.clips.push_back(std::move(clip));
+                    data.tracks.push_back(std::move(track));
+                }
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(data);
+                const auto noteNow = [&model]
+                {
+                    const auto held = model->snapshot();
+                    return held.tracks.front().clips.front().notes.front();
+                };
+                const auto loudest = [](const NoteData& note, double from, double to)
+                {
+                    auto most = 0.0;
+                    for (auto time = from; time <= to + 1.0e-9; time += 0.002)
+                        most = std::max(most, std::abs(vibratoCentsAt(note, time)));
+                    return most;
+                };
+
+                // ---- by default it stops where UTAU stops it
+                {
+                    const auto note = noteNow();
+                    const auto span = vibratoSpanOf(note);
+                    report.add("default=" + juce::String(span.start, 3) + ".." + juce::String(span.end, 3));
+                    expect("it_stops_at_the_note_end_by_default",
+                           std::abs(note.vibratoEndPercent - 100.0) < 1.0e-9
+                           && std::abs(span.start - 0.5) < 1.0e-9 && std::abs(span.end - 1.0) < 1.0e-9
+                           && loudest(note, 0.6, 0.9) > 20.0);
+                }
+
+                // ---- moved to 80%: nothing of it past there, heard or drawn
+                {
+                    auto parameters = noteNow();
+                    parameters.vibratoEndPercent = 80.0;
+                    model->setNotesVibrato({ "a" }, parameters, true);
+                    const auto note = noteNow();
+                    const auto span = vibratoSpanOf(note);
+                    const auto sent = AudioEngine::diagnosticUtauRequestNotes(model->snapshot(), "clip");
+                    auto sungAfter = 0.0f, sungWithin = 0.0f;
+                    if (!sent.empty())
+                        for (const auto& point : sent.front().pitchCurve)
+                        {
+                            if (point.timeSeconds > 0.805 && point.timeSeconds <= 1.0)
+                                sungAfter = std::max(sungAfter, std::abs(point.cents));
+                            if (point.timeSeconds > 0.35 && point.timeSeconds < 0.75)
+                                sungWithin = std::max(sungWithin, std::abs(point.cents));
+                        }
+                    report.add("moved=" + juce::String(span.start, 3) + ".." + juce::String(span.end, 3)
+                               + ",sung_after=" + juce::String(sungAfter, 2)
+                               + ",sung_within=" + juce::String(sungWithin, 2));
+                    expect("moved_its_length_counts_back_from_the_new_end",
+                           std::abs(span.start - 0.3) < 1.0e-9 && std::abs(span.end - 0.8) < 1.0e-9);
+                    expect("and_past_it_the_note_is_on_its_own_pitch",
+                           loudest(note, 0.801, 1.0) < 1.0e-9 && loudest(note, 0.35, 0.75) > 20.0
+                           && sent.size() == 1 && sungAfter < 1.0e-3f && sungWithin > 20.0f);
+                    // Without a fade-out nothing brings the swing down to zero
+                    // at the end, so only the end itself can stop it there.
+                    auto abrupt = note;
+                    abrupt.vibratoFadeOutPercent = 0.0;
+                    report.add("abrupt_after=" + juce::String(loudest(abrupt, 0.801, 1.0), 2)
+                               + ",abrupt_before=" + juce::String(loudest(abrupt, 0.6, 0.799), 2));
+                    expect("and_it_stops_there_even_with_no_fade_out",
+                           loudest(abrupt, 0.801, 1.0) < 1.0e-9 && loudest(abrupt, 0.6, 0.799) > 20.0);
+                }
+
+                // ---- the handles, dragged the way a person drags them
+                I18n strings;
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 1400, 600);
+                roll->setPixelsPerSecond(400.0f);
+                roll->setFocusedTrack("track");
+                roll->setTool(PianoRollComponent::Tool::note);
+                roll->diagnosticRefresh();
+                roll->selectAllNotes();
+                const auto event = [&roll](juce::Point<float> where, juce::Point<float> from)
+                {
+                    return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(),
+                        where, juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+                        1.0f, 0.0f, 0.0f, 0.0f, 0.0f, roll.get(), roll.get(),
+                        juce::Time::getCurrentTime(), from, juce::Time::getCurrentTime(), 1, false);
+                };
+                const auto drag = [&](juce::Point<float> from, juce::Point<float> to)
+                {
+                    roll->mouseDown(event(from, from));
+                    roll->mouseDrag(event({ (from.x + to.x) * 0.5f, (from.y + to.y) * 0.5f }, from));
+                    roll->mouseDrag(event(to, from));
+                    roll->mouseUp(event(to, from));
+                    roll->diagnosticRefresh();
+                };
+                const auto endHandle = roll->diagnosticVibratoHandle("a", "end");
+                const auto lineY = roll->diagnosticYForMidi(60.0f);
+                report.add("end_handle_x=" + (endHandle ? juce::String(endHandle->x, 1) : juce::String("-"))
+                           + ",expected=" + juce::String(roll->diagnosticEdgeX(1.8), 1));
+                expect("a_handle_sits_where_it_stops",
+                       endHandle && std::abs(endHandle->x - roll->diagnosticEdgeX(1.8)) < 0.5f
+                       && std::abs(endHandle->y - lineY) < 0.5f);
+                if (endHandle)
+                    drag(*endHandle, { roll->diagnosticEdgeX(1.7), endHandle->y });
+                {
+                    const auto span = vibratoSpanOf(noteNow());
+                    report.add("end_dragged=" + juce::String(span.start, 3) + ".." + juce::String(span.end, 3));
+                    expect("dragging_it_moves_the_end",
+                           std::abs(span.end - 0.7) < 0.004 && std::abs(noteNow().vibratoEndPercent - 70.0) < 0.4);
+                    expect("and_leaves_the_start_where_it_was", std::abs(span.start - 0.3) < 0.004);
+                }
+                if (const auto startHandle = roll->diagnosticVibratoHandle("a", "length"))
+                    drag(*startHandle, { roll->diagnosticEdgeX(1.2), startHandle->y });
+                {
+                    const auto span = vibratoSpanOf(noteNow());
+                    report.add("start_dragged=" + juce::String(span.start, 3) + ".." + juce::String(span.end, 3));
+                    expect("moving_the_start_leaves_the_end",
+                           std::abs(span.start - 0.2) < 0.004 && std::abs(span.end - 0.7) < 0.004);
+                }
+                // The fade-out is measured back from the end it now has.
+                {
+                    const auto fade = roll->diagnosticVibratoHandle("a", "fadeOut");
+                    expect("the_fade_out_counts_back_from_the_end",
+                           fade && std::abs(fade->x - roll->diagnosticEdgeX(1.0 + 0.7 - 0.5 * 0.2)) < 0.6f);
+                }
+                // No fade-out: that handle sits right on the end, and both must
+                // still be there to take hold of.
+                {
+                    auto parameters = noteNow();
+                    parameters.vibratoFadeOutPercent = 0.0;
+                    model->setNotesVibrato({ "a" }, parameters, true);
+                    roll->diagnosticRefresh();
+                    const auto fade = roll->diagnosticVibratoHandle("a", "fadeOut");
+                    const auto end = roll->diagnosticVibratoHandle("a", "end");
+                    expect("with_no_fade_out_the_two_are_apart",
+                           fade && end && fade->getDistanceFrom(*end) >= 8.0f);
+                    if (fade)
+                        drag(*fade, { roll->diagnosticEdgeX(1.6), fade->y });
+                    const auto afterFade = noteNow();
+                    if (const auto endNow = roll->diagnosticVibratoHandle("a", "end"))
+                        drag(*endNow, { roll->diagnosticEdgeX(1.75), endNow->y });
+                    const auto afterEnd = noteNow();
+                    report.add("fade_out_now=" + juce::String(afterFade.vibratoFadeOutPercent, 1)
+                               + ",end_now=" + juce::String(afterEnd.vibratoEndPercent, 1));
+                    expect("and_each_takes_its_own_drag",
+                           afterFade.vibratoFadeOutPercent > 10.0
+                           && std::abs(afterFade.vibratoEndPercent - 70.0) < 0.4
+                           && std::abs(afterEnd.vibratoEndPercent - 75.0) < 0.4);
+                }
+
+                // ---- a change to the end is a change to what is sung
+                {
+                    auto moved = noteNow();
+                    moved.vibratoEndPercent = 60.0;
+                    expect("the_render_hears_it",
+                           AudioEngine::utauNoteRenderHash(noteNow()) != AudioEngine::utauNoteRenderHash(moved));
+                }
+
+                // ---- baked into points, it stops where it stops -- with no
+                // fade-out, so the stop is a step the points have to keep
+                {
+                    auto abrupt = noteNow();
+                    abrupt.vibratoFadeOutPercent = 0.0;
+                    model->setNotesVibrato({ "a" }, abrupt, true);
+                    const auto before = noteNow();
+                    const auto end = vibratoSpanOf(before).end;
+                    model->bakeNoteVibratoIntoPitch("a");
+                    const auto baked = noteNow();
+                    auto after = 0.0f, within = 0.0f;
+                    for (auto time = end + 0.003; time <= baked.durationSeconds; time += 0.005)
+                        after = std::max(after, std::abs(evaluatePitchCurve(baked.pitchControlPoints, time) - 60.0f));
+                    for (auto time = vibratoSpanOf(before).start + 0.05; time < end - 0.05; time += 0.005)
+                        within = std::max(within, std::abs(evaluatePitchCurve(baked.pitchControlPoints, time) - 60.0f));
+                    report.add("baked_after=" + juce::String(after, 4) + ",baked_within=" + juce::String(within, 3));
+                    expect("baked_it_stops_there_too",
+                           !baked.pitchControlPoints.empty() && after < 0.005f && within > 0.2f);
+                    model->undo();
+                    model->undo();
+                }
+
+                // ---- saved, and read back; a project from before reads as UTAU's
+                {
+                    const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                        .getChildFile("hachi-vibrato-end-" + juce::Uuid().toDashedString());
+                    folder.createDirectory();
+                    const auto saved = folder.getChildFile("end.hjpx");
+                    juce::String error;
+                    const auto wrote = model->save(saved, error);
+                    auto reread = std::make_unique<ProjectModel>();
+                    const auto read = reread->load(saved, error);
+                    const auto readBack = reread->snapshot();
+                    const auto kept = wrote && read
+                        && std::abs(readBack.tracks.front().clips.front().notes.front().vibratoEndPercent
+                                    - noteNow().vibratoEndPercent) < 1.0e-6;
+                    // Without the property, as every project saved before it.
+                    juce::MemoryBlock bytes;
+                    saved.loadFileAsData(bytes);
+                    juce::MemoryInputStream stream(bytes, false);
+                    auto tree = juce::ValueTree::readFromStream(stream);
+                    std::function<void(juce::ValueTree)> strip = [&strip](juce::ValueTree node)
+                    {
+                        node.removeProperty("vibratoEndPercent", nullptr);
+                        for (auto child : node) strip(child);
+                    };
+                    strip(tree);
+                    const auto older = folder.getChildFile("older.hjpx");
+                    {
+                        juce::FileOutputStream out(older);
+                        tree.writeToStream(out);
+                    }
+                    auto olderModel = std::make_unique<ProjectModel>();
+                    const auto readOlder = olderModel->load(older, error);
+                    const auto olderData = olderModel->snapshot();
+                    expect("it_survives_saving", kept);
+                    expect("and_an_older_project_stops_at_the_note_end",
+                           readOlder && std::abs(olderData.tracks.front().clips.front().notes.front()
+                                                     .vibratoEndPercent - 100.0) < 1.0e-9);
+                    folder.deleteRecursively();
+                }
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-hanzi-pinyin")
+        {
+            // Edit > 汉字转拼音: every Chinese character in a UTAU track's
+            // lyrics to the pinyin its voicebank's aliases are spelt in, the
+            // rest of each lyric as it was, in one undoable step, and only
+            // where the track is UTAU.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto utf8 = [](const char* text) { return juce::String::fromUTF8(text); };
+
+                // ---- the conversion itself
+                const std::vector<std::pair<const char*, const char*>> cases {
+                    { "你", "ni" }, { "好", "hao" }, { "的", "de" },
+                    // u umlaut as the voicebanks spell it; after j q x y it is u
+                    { "绿", "lv" }, { "女", "nv" }, { "略", "lve" },
+                    { "去", "qu" }, { "雪", "xue" }, { "鱼", "yu" },
+                    // a traditional character reads as its simplified form
+                    { "愛", "ai" }, { "說", "shuo" },
+                    // everything that is not a Chinese character stays
+                    { "- 你", "- ni" }, { "你 R", "ni R" }, { "_爱", "_ai" },
+                    { "a", "a" }, { "R", "R" }, { "", "" }, { "ka3", "ka3" },
+                    { "你好", "nihao" }, { "〇", "ling" }, { "。", "。" },
+                };
+                auto wrong = 0;
+                juce::String firstWrong;
+                for (const auto& [lyric, pinyin] : cases)
+                    if (lyricInPinyin(utf8(lyric)) != utf8(pinyin))
+                    {
+                        if (wrong++ == 0)
+                            firstWrong = utf8(lyric) + "->" + lyricInPinyin(utf8(lyric));
+                    }
+                report.add("cases=" + juce::String(static_cast<int>(cases.size()))
+                           + ",wrong=" + juce::String(wrong)
+                           + (firstWrong.isNotEmpty() ? ",first=" + firstWrong : juce::String()));
+                expect("each_lyric_as_its_voicebank_spells_it", wrong == 0);
+
+                // ---- on a project: the UTAU track only, in one step
+                ProjectData data;
+                const auto track = [&utf8](const char* id, PitchAlgorithm algorithm,
+                                           std::initializer_list<const char*> lyrics)
+                {
+                    TrackData made;
+                    made.id = id;
+                    made.name = id;
+                    made.compose = true;
+                    made.pitchAlgorithm = algorithm;
+                    ClipData clip;
+                    clip.id = juce::String(id) + "-clip";
+                    clip.durationSeconds = 8.0;
+                    auto at = 0.5;
+                    for (const auto* lyric : lyrics)
+                    {
+                        NoteData note;
+                        note.id = juce::String(id) + "-" + juce::String(static_cast<int>(clip.notes.size()));
+                        note.label = utf8(lyric);
+                        note.startSeconds = at;
+                        note.durationSeconds = 0.4;
+                        note.midiNote = 60.0f;
+                        note.sourceMidiCenter = 60.0f;
+                        note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                        note.contour.push_back({ 0.4, 0.0f, 0.0f, true });
+                        clip.notes.push_back(std::move(note));
+                        at += 0.5;
+                    }
+                    made.clips.push_back(std::move(clip));
+                    return made;
+                };
+                data.tracks.push_back(track("utau", PitchAlgorithm::utau,
+                                            { "你", "- 爱", "a", "绿 R", "好" }));
+                data.tracks.push_back(track("plain", PitchAlgorithm::mld5, { "你", "好" }));
+                const auto labelsOf = [](const ProjectData& project, const char* trackId)
+                {
+                    juce::StringArray labels;
+                    for (const auto& each : project.tracks)
+                        if (each.id == trackId)
+                            for (const auto& clip : each.clips)
+                                for (const auto& note : clip.notes) labels.add(note.label);
+                    return labels.joinIntoString("/");
+                };
+                {
+                    auto model = std::make_unique<ProjectModel>();
+                    model->replace(data);
+                    const auto changed = model->convertTrackLyricsToPinyin("utau");
+                    const auto untouched = model->convertTrackLyricsToPinyin("plain");
+                    const auto after = model->snapshot();
+                    report.add("utau=" + labelsOf(after, "utau") + ",plain=" + labelsOf(after, "plain")
+                               + ",changed=" + juce::String(changed));
+                    expect("the_utau_track_is_converted",
+                           labelsOf(after, "utau") == "ni/- ai/a/lv R/hao" && changed == 4);
+                    expect("native_track_converts_too",
+                           untouched == 2 && labelsOf(after, "plain") == "ni/hao");
+                    model->undo();
+                    expect("native_conversion_undo_is_separate",
+                           labelsOf(model->snapshot(), "plain") == utf8("你/好")
+                           && labelsOf(model->snapshot(), "utau") == "ni/- ai/a/lv R/hao");
+                    model->undo();
+                    const auto undone = model->snapshot();
+                    expect("one_undo_puts_every_lyric_back",
+                           labelsOf(undone, "utau") == utf8("你/- 爱/a/绿 R/好"));
+                }
+
+                // ---- in the window: offered on a UTAU track, and only there
+                {
+                    auto window = std::make_unique<MainComponent>();
+                    window->setBounds(0, 0, 1280, 760);
+                    window->diagnosticProject().replace(data);
+                    window->diagnosticSelectTrack("utau");
+                    const auto onUtau = window->diagnosticEditMenuItemEnabled(
+                        MainComponent::hanziToPinyinMenuItem);
+                    window->diagnosticChooseMenuItem(MainComponent::hanziToPinyinMenuItem);
+                    const auto chosen = window->diagnosticProject().snapshot();
+                    window->diagnosticSelectTrack("plain");
+                    const auto onPlain = window->diagnosticEditMenuItemEnabled(
+                        MainComponent::hanziToPinyinMenuItem);
+                    window->diagnosticChooseMenuItem(MainComponent::hanziToPinyinMenuItem);
+                    const auto plainAfter = window->diagnosticProject().snapshot();
+                    report.add(juce::String("menu_on_utau=") + (onUtau ? (*onUtau ? "on" : "off") : "absent")
+                               + ",on_plain=" + (onPlain ? (*onPlain ? "on" : "off") : "absent"));
+                    expect("the_edit_menu_offers_it_on_a_utau_track",
+                           onUtau.has_value() && *onUtau
+                           && labelsOf(chosen, "utau") == "ni/- ai/a/lv R/hao");
+                    expect("native_menu_converts_lyrics",
+                           onPlain.has_value() && *onPlain
+                           && labelsOf(plainAfter, "plain") == "ni/hao");
+                }
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-shared-pitch-line")
+        {
+            // A pitch point moves the pitch at its own moment, whichever note
+            // it was placed on.  The first point of a UST bend sits before its
+            // note, over the tail of the note before; dragging it used to
+            // reshape only its own note's consonant while the tail it lay on
+            // sang on unchanged -- "I dragged it for ages and nothing moved".
+            //
+            // Checked on what is sent to the resampler and on the line drawn,
+            // with the drag done the way a person does it: press on the point,
+            // move, release.  And on what must not change: a note's body, the
+            // next note's own bend, notes that only touch, notes apart.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                    std::cout << name << '=' << value << std::endl;
+                };
+                ProjectData data;
+                {
+                    TrackData track;
+                    track.id = "track";
+                    track.name = "utau";
+                    track.compose = true;
+                    track.pitchAlgorithm = PitchAlgorithm::utau;
+                    ClipData clip;
+                    clip.id = "clip";
+                    clip.startSeconds = 0.0;
+                    clip.durationSeconds = 8.0;
+                    const auto add = [&clip](const char* label, double start, float midi,
+                                             std::vector<PitchCurveEditPoint> points,
+                                             bool automatic)
+                    {
+                        NoteData note;
+                        note.id = label;
+                        note.label = label;
+                        note.startSeconds = start;
+                        note.durationSeconds = 0.5;
+                        note.midiNote = midi;
+                        note.sourceMidiCenter = midi;
+                        note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                        note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                        note.pitchControlPoints = std::move(points);
+                        note.utauAutoPitchTransition = automatic;
+                        clip.notes.push_back(std::move(note));
+                    };
+                    const auto point = [](double time, float midi, PitchCurveShape shape)
+                    {
+                        PitchCurveEditPoint made { time, midi };
+                        made.shape = shape;
+                        return made;
+                    };
+                    // As real USTs write them, over and over: ya's bend runs
+                    // on two hundred milliseconds past its own end, into yu,
+                    // and yu's bend starts back inside ya.
+                    add("ya", 0.0, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                            point(0.1, 60.0f, PitchCurveShape::smooth),
+                                            point(0.7, 61.0f, PitchCurveShape::smooth) }, false);
+                    add("yu", 0.5, 64.0f, { point(-0.06, 60.0f, PitchCurveShape::natural),
+                                            point(0.06, 64.0f, PitchCurveShape::smooth) }, false);
+                    // A as a UST writes a note with no bend; B's bend starts
+                    // inside A, at A's pitch, the way three in four do.
+                    add("a", 2.0, 60.0f, {}, false);
+                    add("ka", 2.5, 62.0f, { point(-0.08, 60.0f, PitchCurveShape::natural),
+                                            point(0.04, 62.0f, PitchCurveShape::smooth) }, false);
+                    // Apart: its bend starts in the silence before it.
+                    add("sa", 3.5, 64.0f, { point(-0.05, 62.0f, PitchCurveShape::natural),
+                                            point(0.05, 64.0f, PitchCurveShape::smooth) }, false);
+                    // Only touching, neither reaching into the other.
+                    add("ta", 4.5, 60.0f, {}, false);
+                    add("na", 5.0, 65.0f, {}, false);
+                    // Two of the editor's own, which take its automatic bridge.
+                    // Their line runs straight from ha's last point to ma's
+                    // first: a transition laid there is an S, and shows.
+                    add("ha", 6.0, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                            point(0.35, 58.0f, PitchCurveShape::natural) }, true);
+                    add("ma", 6.5, 64.0f, { point(-0.1, 60.0f, PitchCurveShape::linear),
+                                            point(0.05, 64.0f, PitchCurveShape::smooth) }, true);
+                    // Across a real gap, independent lines stay independent
+                    // even when la's far point lies past ra's first. Adjacent
+                    // unedited receivers are now covered by timeline-pit.
+                    add("la", 8.0, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                            point(0.7, 62.0f, PitchCurveShape::smooth) }, false);
+                    add("ra", 8.6, 65.0f, {}, false);
+                    // Over a rest short enough to be an articulation -- 46 ms,
+                    // as a UST's rest comes in, a gap -- a bend reaching back
+                    // into the note before joins them as if they touched.
+                    // Over a tenth of a second it does not, and nothing
+                    // carries a curve over a rest into a note with no points.
+                    add("ki", 9.5, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                            point(0.3, 60.0f, PitchCurveShape::natural) }, false);
+                    add("ku", 10.046, 67.0f, { point(-0.06, 64.0f, PitchCurveShape::natural),
+                                               point(0.05, 67.0f, PitchCurveShape::smooth) }, false);
+                    add("ke", 11.0, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                             point(0.3, 60.0f, PitchCurveShape::natural) }, false);
+                    add("ko", 11.6, 67.0f, { point(-0.12, 64.0f, PitchCurveShape::natural),
+                                             point(0.05, 67.0f, PitchCurveShape::smooth) }, false);
+                    add("hi", 12.5, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                             point(0.3, 60.0f, PitchCurveShape::natural),
+                                             point(0.6, 62.0f, PitchCurveShape::smooth) }, false);
+                    add("hu", 13.05, 65.0f, {}, false);
+                    track.clips.push_back(std::move(clip));
+                    data.tracks.push_back(std::move(track));
+                }
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(data);
+
+                // What the resampler is asked to sing, by lyric, in MIDI.
+                std::map<juce::String, backend::UtauNoteRenderSpec> sent;
+                const auto send = [&model, &sent]
+                {
+                    sent.clear();
+                    for (auto& note : AudioEngine::diagnosticUtauRequestNotes(model->snapshot(), "clip"))
+                        sent[note.alias] = std::move(note);
+                };
+                const auto sung = [&sent](const char* lyric, double time)
+                {
+                    const auto& note = sent.at(lyric);
+                    const auto& curve = note.pitchCurve;
+                    if (curve.empty()) return note.midiNote;
+                    auto cents = curve.back().cents;
+                    if (time <= curve.front().timeSeconds) cents = curve.front().cents;
+                    else
+                        for (std::size_t index = 1; index < curve.size(); ++index)
+                            if (time <= curve[index].timeSeconds)
+                            {
+                                const auto& left = curve[index - 1];
+                                const auto& right = curve[index];
+                                const auto width = right.timeSeconds - left.timeSeconds;
+                                const auto amount = width > 1.0e-9
+                                    ? static_cast<float>((time - left.timeSeconds) / width) : 0.0f;
+                                cents = left.cents + (right.cents - left.cents) * amount;
+                                break;
+                            }
+                    return note.midiNote + cents / 100.0f;
+                };
+                const auto ownOf = [&model](const char* id)
+                {
+                    // A copy first: a range-for straight over snapshot()'s
+                    // members reads a temporary that is already gone.
+                    const auto held = model->snapshot();
+                    for (const auto& note : held.tracks.front().clips.front().notes)
+                        if (note.id == id) return note.pitchControlPoints;
+                    return std::vector<PitchCurveEditPoint>();
+                };
+                const auto near = [](float left, float right, float within = 0.01f)
+                {
+                    return std::abs(left - right) < within;
+                };
+
+                send();
+                const auto kaOwn = ownOf("ka");
+                const auto maOwn = ownOf("ma");
+                report.add("a_tail=" + juce::String(sung("a", 0.47), 3)
+                           + ",ka_there=" + juce::String(sung("ka", -0.03), 3)
+                           + ",ka_head=" + juce::String(sung("ka", 0.0), 3)
+                           + ",na_consonant=" + juce::String(sung("na", -0.1), 3));
+                // The stretch of a's tail that ka's bend lies on is sung along
+                // that bend, by both notes alike.
+                expect("the_tail_follows_the_next_notes_bend",
+                       sung("a", 0.47) > 60.1f && near(sung("a", 0.47), sung("ka", -0.03)));
+                expect("the_next_bend_is_sung_as_before",
+                       near(sung("ka", 0.0), evaluatePitchCurve(kaOwn, 0.0))
+                       && near(sung("ka", 0.02), evaluatePitchCurve(kaOwn, 0.02))
+                       && near(sung("ka", -0.2), 60.0f));
+                expect("the_body_is_untouched",
+                       near(sung("a", 0.2), 60.0f) && near(sung("a", 0.36), 60.0f));
+                // sa's bend starts in the silence before it and reaches into no
+                // note: sampled over its own points as it always was.
+                expect("notes_apart_keep_their_own",
+                       !sent.at("sa").pitchCurve.empty()
+                       && sent.at("sa").pitchCurve.front().timeSeconds > -0.06
+                       && near(sung("sa", -0.3), 62.0f));
+                // na's consonant stays at na's pitch, as UTAU sings it.
+                expect("touching_notes_keep_their_own",
+                       near(sung("na", -0.1), 65.0f) && near(sung("ta", 0.55), 60.0f));
+                // The bridge the editor lays between its own notes -- twenty
+                // milliseconds either side of the boundary -- would sing
+                // something else over the very point being shaped.
+                // ya's bend past its end is its own tail's in UTAU; here, from
+                // yu's first point on, yu decides -- the two lines do not zig-zag
+                // through each other's points -- and ya up to there is sung
+                // exactly as its own curve says, far point and all.
+                const auto yaOwn = ownOf("ya");
+                const auto yuOwn = ownOf("yu");
+                report.add("ya_at_0.3=" + juce::String(sung("ya", 0.3), 3)
+                           + ",yu_at_0.1=" + juce::String(sung("yu", 0.1), 3)
+                           + ",ya_under_yu=" + juce::String(sung("ya", 0.6), 3));
+                expect("a_bend_past_its_note_gives_way_to_the_next",
+                       near(sung("yu", 0.1), evaluatePitchCurve(yuOwn, 0.1))
+                       && near(sung("yu", 0.0), evaluatePitchCurve(yuOwn, 0.0))
+                       && near(sung("ya", 0.6), sung("yu", 0.1)));
+                // ya is sung as it stands up to its last point before yu's
+                // first -- 0.1 -- and from there runs smoothly into it.
+                expect("and_up_to_there_is_sung_as_it_stands",
+                       near(sung("ya", 0.05), evaluatePitchCurve(yaOwn, 0.05))
+                       && near(sung("ya", 0.1), evaluatePitchCurve(yaOwn, 0.1))
+                       && near(sung("ya", 0.3), 60.0f) && near(sung("ya", 0.44), 60.0f));
+                expect("no_bridge_over_a_shared_line",
+                       near(sung("ma", 0.0), evaluatePitchCurve(maOwn, 0.0))
+                       && near(sung("ma", -0.01), evaluatePitchCurve(maOwn, -0.01))
+                       && near(sung("ha", 0.5), sung("ma", 0.0))
+                       && near(sung("ha", 0.49), sung("ma", -0.01)));
+                // Nor over the stretch between their points, where the
+                // editor's transition between two notes now runs.
+                auto joinAsDrawn = true;
+                for (const auto time : { 6.36, 6.37, 6.38 })
+                {
+                    const auto wanted = 58.0f + 2.0f * static_cast<float>((time - 6.35) / 0.05);
+                    joinAsDrawn = joinAsDrawn && near(sung("ha", time - 6.0), wanted)
+                                  && near(sung("ma", time - 6.5), wanted);
+                }
+                report.add("ha_at_6.36=" + juce::String(sung("ha", 0.36), 3));
+                expect("nor_between_their_points", joinAsDrawn);
+                report.add("ki_tail=" + juce::String(sung("ki", 0.49), 3)
+                           + ",ke_tail=" + juce::String(sung("ke", 0.49), 3)
+                           + ",hu_head=" + juce::String(sung("hu", 0.0), 3));
+                expect("a_bend_reaches_over_a_short_rest",
+                       sung("ki", 0.49) > 63.0f && near(sung("ki", 0.49), sung("ku", -0.056)));
+                expect("but_not_over_a_real_gap",
+                       near(sung("ke", 0.49), 60.0f) && near(sung("ke", 0.45), 60.0f));
+                expect("nor_carries_a_curve_over_a_rest_into_a_note_without_points",
+                       near(sung("hu", 0.0), 65.0f) && near(sung("hu", 0.03), 65.0f));
+
+                // ---- the roll: the line drawn, the handles, and the drag
+                I18n strings;
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 1600, 700);
+                roll->setPixelsPerSecond(300.0f);
+                roll->setFocusedTrack("track");
+                roll->setTool(PianoRollComponent::Tool::points);
+                roll->diagnosticRefresh();
+                auto drawnAsSung = true;
+                for (const auto time : { 2.30, 2.40, 2.42, 2.45 })
+                {
+                    const auto drawn = roll->diagnosticPitchLineAt("a", time);
+                    drawnAsSung = drawnAsSung && drawn && near(*drawn, sung("a", time - 2.0));
+                }
+                for (const auto time : { 2.45, 2.52, 2.60 })
+                {
+                    const auto drawn = roll->diagnosticPitchLineAt("ka", time);
+                    drawnAsSung = drawnAsSung && drawn && near(*drawn, sung("ka", time - 2.5));
+                }
+                expect("the_line_drawn_is_the_line_sung", drawnAsSung);
+                const auto aSpan = roll->diagnosticPitchLineSpan("a");
+                const auto kaSpan = roll->diagnosticPitchLineSpan("ka");
+                report.add("a_drawn=" + (aSpan ? juce::String(aSpan->first, 3) + ".."
+                                                 + juce::String(aSpan->second, 3) : juce::String("-"))
+                           + ",ka_drawn=" + (kaSpan ? juce::String(kaSpan->first, 3) + ".."
+                                                   + juce::String(kaSpan->second, 3) : juce::String("-")));
+                expect("drawn_end_to_end",
+                       aSpan && kaSpan && std::abs(aSpan->second - kaSpan->first) < 1.0e-6
+                       && std::abs(kaSpan->first - 2.42) < 1.0e-6);
+                // a has no points of its own: the handles derived from its
+                // contour stop where ka's bend begins.  One past it would sit
+                // on the line and move nothing.
+                auto noDeadHandle = true;
+                const auto aHandles = roll->diagnosticOfferedPitchAnchors("a");
+                for (const auto& handle : aHandles)
+                    noDeadHandle = noDeadHandle && 2.0 + handle.timeSeconds < 2.42 - 1.0e-6;
+                // ya's far point sits where yu decides: not offered either.
+                const auto yaHandles = roll->diagnosticOfferedPitchAnchors("ya");
+                for (const auto& handle : yaHandles)
+                    noDeadHandle = noDeadHandle && handle.timeSeconds < 0.44 - 1.0e-6;
+                report.add("offered=a:" + juce::String(static_cast<int>(aHandles.size()))
+                           + ",ya:" + juce::String(static_cast<int>(yaHandles.size())));
+                expect("no_handle_that_moves_nothing",
+                       !aHandles.empty() && yaHandles.size() == 2 && noDeadHandle);
+
+                const auto event = [&roll](juce::Point<float> where, juce::Point<float> from)
+                {
+                    return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(),
+                        where, juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+                        1.0f, 0.0f, 0.0f, 0.0f, 0.0f, roll.get(), roll.get(),
+                        juce::Time::getCurrentTime(), from, juce::Time::getCurrentTime(), 1, false);
+                };
+                // Where a handle is not drawn, nothing is taken hold of: a's
+                // own end at 2.5 and ya's far point at 0.7 both lie where a
+                // later bend decides.
+                auto nothingHidden = true;
+                for (const auto& [seconds, midi] : { std::pair { 2.5, 60.0f }, std::pair { 0.7, 61.0f } })
+                {
+                    const juce::Point<float> at(roll->diagnosticEdgeX(seconds), roll->diagnosticYForMidi(midi));
+                    roll->mouseDown(event(at, at));
+                    nothingHidden = nothingHidden && !roll->diagnosticDraggingAnchor();
+                    roll->mouseUp(event(at, at));
+                    roll->diagnosticRefresh();
+                }
+                expect("a_hidden_handle_cannot_be_taken_hold_of", nothingHidden);
+
+                // A point added over a's tail, where ka's bend is sung, is ka's
+                // -- even clicked at a's own pitch, a line a no longer sings
+                // there.  Added to a, it would decide nothing.
+                const auto kaBefore = ownOf("ka").size();
+                {
+                    const juce::Point<float> on(roll->diagnosticEdgeX(2.47),
+                                                roll->diagnosticYForMidi(60.0f));
+                    roll->mouseDoubleClick(event(on, on));
+                    roll->diagnosticRefresh();
+                }
+                const auto kaAfter = ownOf("ka").size();
+                report.add("ka_points=" + juce::String(static_cast<int>(kaBefore)) + "->"
+                           + juce::String(static_cast<int>(kaAfter))
+                           + ",a_points=" + juce::String(static_cast<int>(ownOf("a").size())));
+                expect("a_point_added_there_goes_to_the_owner",
+                       kaAfter == kaBefore + 1 && ownOf("a").empty());
+                // Put back, so the drag below starts from the file's bend.
+                model->undo();
+                roll->diagnosticRefresh();
+                send();
+
+                // a's own handle, dragged right, goes as far as ka's first
+                // point -- onto the same vertical line -- and no further, where
+                // it would decide nothing and vanish from under the pointer.
+                // There it is still a's, and still shown, and so is ka's.
+                {
+                    const juce::Point<float> from(roll->diagnosticEdgeX(2.0), roll->diagnosticYForMidi(60.0f));
+                    const juce::Point<float> to(roll->diagnosticEdgeX(2.48), from.y);
+                    roll->mouseDown(event(from, from));
+                    roll->mouseDrag(event({ (from.x + to.x) * 0.5f, from.y }, from));
+                    roll->mouseDrag(event(to, from));
+                    roll->mouseUp(event(to, from));
+                    roll->diagnosticRefresh();
+                }
+                const auto aMoved = ownOf("a");
+                const auto aOffered = roll->diagnosticOfferedPitchAnchors("a");
+                report.add("a_dragged_to=" + (aMoved.empty() ? juce::String("-")
+                                                             : juce::String(aMoved.front().timeSeconds, 3))
+                           + ",offered=" + juce::String(static_cast<int>(aOffered.size())));
+                const auto kaOfferedThen = roll->diagnosticOfferedPitchAnchors("ka");
+                expect("a_handle_stops_where_the_next_takes_over",
+                       !aMoved.empty() && std::abs(aMoved.front().timeSeconds - 0.42) < 1.0e-6
+                       && aOffered.size() == 1 && std::abs(aOffered.front().timeSeconds - 0.42) < 1.0e-6
+                       && !kaOfferedThen.empty()
+                       && std::abs(kaOfferedThen.front().timeSeconds + 0.08) < 1.0e-6);
+                model->undo();
+                roll->diagnosticRefresh();
+                send();
+
+                // ---- one vertical line at most
+                //
+                // A note's first point, dragged back over the note before, goes
+                // as far as that note's last point on screen and no further:
+                // past it, that point would be overruled and vanish.  The two
+                // may stand on one vertical line, and both stay there.
+                {
+                    struct Head { const char* note; const char* before; double seconds; float midi;
+                                  double stopsAt; };
+                    auto stopped = true, keptShown = true;
+                    juce::String where;
+                    for (const auto& head : { Head { "ka", "a", 2.42, 60.0f, 2.0 },
+                                              Head { "yu", "ya", 0.44, 60.0f, 0.1 } })
+                    {
+                        const auto beforeShown = roll->diagnosticOfferedPitchAnchors(head.before);
+                        const juce::Point<float> from(roll->diagnosticEdgeX(head.seconds),
+                                                      roll->diagnosticYForMidi(head.midi));
+                        const juce::Point<float> to(roll->diagnosticEdgeX(head.seconds - 0.8), from.y);
+                        roll->mouseDown(event(from, from));
+                        const auto took = roll->diagnosticDraggingAnchor();
+                        roll->mouseDrag(event({ (from.x + to.x) * 0.5f, from.y }, from));
+                        roll->mouseDrag(event(to, from));
+                        const auto whileHeld = roll->diagnosticOfferedPitchAnchors(head.before);
+                        roll->mouseUp(event(to, from));
+                        roll->diagnosticRefresh();
+                        const auto afterShown = roll->diagnosticOfferedPitchAnchors(head.before);
+                        const auto moved = ownOf(head.note);
+                        const auto held = model->snapshot();
+                        double noteStart = 0.0;
+                        for (const auto& note : held.tracks.front().clips.front().notes)
+                            if (note.id == head.note) noteStart = note.startSeconds;
+                        const auto at = moved.empty() ? -1.0 : noteStart + moved.front().timeSeconds;
+                        where << " " << head.note << "=" << juce::String(at, 3);
+                        stopped = stopped && took && std::abs(at - head.stopsAt) < 1.0e-6;
+                        // Every point the note before showed, it shows still --
+                        // the one on the line included -- while held and after.
+                        keptShown = keptShown && whileHeld.size() == beforeShown.size()
+                            && afterShown.size() == beforeShown.size();
+                        model->undo();
+                        roll->diagnosticRefresh();
+                    }
+                    // A head a file already put further back than the note
+                    // before's last point -- ra's, before la's far one -- is
+                    // left where it is on being taken, not pulled forward.
+                    {
+                        const juce::Point<float> from(roll->diagnosticEdgeX(8.6),
+                                                      roll->diagnosticYForMidi(65.0f));
+                        const juce::Point<float> to(from.x + 6.0f, from.y);
+                        roll->mouseDown(event(from, from));
+                        const auto took = roll->diagnosticDraggingAnchor();
+                        roll->mouseDrag(event({ from.x + 3.0f, from.y }, from));
+                        roll->mouseDrag(event(to, from));
+                        roll->mouseUp(event(to, from));
+                        roll->diagnosticRefresh();
+                        const auto raNow = ownOf("ra");
+                        const auto expected = (to.x - from.x) / 300.0;
+                        const auto at = raNow.empty() ? -1.0 : raNow.front().timeSeconds;
+                        where << " ra=" << juce::String(8.6 + at, 3);
+                        stopped = stopped && took && std::abs(at - expected) < 0.002;
+                        if (!raNow.empty()) model->undo();
+                        roll->diagnosticRefresh();
+                    }
+                    report.add("heads_stopped_at=" + where.trim());
+                    expect("a_head_stops_at_the_previous_notes_last_point", stopped);
+                    expect("and_that_point_stays_shown", keptShown);
+                }
+                // The note before's last point, dragged forward, the mirror:
+                // ya's point at 0.1 goes as far as yu's first, at 0.44.
+                {
+                    const juce::Point<float> from(roll->diagnosticEdgeX(0.1), roll->diagnosticYForMidi(60.0f));
+                    const juce::Point<float> to(roll->diagnosticEdgeX(0.9), from.y);
+                    roll->mouseDown(event(from, from));
+                    roll->mouseDrag(event({ (from.x + to.x) * 0.5f, from.y }, from));
+                    roll->mouseDrag(event(to, from));
+                    roll->mouseUp(event(to, from));
+                    roll->diagnosticRefresh();
+                    const auto yaNow = ownOf("ya");
+                    const auto yaShown = roll->diagnosticOfferedPitchAnchors("ya");
+                    const auto yuShown = roll->diagnosticOfferedPitchAnchors("yu");
+                    report.add("ya_tail_stopped_at=" + (yaNow.size() > 1 ? juce::String(yaNow[1].timeSeconds, 3)
+                                                                         : juce::String("-")));
+                    expect("a_tail_stops_at_the_next_notes_first_point",
+                           yaNow.size() == 3 && std::abs(yaNow[1].timeSeconds - 0.44) < 1.0e-6
+                           && yaShown.size() == 2 && !yuShown.empty()
+                           && std::abs(yuShown.front().timeSeconds + 0.06) < 1.0e-6);
+                    model->undo();
+                    roll->diagnosticRefresh();
+                    send();
+                }
+
+                // Drag ka's first point, over a's tail, down to 58.
+                const juce::Point<float> grab(roll->diagnosticEdgeX(2.42), roll->diagnosticYForMidi(60.0f));
+                const juce::Point<float> drop(grab.x, roll->diagnosticYForMidi(58.0f));
+                roll->mouseDown(event(grab, grab));
+                const auto held = roll->diagnosticDraggingAnchor();
+                roll->mouseDrag(event({ grab.x, (grab.y + drop.y) * 0.5f }, grab));
+                roll->mouseDrag(event(drop, grab));
+                const auto whileHeld = roll->diagnosticPitchLineAt("a", 2.42);
+                roll->mouseUp(event(drop, grab));
+                roll->diagnosticRefresh();
+                send();
+                const auto afterwards = roll->diagnosticPitchLineAt("a", 2.42);
+                report.add("held=" + juce::String(held ? 1 : 0)
+                           + ",drawn_while_held=" + (whileHeld ? juce::String(*whileHeld, 3) : juce::String("-"))
+                           + ",a_sung_at_the_point=" + juce::String(sung("a", 0.42), 3)
+                           + ",a_turning=" + juce::String(sung("a", 0.395), 3)
+                           + ",ka_first=" + juce::String(ownOf("ka").empty() ? 0.0f
+                                                         : ownOf("ka").front().targetMidi, 3));
+                expect("the_point_is_taken_hold_of", held);
+                // a's only point of its own is at its start: from there the
+                // line runs smoothly down into ka's point -- no flat stretch
+                // and then a drop straight down at the hand-over, and nothing
+                // placed in between.
+                expect("dragging_it_moves_the_tail", near(sung("a", 0.42), 58.0f, 0.05f));
+                auto falling = true;
+                auto previousMidi = sung("a", 0.0);
+                for (auto time = 0.01; time <= 0.42 + 1.0e-9; time += 0.01)
+                {
+                    const auto now = sung("a", time);
+                    falling = falling && now <= previousMidi + 1.0e-3f && now >= 58.0f - 1.0e-3f;
+                    previousMidi = now;
+                }
+                report.add("a_joining=" + juce::String(sung("a", 0.1), 3) + ","
+                           + juce::String(sung("a", 0.21), 3) + "," + juce::String(sung("a", 0.35), 3));
+                expect("and_joins_it_smoothly",
+                       falling && near(sung("a", 0.0), 60.0f) && near(sung("a", 0.21), 59.0f, 0.05f)
+                       && std::abs(sung("a", 0.415) - sung("a", 0.42)) < 0.02f);
+                expect("the_line_follows_while_it_is_held",
+                       whileHeld && near(*whileHeld, 58.0f, 0.05f));
+                // Nowhere does the line stand still and then drop straight
+                // down where one note hands over: drawn a millisecond either
+                // side of each hand-over, it has barely moved.
+                auto noStep = true;
+                for (const auto& [id, at] : { std::pair { "a", 2.42 }, std::pair { "ya", 0.44 } })
+                {
+                    const auto before = roll->diagnosticPitchLineAt(id, at - 0.001);
+                    const auto after = roll->diagnosticPitchLineAt(id, at);
+                    noStep = noStep && before && after && std::abs(*before - *after) < 0.05f;
+                }
+                expect("no_step_where_one_note_hands_over", noStep);
+                expect("and_after_it_is_let_go",
+                       afterwards && near(*afterwards, 58.0f, 0.05f));
+
+                // ---- every point on its own
+                //
+                // Dragging one point moves that point.  Nothing else on screen
+                // moves, appears or disappears -- not while it is held, and
+                // not once it is let go -- and no point is added anywhere.
+                // Which handles are shown is settled before a drag begins: a
+                // point dragged across another note's reach does not make that
+                // note's points come and go under it.
+                struct Shown { juce::String note; juce::Point<float> at; };
+                const auto shownHandles = [&model, &roll]
+                {
+                    std::vector<Shown> list;
+                    const auto held = model->snapshot();
+                    for (const auto& note : held.tracks.front().clips.front().notes)
+                        for (const auto& anchor : roll->diagnosticOfferedPitchAnchors(note.id))
+                            list.push_back({ note.id,
+                                { roll->diagnosticEdgeX(note.startSeconds + anchor.timeSeconds),
+                                  roll->diagnosticYForMidi(anchor.targetMidi) } });
+                    return list;
+                };
+                const auto storedCounts = [&model]
+                {
+                    std::map<juce::String, std::size_t> counts;
+                    const auto held = model->snapshot();
+                    for (const auto& note : held.tracks.front().clips.front().notes)
+                        counts[note.id] = note.pitchControlPoints.size();
+                    return counts;
+                };
+                const auto sameExcept = [](const std::vector<Shown>& before,
+                                           const std::vector<Shown>& now,
+                                           const juce::String& draggedNote,
+                                           juce::Point<float> grabbed, bool draggedToo)
+                {
+                    // Every handle still where it was; for the note being
+                    // dragged, every one but the one taken hold of.
+                    auto matched = 0;
+                    auto expected = 0;
+                    for (const auto& handle : before)
+                    {
+                        if (handle.note == draggedNote
+                            && (!draggedToo || handle.at.getDistanceFrom(grabbed) < 0.5f))
+                            continue;
+                        ++expected;
+                        for (const auto& other : now)
+                            if (other.note == handle.note && other.at.getDistanceFrom(handle.at) < 0.5f)
+                            {
+                                ++matched;
+                                break;
+                            }
+                    }
+                    auto count = [](const std::vector<Shown>& list, const juce::String& note, bool mine)
+                    {
+                        auto n = 0;
+                        for (const auto& handle : list) n += (handle.note == note) == mine ? 1 : 0;
+                        return n;
+                    };
+                    // No more and no fewer of them either.
+                    const auto othersKept = count(before, draggedNote, false) == count(now, draggedNote, false);
+                    const auto mineKept = !draggedToo
+                        || count(before, draggedNote, true) == count(now, draggedNote, true);
+                    return matched == expected && othersKept && mineKept;
+                };
+                struct Drag { const char* note; double seconds; float midi; float dx; float dy; };
+                const std::vector<Drag> drags {
+                    { "ka", 2.42, 58.0f, 15.0f, 0.0f },     // the point that reaches back, later
+                    { "ka", 2.42, 58.0f, -15.0f, 0.0f },    // and earlier
+                    { "ka", 2.42, 58.0f, 0.0f, 20.0f },     // and lower
+                    { "a", 2.0, 60.0f, 15.0f, 0.0f },       // the note it reaches into
+                    { "ya", 0.1, 60.0f, 0.0f, -20.0f },     // a note whose bend runs past its end
+                    { "yu", 0.44, 60.0f, -10.0f, 0.0f },    // the point reaching back into that one
+                };
+                auto heldStill = true, afterStill = true, nothingAdded = true;
+                juce::String moved;
+                for (const auto& drag : drags)
+                {
+                    const juce::Point<float> from(roll->diagnosticEdgeX(drag.seconds),
+                                                  roll->diagnosticYForMidi(drag.midi));
+                    const juce::Point<float> to(from.x + drag.dx, from.y + drag.dy);
+                    const auto before = shownHandles();
+                    const auto countsBefore = storedCounts();
+                    roll->mouseDown(event(from, from));
+                    const auto took = roll->diagnosticDraggingAnchor();
+                    roll->mouseDrag(event({ from.x + drag.dx * 0.5f, from.y + drag.dy * 0.5f }, from));
+                    roll->mouseDrag(event(to, from));
+                    const auto during = shownHandles();
+                    roll->mouseUp(event(to, from));
+                    roll->diagnosticRefresh();
+                    const auto after = shownHandles();
+                    auto countsAfter = storedCounts();
+                    // A note with no points of its own gets the ones it was
+                    // showing, and no more.
+                    auto added = false;
+                    for (const auto& [id, n] : countsAfter)
+                    {
+                        auto shownBefore = 0;
+                        for (const auto& handle : before) shownBefore += handle.note == id ? 1 : 0;
+                        const auto found = countsBefore.find(id);
+                        const auto was = found != countsBefore.end() ? found->second : std::size_t { 0 };
+                        if (n != was && !(was == 0 && id == drag.note
+                                          && n <= static_cast<std::size_t>(std::max(shownBefore, 2))))
+                            added = true;
+                    }
+                    const auto heldOk = took && sameExcept(before, during, drag.note, from, false);
+                    const auto afterOk = took && sameExcept(before, after, drag.note, from, true);
+                    heldStill = heldStill && heldOk;
+                    afterStill = afterStill && afterOk;
+                    nothingAdded = nothingAdded && !added;
+                    if (!heldOk || !afterOk || added)
+                        moved << " " << drag.note << "(" << drag.dx << "," << drag.dy << ")"
+                              << (took ? "" : ":not-taken") << (heldOk ? "" : ":held")
+                              << (afterOk ? "" : ":after") << (added ? ":added" : "");
+                    model->undo();
+                    roll->diagnosticRefresh();
+                }
+                // Far enough that ka's point passes a's own end, which ka had
+                // been overruling: shown the moment the lines were recomputed
+                // under the drag, it popped up under the pointer.  Nothing
+                // comes or goes while a point is held.
+                {
+                    const juce::Point<float> from(roll->diagnosticEdgeX(2.42), roll->diagnosticYForMidi(58.0f));
+                    const juce::Point<float> to(from.x + 30.0f, from.y);
+                    const auto before = shownHandles();
+                    roll->mouseDown(event(from, from));
+                    roll->mouseDrag(event({ from.x + 15.0f, from.y }, from));
+                    roll->mouseDrag(event(to, from));
+                    const auto during = shownHandles();
+                    roll->mouseUp(event(to, from));
+                    roll->diagnosticRefresh();
+                    const auto after = shownHandles();
+                    const auto still = sameExcept(before, during, "ka", from, false);
+                    auto aBefore = 0, aAfter = 0;
+                    for (const auto& handle : before) aBefore += handle.note == "a" ? 1 : 0;
+                    for (const auto& handle : after) aAfter += handle.note == "a" ? 1 : 0;
+                    report.add("far_drag_a_handles=" + juce::String(aBefore) + "->" + juce::String(aAfter)
+                               + "_after_release");
+                    expect("nothing_comes_or_goes_while_a_point_is_held", still);
+                    model->undo();
+                    roll->diagnosticRefresh();
+                }
+                report.add("drags=" + juce::String(static_cast<int>(drags.size()))
+                           + (moved.isEmpty() ? juce::String(",all_independent") : ",moved:" + moved));
+                expect("dragging_one_point_moves_no_other_while_held", heldStill);
+                expect("nor_once_it_is_let_go", afterStill);
+                expect("and_no_point_is_added_anywhere", nothingAdded);
+
+                // A bend that runs on past its note's end keeps its far points
+                // where they are when one of its near points is moved: they
+                // used to be pulled back to the note's end, reshaping its tail.
+                {
+                    const juce::Point<float> from(roll->diagnosticEdgeX(0.1), roll->diagnosticYForMidi(60.0f));
+                    roll->mouseDown(event(from, from));
+                    roll->mouseDrag(event({ from.x, from.y - 10.0f }, from));
+                    roll->mouseDrag(event({ from.x, from.y - 20.0f }, from));
+                    roll->mouseUp(event({ from.x, from.y - 20.0f }, from));
+                    roll->diagnosticRefresh();
+                    const auto yaAfter = ownOf("ya");
+                    auto farKept = false;
+                    for (const auto& kept : yaAfter)
+                        farKept = farKept || (std::abs(kept.timeSeconds - 0.7) < 1.0e-9
+                                              && near(kept.targetMidi, 61.0f, 1.0e-4f));
+                    report.add("ya_points_after=" + juce::String(static_cast<int>(yaAfter.size())));
+                    expect("a_point_past_the_note_end_stays_put", yaAfter.size() == 3 && farKept);
+                    model->undo();
+                    roll->diagnosticRefresh();
+                }
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 3 && arguments[0] == "--smoke-waveform-alignment")
+        {
+            // Where a note's waveform is drawn against where its envelope is.
+            // A phrase sung straight through, so every note hands over to the
+            // next one, and the envelope on screen ends where the note stops
+            // being heard in the song.  Nothing may be drawn past it.
+            //
+            // Two ways it was.  The piece runs on past the hand-over, and was
+            // drawn at full height there -- two hundred milliseconds past the
+            // line on a note handing over early.  And a render is only ever of
+            // the notes selected: the last of them is rendered with no note
+            // after it, sings on to its own end, and was drawn doing so while
+            // the envelope on screen, which knows the next note is there,
+            // had already ended.  So a selection is rendered here as well.
+            const juce::File bank(arguments[1].unquoted());
+            const juce::File resampler(arguments[2].unquoted());
+            [this, bank, resampler]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                constexpr int noteCount = 8;
+                // Milliseconds drawn where the envelope on screen is silent --
+                // before its first point, after its last, or pulled to nothing
+                // between them -- for the picture in the note's row and the
+                // faint layer in the envelope lane.  -1 where a note that was
+                // rendered has no picture at all.
+                // And the same for the audio itself as the engine measured it
+                // -- as heard, and before the envelope -- which, when the whole
+                // phrase is rendered, has to end at the line on its own.
+                struct Outside
+                {
+                    int picture = -1;
+                    int ghost = -1;
+                    bool sounds = false;
+                    int heard = -1;
+                    int piece = -1;
+                };
+                const auto measure = [&bank, &resampler](bool withEnvelopes, int selected)
+                {
+                    ProjectData data;
+                    TrackData track;
+                    track.id = "track";
+                    track.name = "utau";
+                    track.compose = true;
+                    track.pitchAlgorithm = PitchAlgorithm::utau;
+                    track.voicebankDirectory = bank;
+                    ClipData clip;
+                    clip.id = "clip";
+                    clip.startSeconds = 0.0;
+                    clip.durationSeconds = 8.0;
+                    // Leads-in from 8 to 215 ms and overlaps from -6 to 69:
+                    // hand-overs early and late, and one silent gap.
+                    const juce::StringArray lyrics { "shi", "qu", "ba", "si",
+                                                     "xiang", "wo", "de", "ni" };
+                    std::vector<juce::String> chosen;
+                    for (int index = 0; index < noteCount; ++index)
+                    {
+                        NoteData note;
+                        note.id = "note" + juce::String(index);
+                        note.label = lyrics[index];
+                        note.startSeconds = 2.0 + 0.4 * index;
+                        note.durationSeconds = 0.4;
+                        note.midiNote = 60.0f + static_cast<float>(index % 3);
+                        note.sourceMidiCenter = note.midiNote;
+                        note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                        note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                        // What a UST brings: every note with an envelope of its
+                        // own, which both ends follow to where it really sounds.
+                        if (withEnvelopes)
+                            note.amplitudeEnvelope = { { -0.30, -60.0f }, { -0.28, 0.0f },
+                                                       { 0.365, 0.0f }, { 0.40, -60.0f } };
+                        if (index < selected) chosen.push_back(note.id);
+                        clip.notes.push_back(std::move(note));
+                    }
+                    track.clips.push_back(std::move(clip));
+                    data.tracks.push_back(std::move(track));
+
+                    auto engine = std::make_unique<AudioEngine>();
+                    engine->setUtauResamplerFile(resampler);
+                    engine->prepareToPlay(512, 48'000.0);
+                    engine->setUtauRenderNoteSelection(chosen);
+                    engine->syncProject(data);
+                    for (int tries = 0; tries < 900 && engine->renderProgress(); ++tries)
+                        juce::Thread::sleep(100);
+                    juce::Thread::sleep(200);
+                    engine->refreshUtauWaveforms();
+                    const auto waveforms = engine->utauNoteWaveforms();
+
+                    I18n strings;
+                    auto model = std::make_unique<ProjectModel>();
+                    model->replace(data);
+                    auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                    roll->setBounds(0, 0, 1200, 600);
+                    roll->setPixelsPerSecond(300.0f);
+                    roll->setFocusedTrack("track");
+                    roll->setUtauNoteWaveforms(waveforms);
+                    roll->diagnosticRefresh();
+
+                    std::vector<Outside> outside(static_cast<std::size_t>(selected));
+                    for (int index = 0; index < selected; ++index)
+                    {
+                        const auto id = "note" + juce::String(index);
+                        const auto drawn = roll->diagnosticDrawnNoteWaveform(id);
+                        const auto envelope = roll->diagnosticDisplayEnvelope(id);
+                        if (!drawn || drawn->picture.empty() || envelope.size() < 2) continue;
+                        auto peak = 0.0f;
+                        for (const auto level : drawn->ghost) peak = std::max(peak, level);
+                        const UtauNoteWaveform* measured = nullptr;
+                        for (const auto& candidate : *waveforms)
+                            if (candidate.noteId == id) measured = &candidate;
+                        if (measured == nullptr
+                            || measured->maxima.size() != drawn->picture.size())
+                            continue;
+                        auto& here = outside[static_cast<std::size_t>(index)];
+                        here = { 0, 0, false, 0, 0 };
+                        for (std::size_t bucket = 0; bucket < drawn->picture.size(); ++bucket)
+                        {
+                            if (drawn->picture[bucket] > 0.1f * peak) here.sounds = true;
+                            const auto seconds = (static_cast<double>(bucket) + 0.5) / 1000.0
+                                - drawn->leadInSeconds;
+                            const auto silent = seconds < envelope.front().timeSeconds
+                                || seconds > envelope.back().timeSeconds
+                                || PianoRollComponent::diagnosticAmplitudeDbAt(
+                                       envelope, seconds) <= -59.9f;
+                            if (!silent) continue;
+                            if (drawn->picture[bucket] > 0.03f * peak) ++here.picture;
+                            if (drawn->ghost[bucket] > 0.03f * peak) ++here.ghost;
+                            if (std::max(measured->maxima[bucket], -measured->minima[bucket])
+                                    > 0.03f * peak)
+                                ++here.heard;
+                            if (std::max(measured->unshapedMaxima[bucket],
+                                         -measured->unshapedMinima[bucket]) > 0.03f * peak)
+                                ++here.piece;
+                        }
+                    }
+                    return outside;
+                };
+                const auto describe = [](const std::vector<Outside>& outside)
+                {
+                    juce::String text;
+                    for (const auto& note : outside)
+                        text << (text.isEmpty() ? "" : " ") << note.picture << "/" << note.ghost
+                             << "/" << note.heard << "/" << note.piece;
+                    return text;
+                };
+                const auto agree = [](const std::vector<Outside>& outside)
+                {
+                    auto all = !outside.empty();
+                    for (const auto& note : outside)
+                        // Two milliseconds: a bucket straddling the last point,
+                        // either side of it.
+                        all = all && note.picture >= 0 && note.picture <= 2
+                            && note.ghost >= 0 && note.ghost <= 2;
+                    return all;
+                };
+                // The audio as measured: every note but the last, which has
+                // nothing to hand over to and rings on to the end of its piece
+                // when it carries no envelope of its own to end it.
+                const auto heardAgrees = [](const std::vector<Outside>& outside, bool lastToo)
+                {
+                    auto all = !outside.empty();
+                    for (std::size_t index = 0; index < outside.size(); ++index)
+                        if (lastToo || index + 1 < outside.size())
+                            all = all && outside[index].heard >= 0 && outside[index].heard <= 2
+                                && outside[index].piece >= 0 && outside[index].piece <= 2;
+                    return all;
+                };
+                const auto sounding = [](const std::vector<Outside>& outside)
+                {
+                    auto all = !outside.empty();
+                    for (const auto& note : outside) all = all && note.sounds;
+                    return all;
+                };
+
+                const auto whole = measure(false, noteCount);
+                const auto enveloped = measure(true, noteCount);
+                // Four of the eight: the fourth is rendered with nothing after
+                // it, and the fifth is on screen, taking over from it.
+                const auto selection = measure(true, 4);
+                report.add("whole_picture/ghost/heard/piece_ms=" + describe(whole));
+                report.add("enveloped=" + describe(enveloped));
+                report.add("selection_of_four=" + describe(selection));
+                expect("every_rendered_note_is_drawn",
+                       sounding(whole) && sounding(enveloped) && sounding(selection));
+                expect("nothing_is_drawn_past_the_line", agree(whole) && agree(enveloped));
+                expect("not_even_at_the_end_of_a_selection", agree(selection));
+                expect("and_the_audio_itself_ends_at_the_hand_over",
+                       heardAgrees(whole, false) && heardAgrees(enveloped, true));
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 3 && arguments[0] == "--smoke-note-waveform")
+        {
+            // What a note's waveform is of.  It used to be the note's share of
+            // the finished mix, sliced from where the note starts to where it
+            // ends -- and a UTAU note does not sound between those two moments.
+            // Its consonant is sung ahead of the beat, so it fell in the slice
+            // belonging to the note before it and was drawn in that note's row:
+            // the q of qu appeared under the note before qu.  Wherever two
+            // notes overlap the slice held both of them summed as well.
+            //
+            // A note's waveform is now its own audio, as the engine made it and
+            // before any of it is mixed.  The two things that says are measured
+            // here: it begins a lead-in before the note, and it is the same
+            // whether or not the note beside it is even there.
+            const juce::File bank(arguments[1].unquoted());
+            const juce::File resampler(arguments[2].unquoted());
+            const auto alias = arguments.size() >= 4 ? arguments[3].unquoted()
+                                                     : juce::String("si");
+            // A second syllable, for the neighbour to sing instead.
+            const auto other = arguments.size() >= 5 ? arguments[4].unquoted()
+                                                     : juce::String("a");
+            [this, bank, resampler, alias, other]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+
+                // Two notes back to back, so the second one's consonant reaches
+                // into the first -- which is the case that was drawn wrongly.
+                // pinned fixes where the second note takes over from the
+                // first -- its preutterance and overlap -- whatever it sings.
+                // A note's picture now fades where the mix fades it, which is
+                // where the next note takes over; with that moment held still,
+                // whatever still differs between two renders is sound.
+                const auto phrase = [](const juce::String& firstLyric,
+                                       const juce::String& secondLyric,
+                                       bool pinned = false)
+                {
+                    ProjectData data;
+                    TrackData track;
+                    track.id = "track";
+                    track.name = "utau";
+                    track.compose = true;
+                    track.pitchAlgorithm = PitchAlgorithm::utau;
+                    ClipData clip;
+                    clip.id = "clip";
+                    clip.startSeconds = 0.0;
+                    clip.durationSeconds = 5.0;
+                    for (int index = 0; index < 2; ++index)
+                    {
+                        NoteData note;
+                        note.id = "note" + juce::String(index);
+                        note.label = index == 0 ? firstLyric : secondLyric;
+                        note.startSeconds = 2.0 + 0.5 * index;
+                        note.durationSeconds = 0.5;
+                        note.midiNote = 60.0f + 2.0f * index;
+                        note.sourceMidiCenter = note.midiNote;
+                        note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                        note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                        if (pinned && index == 1)
+                        {
+                            note.utauPreutteranceOverrideEnabled = true;
+                            note.utauPreutteranceSeconds = 0.12;
+                            note.utauOverlapOverrideEnabled = true;
+                            note.utauOverlapSeconds = 0.04;
+                        }
+                        clip.notes.push_back(std::move(note));
+                    }
+                    track.clips.push_back(std::move(clip));
+                    data.tracks.push_back(std::move(track));
+                    return data;
+                };
+                std::shared_ptr<const std::vector<UtauNoteWaveform>> lastDrawn;
+                const auto render = [&bank, &resampler, &lastDrawn](ProjectData data)
+                {
+                    data.tracks.front().voicebankDirectory = bank;
+                    auto engine = std::make_unique<AudioEngine>();
+                    engine->setUtauResamplerFile(resampler);
+                    engine->prepareToPlay(512, 48'000.0);
+                    engine->selectEveryUtauNote(data);
+                    engine->syncProject(data);
+                    for (int tries = 0; tries < 900 && engine->renderProgress(); ++tries)
+                        juce::Thread::sleep(100);
+                    juce::Thread::sleep(200);
+                    engine->refreshUtauWaveforms();
+                    const auto waveforms = engine->utauNoteWaveforms();
+                    lastDrawn = waveforms;
+                    std::map<juce::String, UtauNoteWaveform> byId;
+                    if (waveforms != nullptr)
+                        for (const auto& waveform : *waveforms)
+                            byId[waveform.noteId] = waveform;
+                    return byId;
+                };
+
+                // The same phrase three ways: as it is, with the second note
+                // singing something else, and with the first note singing
+                // something else.  A note's own audio cannot depend on which
+                // syllable its neighbour sings -- the two notes are rendered
+                // apart and only meet in the mix.
+                const auto differenceBetween = [](const UtauNoteWaveform& left,
+                                                  const UtauNoteWaveform& right)
+                {
+                    // Different lengths are a difference of their own, and a
+                    // number no real difference can reach says so.
+                    if (left.maxima.size() != right.maxima.size()
+                        || std::abs(left.leadInSeconds - right.leadInSeconds) > 1.0e-6
+                        || std::abs(left.durationSeconds - right.durationSeconds) > 1.0e-6)
+                        return 9.0f;
+                    auto worst = 0.0f;
+                    for (std::size_t index = 0; index < left.maxima.size(); ++index)
+                    {
+                        worst = std::max(worst, std::abs(left.maxima[index] - right.maxima[index]));
+                        worst = std::max(worst, std::abs(left.minima[index] - right.minima[index]));
+                    }
+                    return worst;
+                };
+                const auto together = render(phrase(alias, alias));
+                const auto again = render(phrase(alias, alias, true));
+                const auto pinnedTogether = render(phrase(alias, alias, true));
+                const auto secondChanged = render(phrase(alias, other, true));
+                const auto firstChanged = render(phrase(other, alias, true));
+                const auto has = [](const std::map<juce::String, UtauNoteWaveform>& drawn,
+                                    const char* id)
+                {
+                    return drawn.find(id) != drawn.end();
+                };
+                expect("both_notes_are_drawn",
+                       has(together, "note0") && has(together, "note1")
+                       && has(pinnedTogether, "note0") && has(pinnedTogether, "note1")
+                       && has(secondChanged, "note0") && has(firstChanged, "note1"));
+                if (!has(together, "note1") || !has(secondChanged, "note0")
+                    || !has(firstChanged, "note1") || !has(pinnedTogether, "note0")
+                    || !has(pinnedTogether, "note1"))
+                {
+                    std::cout << report.joinIntoString("|") << "|ok=0" << std::endl;
+                    setApplicationReturnValue(4);
+                    juce::MessageManager::callAsync([this] { quit(); });
+                    return;
+                }
+                const auto& second = together.at("note1");
+
+                // The oto says how far ahead of the beat this alias is sung;
+                // that is where the piece starts.
+                const auto timing = backend::UtauRenderer::sampleTiming(
+                    bank, alias, 62.0f, 100, false, false);
+                const auto preutterance = timing ? timing->preutteranceSeconds : 0.0;
+                report.add("lead_in=" + juce::String(second.leadInSeconds, 4)
+                           + ",oto_preutterance=" + juce::String(preutterance, 4)
+                           + ",piece=" + juce::String(second.durationSeconds, 3)
+                           + ",note=0.500");
+                expect("it_begins_before_its_note", second.leadInSeconds > 0.02);
+                expect("as_far_before_as_the_oto_says",
+                       preutterance > 0.02
+                       && std::abs(second.leadInSeconds - preutterance) < 0.005);
+                // And it covers more than the note: the lead-in at the front,
+                // and whatever the engine made past the note's end.
+                expect("and_covers_the_whole_piece", second.durationSeconds > 0.5);
+
+                // The consonant is in this note's own waveform.  Before, it was
+                // in the row of the note before it, and this half of the piece
+                // was not drawn at all.
+                const auto loudestIn = [](const UtauNoteWaveform& waveform,
+                                          double fromSeconds, double toSeconds)
+                {
+                    const auto buckets = static_cast<double>(waveform.maxima.size());
+                    if (buckets <= 0.0 || waveform.durationSeconds <= 0.0) return 0.0f;
+                    const auto first = static_cast<std::size_t>(std::max(0.0,
+                        std::floor(fromSeconds / waveform.durationSeconds * buckets)));
+                    const auto last = static_cast<std::size_t>(std::min(buckets,
+                        std::ceil(toSeconds / waveform.durationSeconds * buckets)));
+                    auto loudest = 0.0f;
+                    for (auto index = first; index < last && index < waveform.maxima.size(); ++index)
+                    {
+                        loudest = std::max(loudest, waveform.maxima[index]);
+                        loudest = std::max(loudest, -waveform.minima[index]);
+                    }
+                    return loudest;
+                };
+                const auto inTheLeadIn = loudestIn(second, 0.0, second.leadInSeconds);
+                const auto inTheNote = loudestIn(second, second.leadInSeconds,
+                                                 second.durationSeconds);
+                report.add("lead_in_peak=" + juce::String(inTheLeadIn, 3)
+                           + ",note_peak=" + juce::String(inTheNote, 3));
+                expect("the_consonant_is_in_this_note", inTheLeadIn > 0.01f && inTheNote > 0.01f);
+
+                // The whole of it: the same note, rendered with its neighbour
+                // and rendered without one, has to be the same waveform.  From
+                // the mix it could not be -- where the two overlap, the mix
+                // holds both of them added together.
+                // How much two renders of the very same phrase differ at all:
+                // the engine's own repeatability, and the floor under every
+                // comparison below.
+                if (again.find("note1") != again.end())
+                    report.add("same_phrase_twice="
+                               + juce::String(differenceBetween(pinnedTogether.at("note1"),
+                                                                again.at("note1")), 5));
+                // The whole of it.  The first note's waveform must not move
+                // when the second note sings something else: the second note's
+                // consonant is sung during the first note, and from the mix it
+                // was drawn in the first note's row -- the q of qu under the
+                // note before qu.  The same in the other direction, since the
+                // first note's tail crosses into the second note's stretch.
+                //
+                // What a note's picture must never hold is its neighbour's
+                // sound.  Where it fades is a different matter: it fades as the
+                // mix fades it, where the next note takes over, and that moment
+                // is the next note's preutterance and overlap.  These renders
+                // pin both, so the fade stands still while the syllable
+                // changes -- and the stretch where the neighbour's consonant is
+                // sung, which is where its sound used to leak in, is still
+                // compared in full.
+                const auto& first = pinnedTogether.at("note0");
+                const auto& pinnedSecond = pinnedTogether.at("note1");
+                const auto neighbourChanged = differenceBetween(
+                    first, secondChanged.at("note0"));
+                const auto ownChanged = differenceBetween(
+                    first, firstChanged.at("note0"));
+                const auto secondKept = differenceBetween(
+                    pinnedSecond, firstChanged.at("note1"));
+                const auto secondMoved = differenceBetween(
+                    pinnedSecond, secondChanged.at("note1"));
+                report.add("first_when_the_second_changes=" + juce::String(neighbourChanged, 5)
+                           + ",first_when_itself_changes=" + juce::String(ownChanged, 5)
+                           + ",second_when_the_first_changes=" + juce::String(secondKept, 5)
+                           + ",second_when_itself_changes=" + juce::String(secondMoved, 5));
+                expect("a_note_holds_none_of_its_neighbour",
+                       neighbourChanged < 1.0e-6f && secondKept < 1.0e-6f);
+                // And the measurement can tell a changed note apart at all,
+                // which is what says the comparison above means anything.
+                expect("but_does_hold_itself",
+                       ownChanged > 0.01f && secondMoved > 0.01f);
+
+                // The note's own envelope is in the picture.  A shape with a
+                // silent stretch in the middle has to be drawn with a silent
+                // stretch in the middle -- and the same note without the
+                // envelope is loud there, so it is the envelope doing it and
+                // not the recording.
+                auto shaped = phrase(alias, alias);
+                shaped.tracks.front().clips.front().notes[1].amplitudeEnvelope = {
+                    { -0.20, 0.0f }, { 0.14, 0.0f }, { 0.15, -60.0f },
+                    { 0.30, -60.0f }, { 0.31, 0.0f }, { 0.60, 0.0f } };
+                const auto shapedDrawn = render(shaped);
+                if (shapedDrawn.find("note1") != shapedDrawn.end())
+                {
+                    const auto& drawnShape = shapedDrawn.at("note1");
+                    const auto lead = drawnShape.leadInSeconds;
+                    const auto inTheHole = loudestIn(drawnShape, lead + 0.17, lead + 0.28);
+                    const auto beforeIt = loudestIn(drawnShape, lead + 0.02, lead + 0.12);
+                    const auto afterIt = loudestIn(drawnShape, lead + 0.33, lead + 0.45);
+                    const auto withoutIt = loudestIn(second, second.leadInSeconds + 0.17,
+                                                     second.leadInSeconds + 0.28);
+                    report.add("hole=" + juce::String(inTheHole, 4)
+                               + ",before=" + juce::String(beforeIt, 3)
+                               + ",after=" + juce::String(afterIt, 3)
+                               + ",without_the_envelope=" + juce::String(withoutIt, 3));
+                    expect("the_envelope_is_in_the_picture",
+                           inTheHole < 0.01f && beforeIt > 0.05f && afterIt > 0.05f
+                           && withoutIt > 0.05f);
+                }
+                else expect("the_envelope_is_in_the_picture", false);
+
+                // Where the roll actually draws them.  The measurements
+                // above are of the audio; this is the half the eye sees, and
+                // it is read from the roll rather than worked out again here.
+                render(phrase(alias, alias));
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(phrase(alias, alias));
+                I18n strings;
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 1200, 600);
+                roll->setPixelsPerSecond(200.0f);
+                roll->setShowUtauWaveforms(true);
+                roll->setUtauNoteWaveforms(lastDrawn);
+                roll->diagnosticRefresh();
+                const auto drawnFirst = roll->diagnosticWaveformSpan("note0");
+                const auto drawnSecond = roll->diagnosticWaveformSpan("note1");
+                expect("the_roll_draws_both", drawnFirst.has_value() && drawnSecond.has_value());
+                if (drawnSecond)
+                {
+                    report.add("drawn_from=" + juce::String(drawnSecond->first, 4)
+                               + ",note_starts=2.5000,drawn_for="
+                               + juce::String(drawnSecond->second, 4));
+                    // Drawn from where the piece starts, which is a lead-in
+                    // before the note, and for as long as the piece lasts.
+                    expect("drawn_where_the_piece_starts",
+                           std::abs(drawnSecond->first - (2.5 - second.leadInSeconds)) < 1.0e-9);
+                    expect("and_drawn_for_the_whole_piece",
+                           std::abs(drawnSecond->second - second.durationSeconds) < 1.0e-9);
+                    // Which is before the note: the thing that was wrong.
+                    expect("which_is_before_the_note_itself", drawnSecond->first < 2.5 - 0.02);
+                }
+                if (drawnFirst)
+                    expect("and_the_first_is_drawn_from_its_own_start",
+                           std::abs(drawnFirst->first
+                                    - (2.0 - together.at("note0").leadInSeconds)) < 1.0e-9);
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
             return;
         }
         if (arguments.size() >= 3 && arguments[0] == "--smoke-utau-waveform")
@@ -7051,6 +10319,23 @@ public:
                 everyEditCounts = everyEditCounts && hashOf(note) != base;
             }
             {
+                // Whether a stretch of the envelope runs straight in amplitude
+                // changes what is heard just as its points do.
+                auto note = notes[0];
+                note.amplitudeEnvelope = { { -0.05, -60.0f }, { 0.05, 0.0f }, { 0.2, -60.0f } };
+                const auto inDb = hashOf(note);
+                note.amplitudeEnvelope[1].linearToNext = true;
+                everyEditCounts = everyEditCounts && hashOf(note) != inDb;
+            }
+            {
+                // So does a note's own oto, and a number changed inside it.
+                auto note = notes[0]; note.utauOto.enabled = true;
+                const auto ownOto = hashOf(note);
+                everyEditCounts = everyEditCounts && ownOto != base;
+                note.utauOto.preutteranceMs += 10.0;
+                everyEditCounts = everyEditCounts && hashOf(note) != ownOto;
+            }
+            {
                 auto note = notes[0]; note.gain = 0.5f;
                 everyEditCounts = everyEditCounts && hashOf(note) != base;
             }
@@ -7081,6 +10366,2853 @@ public:
                       << std::endl;
             setApplicationReturnValue(ok ? 0 : 4);
             juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-voicebank-index")
+        {
+            // Opening a project and editing it stopped the window, because the
+            // roll read its voicebank on the message thread.  Measured on a
+            // 1022-row bank: 0.8 s to open, 3.7 s sorting the oto under a long
+            // path, 0.3 s for every edit looking notes up by scanning, and 6.9 s
+            // for the edit after the engine wrote a cache file into the folder,
+            // which the index was keyed on.
+            //
+            // A bank is built here to reach every rule at once -- duplicate
+            // aliases that differ only in case, a pair (sigma and final sigma)
+            // that equalsIgnoreCase calls equal and toLowerCase does not, empty
+            // aliases, identical rows, a sub-bank behind a prefix.map, and a
+            // sample with no row -- and put under a long path.  Real banks named
+            // on the command line are compared as well.
+            //
+            // In two halves: the background reading answers through the message
+            // loop, so the second half runs after it has had the chance.
+            [this, &arguments]
+            {
+                using Renderer = backend::UtauRenderer;
+                struct Fixture
+                {
+                    juce::File folder;
+                    std::unique_ptr<ProjectModel> project;
+                    std::unique_ptr<I18n> strings;
+                    std::unique_ptr<PianoRollComponent> roll;
+                    juce::String noteId;
+                    double noteStart = 0.0;
+                    std::atomic<int> readyCallbacks { 0 };
+                    bool asyncReadyCalledOnMessageThread = true;
+                    juce::StringArray report;
+                    bool ok = true;
+                };
+                auto fixture = std::make_shared<Fixture>();
+                const auto expect = [raw = fixture.get()](const char* name, bool value)
+                {
+                    raw->report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    raw->ok = raw->ok && value;
+                };
+
+                fixture->folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-index-" + juce::Uuid().toDashedString())
+                    .getChildFile("a rather long folder name to put the bank under")
+                    .getChildFile("and another one below it for good measure")
+                    .getChildFile("voicebanks");
+                constexpr auto preutterMs = 120.0;
+                // A character equalsIgnoreCase folds differently from
+                // toLowerCase, if this JUCE has one: the pair a table folded the
+                // wrong way would answer wrongly for.
+                juce::String foldOdd, foldPlain;
+                for (juce::juce_wchar code = 0x80; code < 0x10000 && foldOdd.isEmpty(); ++code)
+                {
+                    if (code >= 0xd800 && code < 0xe000) continue;
+                    const auto odd = juce::String::charToString(code);
+                    const auto upper = odd.toUpperCase();
+                    const auto lower = odd.toLowerCase();
+                    if (upper != odd && odd.equalsIgnoreCase(upper) && lower != upper.toLowerCase())
+                    { foldOdd = odd; foldPlain = upper; }
+                    else if (lower != odd && !odd.equalsIgnoreCase(lower))
+                    { foldOdd = odd; foldPlain = lower; }
+                }
+                fixture->report.add("fold_pair=" + (foldOdd.isEmpty() ? juce::String("none")
+                    : juce::String::toHexString(static_cast<int>(foldOdd[0])) + "/"
+                      + juce::String::toHexString(static_cast<int>(foldPlain[0]))));
+                const auto makeBank = [foldOdd, foldPlain](const juce::File& root)
+                {
+                    root.createDirectory();
+                    const auto first = root.getChildFile("s000.wav");
+                    {
+                        juce::AudioBuffer<float> buffer(1, 13230);
+                        for (int index = 0; index < buffer.getNumSamples(); ++index)
+                            buffer.setSample(0, index, 0.2f * static_cast<float>(
+                                std::sin(0.05 * static_cast<double>(index))));
+                        juce::WavAudioFormat format;
+                        std::unique_ptr<juce::FileOutputStream> stream(first.createOutputStream());
+                        std::unique_ptr<juce::AudioFormatWriter> writer(
+                            format.createWriterFor(stream.get(), 44100.0, 1, 16, {}, 0));
+                        if (writer != nullptr)
+                        {
+                            stream.release();
+                            writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                        }
+                    }
+                    juce::StringArray rows;
+                    const auto row = [&rows](const juce::String& wav, const juce::String& alias)
+                    {
+                        rows.add(wav + "=" + alias + ",0,80,-200,120,30");
+                    };
+                    for (int index = 0; index < 600; ++index)
+                    {
+                        const auto name = "s" + juce::String(index).paddedLeft('0', 3) + ".wav";
+                        if (index > 0) first.copyFileTo(root.getChildFile(name));
+                        juce::String alias = "a" + juce::String(index);
+                        if (index % 50 == 1) alias = "Ka";
+                        else if (index % 50 == 2) alias = "KA";
+                        else if (index == 3) alias = juce::String::fromUTF8(u8"\u017f");   // long s
+                        else if (index == 4) alias = "S";
+                        else if (index == 11) alias = juce::String::fromUTF8(u8"\u0131");  // dotless i
+                        else if (index == 12) alias = "I";
+                        else if (index == 13) alias = juce::String::fromUTF8(u8"\u212a");  // Kelvin sign
+                        else if (index == 16) alias = "k";
+                        else if (index == 17 && foldOdd.isNotEmpty()) alias = foldOdd;
+                        else if (index == 18 && foldPlain.isNotEmpty()) alias = foldPlain;
+                        else if (index % 7 == 0) alias = {};
+                        else if (index == 5) alias = "a";
+                        row(name, alias);
+                        if (index == 10) row(name, alias);           // an identical row
+                    }
+                    for (const auto* name : { "t2.wav", "t10.wav", "T1.wav" })
+                    {
+                        first.copyFileTo(root.getChildFile(name));
+                        row(name, juce::String("t-") + name);
+                    }
+                    first.copyFileTo(root.getChildFile("unlisted.wav"));
+                    root.getChildFile("oto.ini").replaceWithText(rows.joinIntoString("\r\n") + "\r\n");
+                    const auto sub = root.getChildFile("sub");
+                    sub.createDirectory();
+                    juce::StringArray subRows;
+                    for (int index = 0; index < 10; ++index)
+                    {
+                        const auto name = "c" + juce::String(index) + ".wav";
+                        first.copyFileTo(sub.getChildFile(name));
+                        subRows.add(name + "=" + juce::StringArray { "- a C5", "a C5", "i C5", "Ka C5" }[index % 4]
+                                    + ",0,80,-200,90,20");
+                    }
+                    sub.getChildFile("oto.ini").replaceWithText(subRows.joinIntoString("\r\n") + "\r\n");
+                    root.getChildFile("prefix.map").replaceWithText("C5\t\t C5\r\nC4\t\t\r\n");
+                };
+                const auto bankA = fixture->folder.getChildFile("A");
+                makeBank(bankA);
+
+                // ---- 1. the same sample through the tables as through the scan
+                // Every variant at five pitches for the built bank, which is
+                // where the rules are; the real banks, at two pitches (one of
+                // them C5, which their prefix maps name) and four variants, are
+                // there for the variety real aliases have -- all five and all
+                // modes took them past two minutes on a busy machine.
+                const auto compareBank = [foldOdd, foldPlain](const juce::File& root, bool fourRegion, bool mou,
+                                            int& compared, juce::String& firstMismatch, bool thorough)
+                {
+                    juce::StringArray warnings;
+                    const auto entries = SampleSettings::loadVoicebankOto(root, warnings, fourRegion, mou);
+                    juce::StringArray lyrics { "", " ", "nothing-like-this", "a", "ka", "KA", "kA",
+                                               "s", "S", "i", "I", "k", "K", "- a",
+                                               juce::String::fromUTF8(u8"\u017f"),
+                                               juce::String::fromUTF8(u8"\u0131"),
+                                               juce::String::fromUTF8(u8"\u212a"),
+                                               foldOdd, foldPlain };
+                    for (const auto& entry : entries)
+                    {
+                        const auto file = juce::File(entry.audioFile).getFileNameWithoutExtension();
+                        for (const auto& text : { entry.alias, file })
+                        {
+                            lyrics.addIfNotAlreadyThere(text);
+                            lyrics.addIfNotAlreadyThere(text.toUpperCase());
+                            lyrics.addIfNotAlreadyThere(text.upToFirstOccurrenceOf(" ", false, false));
+                            if (thorough)
+                            {
+                                lyrics.addIfNotAlreadyThere(text.toLowerCase());
+                                lyrics.addIfNotAlreadyThere(" " + text + " ");
+                            }
+                        }
+                    }
+                    const auto pitches = thorough ? std::vector<float> { 48.0f, 60.0f, 64.0f, 72.0f, 84.0f }
+                                                  : std::vector<float> { 60.0f, 72.0f };
+                    for (const auto& lyric : lyrics)
+                        for (const auto midi : pitches)
+                        {
+                            const auto viaTables = Renderer::diagnosticResolve(root, lyric, midi, fourRegion, mou, false);
+                            const auto viaScan = Renderer::diagnosticResolve(root, lyric, midi, fourRegion, mou, true);
+                            ++compared;
+                            if (viaTables != viaScan && firstMismatch.isEmpty())
+                                firstMismatch = "'" + lyric + "'@" + juce::String(midi, 0)
+                                    + " tables=" + viaTables + " scan=" + viaScan;
+                        }
+                };
+                auto compared = 0;
+                juce::String mismatch;
+                for (const auto mode : { 0, 1, 2 })
+                    compareBank(bankA, mode >= 1, mode == 2, compared, mismatch, true);
+                auto realBanks = 0;
+                for (int index = 1; index < arguments.size(); ++index)
+                {
+                    const juce::File real(arguments[index].unquoted());
+                    if (!real.isDirectory()) continue;
+                    ++realBanks;
+                    compareBank(real, false, false, compared, mismatch, false);
+                }
+                if (mismatch.isNotEmpty()) std::cout << "MISMATCH " << mismatch << std::endl;
+                // The premise: this build has characters whose upper-case and
+                // lower-case folds disagree, so a table folded the wrong way
+                // would answer differently from the scan somewhere above.
+                const auto longS = juce::String::fromUTF8(u8"\u017f");
+                const auto kelvin = juce::String::fromUTF8(u8"\u212a");
+                const auto dotless = juce::String::fromUTF8(u8"\u0131");
+                const auto disagree = [](const juce::String& odd, const juce::String& plain)
+                {
+                    return odd.equalsIgnoreCase(plain)
+                        != (odd.toLowerCase() == plain.toLowerCase());
+                };
+                // Only a premise where this JUCE has such a pair at all; with
+                // none, the two folds cannot give different answers.
+                if (foldOdd.isNotEmpty())
+                    expect("fold_pair_resolves_as_the_scan",
+                           Renderer::diagnosticResolve(bankA, foldOdd, 60.0f, false, false, false)
+                           == Renderer::diagnosticResolve(bankA, foldOdd, 60.0f, false, false, true));
+                juce::ignoreUnused(disagree, longS, kelvin, dotless);
+                expect("duplicate_alias_first_row_wins",
+                       Renderer::diagnosticResolve(bankA, "ka", 60.0f, false, false, false).contains("s001.wav"));
+                expect("prefix_map_reaches_the_sub_bank",
+                       Renderer::diagnosticResolve(bankA, "a", 72.0f, false, false, false).contains("c1.wav"));
+                expect("tables_match_scan", mismatch.isEmpty() && compared > 1000);
+                fixture->report.add("compared=" + juce::String(compared)
+                                          + "|real_banks=" + juce::String(realBanks));
+
+                // ---- 2. the oto order the old comparison gave
+                {
+                    juce::StringArray warnings;
+                    const auto started = juce::Time::getMillisecondCounterHiRes();
+                    const auto entries = SampleSettings::loadVoicebankOto(bankA, warnings);
+                    const auto loadMs = juce::Time::getMillisecondCounterHiRes() - started;
+                    std::vector<VoicebankOtoEntry> listed;
+                    for (const auto& entry : entries)
+                        if (entry.lineIndex >= 0) listed.push_back(entry);
+                    const auto before = [&bankA](const VoicebankOtoEntry& left, const VoicebankOtoEntry& right)
+                    {
+                        const auto otoOrder = left.otoFile.getRelativePathFrom(bankA)
+                            .compareNatural(right.otoFile.getRelativePathFrom(bankA));
+                        if (otoOrder != 0) return otoOrder < 0;
+                        const auto fileOrder = left.sourceName.compareNatural(right.sourceName);
+                        return fileOrder != 0 ? fileOrder < 0 : left.alias.compareNatural(right.alias) < 0;
+                    };
+                    auto sorted = true;
+                    auto tiesInFileOrder = true;
+                    for (std::size_t index = 1; index < listed.size(); ++index)
+                    {
+                        if (before(listed[index], listed[index - 1])) sorted = false;
+                        if (!before(listed[index - 1], listed[index])
+                            && listed[index - 1].otoFile == listed[index].otoFile
+                            && listed[index - 1].lineIndex > listed[index].lineIndex)
+                            tiesInFileOrder = false;
+                    }
+                    expect("oto_sorted_as_before", sorted && listed.size() > 600);
+                    expect("identical_rows_keep_file_order", tiesInFileOrder);
+                    const auto unlistedListed = std::any_of(entries.begin(), entries.end(), [](const auto& entry)
+                    {
+                        return entry.lineIndex < 0 && juce::File(entry.audioFile).getFileName() == "unlisted.wav";
+                    });
+                    expect("unlisted_sample_still_offered", unlistedListed);
+                    fixture->report.add("oto_load_ms=" + juce::String(loadMs, 1));
+                }
+
+                // ---- 3. what reads the bank again, and what does not
+                {
+                    const auto timingOf = [&bankA](const juce::String& alias)
+                    {
+                        return Renderer::sampleTiming(bankA, alias, 60.0f);
+                    };
+                    Renderer::invalidateVoicebankCache();
+                    const auto builds = Renderer::diagnosticIndexBuilds();
+                    const auto first = timingOf("a6");
+                    expect("first_look_reads_once", Renderer::diagnosticIndexBuilds() == builds + 1
+                                                    && first.has_value());
+                    const auto lookStart = juce::Time::getMillisecondCounterHiRes();
+                    for (int index = 0; index < 600; ++index) (void) timingOf("a" + juce::String(index));
+                    fixture->report.add("600_lookups_ms=" + juce::String(
+                        juce::Time::getMillisecondCounterHiRes() - lookStart, 1));
+                    expect("lookups_do_not_read_again", Renderer::diagnosticIndexBuilds() == builds + 1);
+
+                    bankA.getChildFile("s006.wav.llsm2").replaceWithText("engine cache");
+                    bankA.getChildFile("s006.wav.l1f0").replaceWithText("engine cache");
+                    Renderer::diagnosticRecheckVoicebankFiles();
+                    (void) timingOf("a6");
+                    expect("engine_cache_files_do_not_read_again", Renderer::diagnosticIndexBuilds() == builds + 1);
+
+                    // Written from outside, as another program would.
+                    const auto oto = bankA.getChildFile("oto.ini");
+                    const auto stampBefore = oto.getLastModificationTime();
+                    oto.replaceWithText(oto.loadFileAsString().replace("s006.wav=a6,0,80,-200,120,30",
+                                                                       "s006.wav=a6,0,80,-200,150,30"));
+                    oto.setLastModificationTime(stampBefore + juce::RelativeTime::seconds(2.0));
+                    Renderer::diagnosticRecheckVoicebankFiles();
+                    const auto afterExternal = timingOf("a6");
+                    fixture->report.add("after_outside_edit=builds+" + juce::String(Renderer::diagnosticIndexBuilds() - builds)
+                        + ",pre=" + juce::String(afterExternal ? afterExternal->preutteranceSeconds : -1.0, 4));
+                    expect("outside_oto_edit_reads_again", Renderer::diagnosticIndexBuilds() == builds + 2
+                        && afterExternal && std::abs(afterExternal->preutteranceSeconds - 0.150) < 1.0e-6);
+
+                    // Written through the application: seen at once, no recheck.
+                    juce::StringArray warnings;
+                    const auto entries = SampleSettings::loadVoicebankOto(bankA, warnings);
+                    const auto original = std::find_if(entries.begin(), entries.end(),
+                        [](const auto& entry) { return entry.alias == "a6"; });
+                    auto inApp = false;
+                    if (original != entries.end())
+                    {
+                        auto updated = *original;
+                        // Under the 200 ms the entry spans, which a lead-in
+                        // is held within.
+                        updated.preutteranceMs = 175.0;
+                        juce::String error;
+                        inApp = SampleSettings::updateVoicebankOtoEntry(*original, updated, error);
+                    }
+                    const auto afterInApp = timingOf("a6");
+                    fixture->report.add("after_in_app_edit=ok" + juce::String(inApp ? 1 : 0) + ",builds+"
+                        + juce::String(Renderer::diagnosticIndexBuilds() - builds)
+                        + ",pre=" + juce::String(afterInApp ? afterInApp->preutteranceSeconds : -1.0, 4));
+                    expect("in_app_oto_edit_seen_at_once", inApp
+                        && Renderer::diagnosticIndexBuilds() == builds + 3
+                        && afterInApp && std::abs(afterInApp->preutteranceSeconds - 0.175) < 1.0e-6);
+
+                    const auto map = bankA.getChildFile("prefix.map");
+                    const auto mapStamp = map.getLastModificationTime();
+                    map.replaceWithText("C5\t\t C5\r\nC4\t\t C5\r\n");
+                    map.setLastModificationTime(mapStamp + juce::RelativeTime::seconds(2.0));
+                    Renderer::diagnosticRecheckVoicebankFiles();
+                    expect("prefix_map_edit_reads_again",
+                           Renderer::diagnosticResolve(bankA, "a", 60.0f, false, false, false).contains("c1.wav"));
+
+                    const auto jieBuilds = Renderer::diagnosticIndexBuilds();
+                    (void) Renderer::sampleTiming(bankA, "a6", 60.0f, 100, true, false);
+                    bankA.getChildFile("oto4.ini").replaceWithText("s006.wav=a6,10,20,30\r\n");
+                    Renderer::diagnosticRecheckVoicebankFiles();
+                    (void) Renderer::sampleTiming(bankA, "a6", 60.0f, 100, true, false);
+                    expect("new_oto4_reads_again_in_jie", Renderer::diagnosticIndexBuilds() == jieBuilds + 2);
+                }
+
+                // ---- 4. four renders of one fresh bank read it once
+                {
+                    const auto bankB = fixture->folder.getChildFile("B");
+                    makeBank(bankB);
+                    const auto builds = Renderer::diagnosticIndexBuilds();
+                    std::vector<std::thread> threads;
+                    std::vector<double> answers(4, -1.0);
+                    for (int index = 0; index < 4; ++index)
+                        threads.emplace_back([&answers, index, bankB]
+                        {
+                            const auto timing = Renderer::sampleTiming(bankB, "a8", 60.0f);
+                            answers[static_cast<std::size_t>(index)] = timing ? timing->preutteranceSeconds : -2.0;
+                        });
+                    for (auto& thread : threads) thread.join();
+                    expect("concurrent_looks_read_once", Renderer::diagnosticIndexBuilds() == builds + 1);
+                    expect("concurrent_looks_agree", std::all_of(answers.begin(), answers.end(),
+                        [](double value) { return std::abs(value - preutterMs / 1000.0) < 1.0e-9; }));
+                }
+
+                // ---- 5 and 6, first half: a background reading, and a roll that waits for one
+                const auto bankC = fixture->folder.getChildFile("C");
+                makeBank(bankC);
+                const auto buildsBeforeAsync = Renderer::diagnosticIndexBuilds();
+                auto askedWhileReading = true;
+                for (int index = 0; index < 20; ++index)
+                {
+                    std::function<void()> whenReady;
+                    if (index == 0)
+                        whenReady = [raw = fixture.get()]
+                        {
+                            raw->asyncReadyCalledOnMessageThread = raw->asyncReadyCalledOnMessageThread
+                                && juce::MessageManager::getInstance()->isThisTheMessageThread();
+                            ++raw->readyCallbacks;
+                        };
+                    const auto ready = Renderer::voicebankIndexReady(bankC, false, false,
+                                                                     std::move(whenReady));
+                    askedWhileReading = askedWhileReading && !ready;
+                }
+                expect("not_ready_while_reading", askedWhileReading);
+
+                const auto bankD = fixture->folder.getChildFile("D");
+                makeBank(bankD);
+                fixture->strings = std::make_unique<I18n>();
+                fixture->project = std::make_unique<ProjectModel>();
+                const auto ust = fixture->folder.getChildFile("song.ust");
+                ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\nTempo=120.00\r\n"
+                                    "Tracks=1\r\nProjectName=index\r\n"
+                                    "[#0000]\r\nLength=960\r\nLyric=R\r\nNoteNum=60\r\n"
+                                    "[#0001]\r\nLength=480\r\nLyric=a6\r\nNoteNum=60\r\n"
+                                    "[#TRACKEND]\r\n");
+                juce::String ustError;
+                juce::StringArray ustWarnings;
+                fixture->project->addUstFile(ust, ustError, ustWarnings);
+                const auto data = fixture->project->snapshot();
+                const auto trackId = data.tracks.front().id;
+                // Built before the track has a bank: the constructor lays out
+                // at once, before background reading can be asked for.
+                fixture->roll = std::make_unique<PianoRollComponent>(*fixture->project, *fixture->strings);
+                fixture->roll->setBounds(0, 0, 1200, 600);
+                fixture->roll->setReadsVoicebankInBackground(true);
+                // 界, whose notes draw region lines from their entries on every
+                // paint -- the paint that waited 1.7 s for a bank being read.
+                // It waited when switching banks: the notes still had the lead-ins
+                // of the bank before, so painting went on to the region lines and
+                // asked the new bank for them.  So a read bank first -- A, whose
+                // a6 was given a 175 ms lead-in above -- and then a fresh one.
+                fixture->project->setTrackUtauMode(trackId, UtauMode::jie);
+                fixture->project->setTrackVoicebankDirectory(trackId, bankA);
+                const auto withBank = fixture->project->snapshot();
+                for (const auto& clip : withBank.tracks.front().clips)
+                    for (const auto& note : clip.notes)
+                        if (note.label == "a6")
+                        {
+                            fixture->noteId = note.id;
+                            fixture->noteStart = clip.startSeconds + note.startSeconds;
+                        }
+                fixture->roll->setFocusedTrack(trackId);
+                fixture->roll->diagnosticRefresh();
+                const auto leadInOf = [raw = fixture.get()]
+                {
+                    return raw->noteStart - raw->roll->diagnosticSoundingSpan(raw->noteId).first;
+                };
+                expect("read_bank_lead_in_at_once", fixture->noteId.isNotEmpty()
+                    && fixture->roll->diagnosticHasSoundingSpan(fixture->noteId)
+                    && std::abs(leadInOf() - 0.175) < 1.0e-6);
+
+                fixture->project->setTrackVoicebankDirectory(trackId, bankD);
+                const auto waitsBefore = Renderer::diagnosticMessageThreadWaits();
+                const auto layoutStart = juce::Time::getMillisecondCounterHiRes();
+                fixture->roll->diagnosticRefresh();
+                {
+                    // All of it, so the note is certainly among what is painted.
+                    juce::Image canvas(juce::Image::ARGB, std::max(1, fixture->roll->getWidth()),
+                                       std::max(1, fixture->roll->getHeight()), true);
+                    juce::Graphics graphics(canvas);
+                    fixture->roll->paint(graphics);
+                }
+                const auto layoutMs = juce::Time::getMillisecondCounterHiRes() - layoutStart;
+                expect("layout_and_paint_never_wait_for_the_bank",
+                       Renderer::diagnosticMessageThreadWaits() == waitsBefore);
+                // Until the new bank is in, the note keeps what it had.
+                expect("roll_keeps_the_last_lead_in_while_reading",
+                       fixture->roll->diagnosticHasSoundingSpan(fixture->noteId)
+                       && std::abs(leadInOf() - 0.175) < 1.0e-6);
+                fixture->report.add("layout_without_bank_ms=" + juce::String(layoutMs, 1));
+
+                juce::Timer::callAfterDelay(1500, [this, fixture, expect, bankC, bankD, buildsBeforeAsync]
+                {
+                    expect("reading_answered_once", fixture->readyCallbacks.load() == 1);
+                    expect("answer_on_the_message_thread", fixture->asyncReadyCalledOnMessageThread);
+                    expect("ready_afterwards", Renderer::voicebankIndexReady(bankC, false, false, {}));
+                    // Bank C once and bank D once, however often each was asked
+                    // (A's 界 reading was already in hand).
+                    expect("each_bank_read_once", Renderer::diagnosticIndexBuilds() == buildsBeforeAsync + 2);
+                    const auto span = fixture->roll->diagnosticSoundingSpan(fixture->noteId);
+                    expect("roll_lead_in_arrives", fixture->roll->diagnosticHasSoundingSpan(fixture->noteId)
+                        && std::abs(span.first - (fixture->noteStart - preutterMs / 1000.0)) < 1.0e-6);
+
+                    // A roll that is not asked to wait still gets it at once.
+                    PianoRollComponent* sync = nullptr;
+                    auto syncRoll = std::make_unique<PianoRollComponent>(*fixture->project, *fixture->strings);
+                    sync = syncRoll.get();
+                    sync->setFocusedTrack(fixture->project->snapshot().tracks.front().id);
+                    sync->diagnosticRefresh();
+                    expect("roll_without_background_reading_has_it_at_once",
+                           sync->diagnosticHasSoundingSpan(fixture->noteId));
+                    syncRoll.reset();
+                    fixture->roll.reset();
+
+                    std::cout << fixture->report.joinIntoString("|") << "|ok=" << (fixture->ok ? 1 : 0) << std::endl;
+                    fixture->folder.getParentDirectory().getParentDirectory().getParentDirectory().deleteRecursively();
+                    setApplicationReturnValue(fixture->ok ? 0 : 4);
+                    juce::MessageManager::callAsync([this] { quit(); });
+                });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-ust-pitch")
+        {
+            // A UST note with no pitch bend is sung on its own pitch to its
+            // edges -- that is what UTAU does -- but every pair of abutting
+            // notes read from one was given the editor's own 40 ms S transition,
+            // in the renderer and on the roll alike.  Notes with a bend had
+            // the ends of it replaced by the same transition.
+            //
+            // Notes: a (bend up from 3 semitones below), i and u (no bend), e
+            // (bend down from 2 above), a rest, o (no bend).  Read as the
+            // renderer will be sent them, and as the roll draws their handles.
+            // The same notes with the transition switched back on must still
+            // glide, which is how notes made in the editor behave.
+            [this, &arguments]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-ust-pitch-" + juce::Uuid().toDashedString());
+                folder.createDirectory();
+                const auto ust = folder.getChildFile("pitch.ust");
+                ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\nTempo=120.00\r\n"
+                                    "Tracks=1\r\nProjectName=pitch\r\nMode2=True\r\n"
+                                    "[#0000]\r\nLength=480\r\nLyric=a\r\nNoteNum=60\r\n"
+                                    "PBS=-40;-30\r\nPBW=80\r\nPBY=\r\n"
+                                    "[#0001]\r\nLength=480\r\nLyric=i\r\nNoteNum=67\r\n"
+                                    "[#0002]\r\nLength=480\r\nLyric=u\r\nNoteNum=64\r\n"
+                                    "[#0003]\r\nLength=480\r\nLyric=e\r\nNoteNum=62\r\n"
+                                    "PBS=-30;20\r\nPBW=60\r\nPBY=\r\n"
+                                    "[#0004]\r\nLength=480\r\nLyric=R\r\nNoteNum=60\r\n"
+                                    "[#0005]\r\nLength=480\r\nLyric=o\r\nNoteNum=65\r\n"
+                                    "[#TRACKEND]\r\n");
+                auto project = std::make_unique<ProjectModel>();
+                juce::String error;
+                juce::StringArray warnings;
+                const auto built = project->addUstFile(ust, error, warnings);
+                const auto data = project->snapshot();
+                std::map<juce::String, NoteData> byLabel;
+                juce::String clipId, trackId;
+                if (built)
+                {
+                    trackId = data.tracks.front().id;
+                    clipId = data.tracks.front().clips.front().id;
+                    for (const auto& note : data.tracks.front().clips.front().notes)
+                        byLabel[note.label] = note;
+                }
+                expect("imported_five_notes", built && byLabel.size() == 5);
+                expect("ust_notes_take_no_transition", std::all_of(byLabel.begin(), byLabel.end(),
+                    [](const auto& item) { return !item.second.utauAutoPitchTransition; }));
+
+                const auto centsAt = [](const backend::UtauNoteRenderSpec& note, double time)
+                {
+                    if (note.pitchCurve.empty()) return 0.0f;
+                    const auto right = std::lower_bound(note.pitchCurve.begin(), note.pitchCurve.end(), time,
+                        [](const backend::UtauPitchPoint& point, double value) { return point.timeSeconds < value; });
+                    if (right == note.pitchCurve.begin()) return right->cents;
+                    if (right == note.pitchCurve.end()) return note.pitchCurve.back().cents;
+                    const auto& left = *std::prev(right);
+                    const auto amount = right->timeSeconds > left.timeSeconds
+                        ? static_cast<float>((time - left.timeSeconds) / (right->timeSeconds - left.timeSeconds)) : 0.0f;
+                    return left.cents + (right->cents - left.cents) * amount;
+                };
+                const auto sent = [&](const ProjectData& project, const juce::String& clip)
+                {
+                    std::map<juce::String, backend::UtauNoteRenderSpec> byAlias;
+                    for (auto& note : AudioEngine::diagnosticUtauRequestNotes(project, clip))
+                        byAlias[note.alias] = std::move(note);
+                    return byAlias;
+                };
+
+                // ---- as imported
+                auto asImported = sent(data, clipId);
+                const auto flat = [&asImported](const juce::String& alias)
+                {
+                    const auto found = asImported.find(alias);
+                    return found != asImported.end() && !found->second.pitchCurve.empty()
+                        && std::all_of(found->second.pitchCurve.begin(), found->second.pitchCurve.end(),
+                               [](const backend::UtauPitchPoint& point) { return std::abs(point.cents) < 1.0e-3f; });
+                };
+                // i and o are reached into by no bend.  u is: e's bend starts
+                // thirty milliseconds before e, over u's tail, so u sits on its
+                // pitch up to where it turns towards that bend -- and from the
+                // bend's first point on, both notes sing it.
+                const auto flatUntil = [&asImported](const juce::String& alias, double until)
+                {
+                    const auto found = asImported.find(alias);
+                    return found != asImported.end() && !found->second.pitchCurve.empty()
+                        && std::all_of(found->second.pitchCurve.begin(), found->second.pitchCurve.end(),
+                               [until](const backend::UtauPitchPoint& point)
+                               {
+                                   return point.timeSeconds >= until || std::abs(point.cents) < 1.0e-3f;
+                               });
+                };
+                expect("unbent_notes_sit_on_their_pitch", flat("i") && flat("o")
+                       && flatUntil("u", byLabel["u"].durationSeconds - 0.030 - 0.001));
+                expect("and_a_tail_under_the_next_bend_sings_it",
+                       std::abs((byLabel["u"].midiNote + centsAt(asImported["u"], byLabel["u"].durationSeconds) / 100.0f)
+                                - (byLabel["e"].midiNote + centsAt(asImported["e"], 0.0) / 100.0f)) < 0.01f
+                       && std::abs((byLabel["u"].midiNote + centsAt(asImported["u"], byLabel["u"].durationSeconds - 0.010) / 100.0f)
+                                - (byLabel["e"].midiNote + centsAt(asImported["e"], -0.010) / 100.0f)) < 0.01f);
+                // Held to the edges: nothing leads into them from the note before.
+                expect("unbent_notes_start_on_their_pitch",
+                       std::abs(centsAt(asImported["i"], -0.015)) < 1.0e-3f
+                       && std::abs(centsAt(asImported["i"], 0.001)) < 1.0e-3f
+                       && std::abs(centsAt(asImported["u"], 0.001)) < 1.0e-3f);
+                // A bend is sung as written, its tail and its head alike.
+                const auto asWritten = [&](const juce::String& alias)
+                {
+                    const auto& note = byLabel[alias];
+                    const auto& spec = asImported[alias];
+                    auto worst = 0.0f;
+                    for (auto time = -0.030; time <= note.durationSeconds + 1.0e-9; time += 0.005)
+                    {
+                        const auto written = (evaluatePitchCurve(note.pitchControlPoints, time) - note.midiNote) * 100.0f;
+                        worst = std::max(worst, std::abs(centsAt(spec, time) - written));
+                    }
+                    return worst;
+                };
+                const auto aWorst = asWritten("a");
+                const auto eWorst = asWritten("e");
+                report.add("bend_deviation_cents=a:" + juce::String(aWorst, 2) + ",e:" + juce::String(eWorst, 2));
+                expect("bends_sung_as_written", aWorst < 0.5f && eWorst < 0.5f
+                       && !byLabel["a"].pitchControlPoints.empty() && !byLabel["e"].pitchControlPoints.empty());
+                expect("bend_head_starts_where_written", std::abs(centsAt(asImported["e"], -0.030) - 200.0f) < 1.0f
+                       && std::abs(centsAt(asImported["a"], -0.040) + 300.0f) < 1.0f);
+
+                // ---- the same notes with the editor's transition on
+                auto withTransition = data;
+                for (auto& track : withTransition.tracks)
+                    for (auto& clip : track.clips)
+                        for (auto& note : clip.notes)
+                            note.utauAutoPitchTransition = true;
+                auto glided = sent(withTransition, clipId);
+                // The transition runs from where one note's own line ends to
+                // where the next one's begins, so it is read across the
+                // boundary rather than at one instant of it: by the note's own
+                // start it may already have arrived, which is what the roll
+                // draws once the points either side have been dragged apart.
+                const auto glideReach = [&centsAt](const backend::UtauNoteRenderSpec& note)
+                {
+                    auto reach = 0.0f;
+                    for (auto time = -0.15; time <= 0.05 + 1.0e-9; time += 0.001)
+                        reach = std::max(reach, std::abs(centsAt(note, time)));
+                    return reach;
+                };
+                report.add("glide_reach=" + juce::String(glideReach(glided["i"]), 1)
+                           + "," + juce::String(glideReach(glided["u"]), 1)
+                           + ",at_start=" + juce::String(centsAt(glided["i"], 0.0), 1)
+                           + "," + juce::String(centsAt(glided["u"], 0.0), 1)
+                           + ",heads=" + juce::String(glided["i"].pitchCurve.empty() ? 0.0
+                                 : glided["i"].pitchCurve.front().timeSeconds, 3)
+                           + "," + juce::String(glided["u"].pitchCurve.empty() ? 0.0
+                                 : glided["u"].pitchCurve.front().timeSeconds, 3));
+                expect("editor_notes_still_glide", glideReach(glided["i"]) > 50.0f
+                       && glideReach(glided["u"]) > 50.0f);
+                expect("render_hash_follows_the_switch",
+                       AudioEngine::utauNoteRenderHash(byLabel["i"])
+                           != AudioEngine::utauNoteRenderHash(withTransition.tracks.front().clips.front().notes[1]));
+
+                // ---- the roll draws what is sung
+                {
+                    I18n strings;
+                    auto roll = std::make_unique<PianoRollComponent>(*project, strings);
+                    roll->setBounds(0, 0, 1200, 600);
+                    roll->setFocusedTrack(trackId);
+                    roll->diagnosticRefresh();
+                    // i: reached into by nothing, its handles at its two edges.
+                    const auto anchors = roll->diagnosticPitchAnchors(byLabel["i"].id);
+                    expect("roll_unbent_handles_at_the_edges", anchors.size() >= 2
+                        && std::abs(anchors.front().timeSeconds) < 1.0e-9
+                        && std::abs(anchors.back().timeSeconds - byLabel["i"].durationSeconds) < 1.0e-9
+                        && std::all_of(anchors.begin(), anchors.end(), [&](const auto& point)
+                               { return std::abs(point.targetMidi - byLabel["i"].midiNote) < 1.0e-4f; }));
+                    // u: e's bend owns the end of it, so u offers no handle
+                    // there -- one would sit on e's bend and move nothing.
+                    const auto ceded = roll->diagnosticOfferedPitchAnchors(byLabel["u"].id);
+                    expect("roll_cedes_what_the_next_bend_owns", !ceded.empty()
+                        && std::abs(ceded.front().timeSeconds) < 1.0e-9
+                        && std::all_of(ceded.begin(), ceded.end(), [&](const auto& point)
+                               { return point.timeSeconds < byLabel["u"].durationSeconds - 0.030 - 1.0e-6
+                                     && std::abs(point.targetMidi - byLabel["u"].midiNote) < 1.0e-4f; }));
+
+                    auto transitionProject = std::make_unique<ProjectModel>();
+                    transitionProject->replace(withTransition);
+                    auto transitionRoll = std::make_unique<PianoRollComponent>(*transitionProject, strings);
+                    transitionRoll->setBounds(0, 0, 1200, 600);
+                    transitionRoll->setFocusedTrack(trackId);
+                    transitionRoll->diagnosticRefresh();
+                    const auto inset = transitionRoll->diagnosticPitchAnchors(byLabel["i"].id);
+                    expect("roll_editor_handles_inset", inset.size() >= 2 && inset.front().timeSeconds > 0.005
+                        && inset.back().timeSeconds < byLabel["i"].durationSeconds - 0.005);
+                }
+
+                // ---- saved and read back; and a project saved before the switch existed
+                const auto saved = folder.getChildFile("pitch.hjpx");
+                juce::String saveError;
+                auto roundTrip = false;
+                if (project->save(saved, saveError))
+                {
+                    ProjectModel reread;
+                    juce::String loadError;
+                    if (reread.load(saved, loadError))
+                    {
+                        // A copy: a range-for over snapshot() reads what the
+                        // temporary has already freed.
+                        const auto readBack = reread.snapshot();
+                        const auto& notes = readBack.tracks.front().clips.front().notes;
+                        roundTrip = notes.size() == 5;
+                        for (const auto& note : notes)
+                            roundTrip = roundTrip && !note.utauAutoPitchTransition;
+                    }
+                }
+                expect("switch_survives_saving", roundTrip);
+                auto olderGlides = false;
+                {
+                    juce::MemoryBlock bytes;
+                    saved.loadFileAsData(bytes);
+                    juce::MemoryInputStream stream(bytes, false);
+                    auto tree = juce::ValueTree::readFromStream(stream);
+                    std::function<void(juce::ValueTree)> strip = [&strip](juce::ValueTree node)
+                    {
+                        node.removeProperty("utauAutoPitchTransition", nullptr);
+                        for (auto child : node) strip(child);
+                    };
+                    strip(tree);
+                    const auto older = folder.getChildFile("older.hjpx");
+                    {
+                        juce::FileOutputStream out(older);
+                        if (out.openedOk()) { out.setPosition(0); out.truncate(); tree.writeToStream(out); }
+                    }
+                    ProjectModel reread;
+                    juce::String loadError;
+                    if (reread.load(older, loadError))
+                    {
+                        const auto readBack = reread.snapshot();
+                        const auto& notes = readBack.tracks.front().clips.front().notes;
+                        olderGlides = notes.size() == 5;
+                        for (const auto& note : notes)
+                            olderGlides = olderGlides && note.utauAutoPitchTransition;
+                    }
+                }
+                expect("older_projects_keep_gliding", olderGlides);
+
+                // ---- real songs named on the command line, note by note
+                auto realNotes = 0, realBent = 0, realFlat = 0, realVibrato = 0;
+                auto realWorst = 0.0f, realVibratoWorst = 0.0f, realUnderWorst = 0.0f;
+                auto realOk = true;
+                for (int index = 1; index < arguments.size(); ++index)
+                {
+                    const juce::File real(arguments[index].unquoted());
+                    ProjectModel song;
+                    juce::String songError;
+                    juce::StringArray songWarnings;
+                    if (!song.addUstFile(real, songError, songWarnings)) { realOk = false; continue; }
+                    const auto songData = song.snapshot();
+                    const auto& songClip = songData.tracks.front().clips.front();
+                    const auto specs = AudioEngine::diagnosticUtauRequestNotes(songData, songClip.id);
+                    if (specs.size() != songClip.notes.size()) { realOk = false; continue; }
+                    const auto& notes = songClip.notes;
+                    // The line a note is sung along, worked out here from the
+                    // file again rather than read from the renderer: notes
+                    // join where one's bend begins inside the one before; the
+                    // latest note whose first point has been reached decides;
+                    // up to its last point there it is sung as written, and
+                    // from that point runs smoothly into the first point of
+                    // the note that takes over.
+                    const auto own = [](const NoteData& note)
+                    {
+                        auto points = ownPitchPoints(note);
+                        for (auto& point : points) point.timeSeconds += note.startSeconds;
+                        return points;
+                    };
+                    // Joined either way round, as the model joins them: the
+                    // later note's bend begins inside the earlier one, or the
+                    // earlier one's own bend runs on past where the later one
+                    // starts -- touching, or over a rest shorter than 80 ms,
+                    // which comes in from the file as a gap.
+                    const auto reachesBack = [&notes, &own](std::size_t k)
+                    {
+                        if (k == 0 || notes[k].pitchControlPoints.empty()) return false;
+                        const auto& earlier = notes[k - 1];
+                        if (notes[k].startSeconds - (earlier.startSeconds + earlier.durationSeconds) > 0.08)
+                            return false;
+                        if (own(notes[k]).front().timeSeconds
+                                < earlier.startSeconds + earlier.durationSeconds - 1.0e-4)
+                            return true;
+                        if (earlier.pitchControlPoints.empty()) return false;
+                        auto last = -std::numeric_limits<double>::infinity();
+                        for (const auto& point : own(earlier))
+                            last = std::max(last, point.timeSeconds);
+                        return last > notes[k].startSeconds + 1.0e-4;
+                    };
+                    for (std::size_t noteIndex = 0; noteIndex < specs.size(); ++noteIndex)
+                    {
+                        const auto& note = notes[noteIndex];
+                        const auto& spec = specs[noteIndex];
+                        ++realNotes;
+                        if (note.pitchControlPoints.empty()) ++realFlat; else ++realBent;
+                        if (note.vibratoEnabled) ++realVibrato;
+                        auto low = noteIndex;
+                        while (low > 0 && reachesBack(low)) --low;
+                        auto high = noteIndex;
+                        while (high + 1 < notes.size() && reachesBack(high + 1)) ++high;
+                        struct Owner { std::size_t k; double from, until, last; };
+                        std::vector<Owner> owners;
+                        for (auto k = low; k <= high; ++k)
+                        {
+                            auto until = std::numeric_limits<double>::infinity();
+                            for (auto m = k + 1; m <= high; ++m)
+                                until = std::min(until, own(notes[m]).front().timeSeconds);
+                            const auto from = k == low ? -std::numeric_limits<double>::infinity()
+                                                       : own(notes[k]).front().timeSeconds;
+                            if (!(until > from)) continue;
+                            auto last = -std::numeric_limits<double>::infinity();
+                            auto any = false;
+                            for (const auto& point : own(notes[k]))
+                                if (point.timeSeconds >= from - 1.0e-9 && point.timeSeconds < until - 1.0e-6)
+                                {
+                                    last = any ? std::max(last, point.timeSeconds) : point.timeSeconds;
+                                    any = true;
+                                }
+                            if (any) owners.push_back({ k, from, until, last });
+                        }
+                        if (!owners.empty())
+                            owners.front().from = -std::numeric_limits<double>::infinity();
+                        const auto expectedAt = [&](double at, std::size_t& ownerIndex)
+                        {
+                            std::size_t which = 0;
+                            for (std::size_t o = 0; o < owners.size(); ++o)
+                                if (owners[o].from <= at) which = o;
+                            ownerIndex = owners[which].k;
+                            const auto& owner = owners[which];
+                            const auto mine = own(notes[owner.k]);
+                            if (!std::isfinite(owner.until) || at <= owner.last)
+                                return evaluatePitchCurve(mine, at);
+                            std::size_t taker = which + 1;
+                            while (taker < owners.size()
+                                   && std::abs(owners[taker].from - owner.until) > 1.0e-12)
+                                ++taker;
+                            if (taker >= owners.size()) return evaluatePitchCurve(mine, at);
+                            const auto theirs = own(notes[owners[taker].k]);
+                            PitchCurveEditPoint a { owner.last, evaluatePitchCurve(mine, owner.last) };
+                            PitchCurveEditPoint b = theirs.front();
+                            b.timeSeconds = owner.until;
+                            b.targetMidi = evaluatePitchCurve(theirs, owner.until);
+                            return evaluatePitchCurve({ a, b }, at);
+                        };
+                        // A note's vibrato is laid over the line, not in place
+                        // of it, so what is sung is the sum.
+                        const auto swing = [&note](double time)
+                        {
+                            return note.vibratoEnabled
+                                ? static_cast<float>(vibratoCentsAt(note,
+                                      juce::jlimit(0.0, note.durationSeconds, time))) : 0.0f;
+                        };
+                        const auto from = note.pitchControlPoints.empty()
+                            ? 0.0 : std::min(0.0, note.pitchControlPoints.front().timeSeconds);
+                        // At the instants the curve was sampled at, so what is
+                        // compared is what was sent.
+                        for (const auto& point : spec.pitchCurve)
+                        {
+                            if (point.timeSeconds < from - 1.0e-9
+                                || point.timeSeconds > note.durationSeconds + 1.0e-9)
+                                continue;
+                            if (owners.empty()) { realOk = false; break; }
+                            std::size_t ownerIndex = noteIndex;
+                            const auto expected = (expectedAt(note.startSeconds + point.timeSeconds, ownerIndex)
+                                                   - note.midiNote) * 100.0f + swing(point.timeSeconds);
+                            const auto missed = std::abs(point.cents - expected);
+                            if (ownerIndex == noteIndex)
+                            {
+                                realWorst = std::max(realWorst, missed);
+                                if (note.vibratoEnabled)
+                                    realVibratoWorst = std::max(realVibratoWorst, missed);
+                            }
+                            else
+                                realUnderWorst = std::max(realUnderWorst, missed);
+                        }
+                        // And on the grid a bend was always sampled on -- from
+                        // its first point, five milliseconds at a time -- read
+                        // between the samples as the engine reads them.  Where
+                        // a note sings its own points it has to be sent the very
+                        // samples it always was; sampled on some other grid, a
+                        // steep bend comes out a few cents different.
+                        if (!note.pitchControlPoints.empty() && !owners.empty())
+                            for (auto time = from; time < note.durationSeconds; time += 0.005)
+                            {
+                                std::size_t ownerIndex = noteIndex;
+                                const auto at = note.startSeconds + time;
+                                const auto expected = (expectedAt(at, ownerIndex) - note.midiNote) * 100.0f
+                                    + swing(time);
+                                auto ownStretch = false;
+                                for (const auto& owner : owners)
+                                    ownStretch = ownStretch || (owner.k == noteIndex && at >= owner.from
+                                                                && at <= owner.last + 1.0e-9);
+                                if (ownerIndex != noteIndex || !ownStretch) continue;
+                                realWorst = std::max(realWorst, std::abs(centsAt(spec, time) - expected));
+                            }
+                    }
+                }
+                if (arguments.size() > 1)
+                {
+                    report.add("real_notes=" + juce::String(realNotes) + ",bent=" + juce::String(realBent)
+                               + ",flat=" + juce::String(realFlat)
+                               + ",with_vibrato=" + juce::String(realVibrato)
+                               + ",worst_cents=" + juce::String(realWorst, 2)
+                               + ",worst_cents_with_vibrato=" + juce::String(realVibratoWorst, 2)
+                               + ",worst_cents_under_the_next_bend=" + juce::String(realUnderWorst, 2));
+                    expect("real_songs_sung_as_written", realOk && realNotes > 0 && realWorst < 0.5f);
+                    expect("and_every_tail_under_a_bend_sings_it", realUnderWorst < 0.5f);
+                }
+
+                folder.deleteRecursively();
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 2 && arguments[0] == "--smoke-hf-prewarm")
+        {
+            // The first HF note of a session waited 10-20 s for the vocoder
+            // daemon to load.  The window now starts it when it opens.
+            //
+            // A stand-in daemon is started rather than the real one: it
+            // listens on a free port, writes down each time it is started and
+            // whether it was handed this process's handles, and leaves when
+            // told.  The interpreter is named on the command line.
+            [this, &arguments]
+            {
+                using Renderer = backend::UtauRenderer;
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const juce::String python = arguments[1].unquoted();
+                const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-hf-prewarm-" + juce::Uuid().toDashedString());
+
+                // ---- the interpreter, read as the engine reads python.txt
+                const auto engineWith = [&root](const juce::String& name, const juce::String* pythonTxt)
+                {
+                    const auto folder = root.getChildFile(name);
+                    folder.getChildFile("hf_backend").createDirectory();
+                    folder.getChildFile("WCSNDM.exe").replaceWithText("stand-in");
+                    if (pythonTxt != nullptr)
+                        folder.getChildFile("hf_backend").getChildFile("python.txt")
+                            .replaceWithText(*pythonTxt, false, false, nullptr);
+                    return folder;
+                };
+                const juce::String absolute = "D:\\tools\\pythonw.exe\r\n";
+                const juce::String relative = "  \tpython\\pythonw.exe \r\n";
+                const juce::String unc = "\\\\server\\share\\pythonw.exe";
+                const juce::String blank = "   \r\n";
+                const juce::String cjk = juce::String::fromUTF8(u8"E:\\\u58f0\u97f3\\pythonw.exe");
+                const auto none = engineWith("none", nullptr);
+                expect("no_python_txt_means_pythonw", Renderer::hfDaemonInterpreter(none) == "pythonw");
+                expect("absolute_as_written",
+                       Renderer::hfDaemonInterpreter(engineWith("abs", &absolute)) == "D:\\tools\\pythonw.exe");
+                const auto rel = engineWith("rel", &relative);
+                expect("relative_from_the_engine_folder",
+                       Renderer::hfDaemonInterpreter(rel) == rel.getFullPathName() + "\\python\\pythonw.exe");
+                expect("unc_as_written",
+                       Renderer::hfDaemonInterpreter(engineWith("unc", &unc)) == "\\\\server\\share\\pythonw.exe");
+                const auto blankFolder = engineWith("blank", &blank);
+                expect("blank_line_like_the_engine",
+                       Renderer::hfDaemonInterpreter(blankFolder) == blankFolder.getFullPathName() + "\\pythonw");
+                expect("utf8_path", Renderer::hfDaemonInterpreter(engineWith("cjk", &cjk)) == cjk);
+
+                // ---- starting it
+                auto port = 0;
+                {
+                    juce::StreamingSocket listener;
+                    if (listener.createListener(0, "127.0.0.1")) port = listener.getBoundPort();
+                }
+                const auto engine = engineWith("engine", &python);
+                const auto backend = engine.getChildFile("hf_backend");
+                backend.getChildFile("port.txt").replaceWithText(juce::String(port));
+                backend.getChildFile("hf_daemon.py").replaceWithText(
+                    "import os, socket, sys, time\n"
+                    "here = os.path.dirname(os.path.abspath(__file__))\n"
+                    "port = int(open(os.path.join(here, 'port.txt')).read())\n"
+                    "with open(os.path.join(here, 'launches.txt'), 'a') as log:\n"
+                    "    log.write('%d %d %d %s\\n' % (os.getpid(), sys.stdout is None, sys.stderr is None, os.getcwd()))\n"
+                    "s = socket.socket(); s.bind(('127.0.0.1', port)); s.listen(5); s.settimeout(0.3)\n"
+                    "end = time.time() + 40\n"
+                    "while time.time() < end and not os.path.exists(os.path.join(here, 'quit.txt')):\n"
+                    "    try:\n"
+                    "        c, _ = s.accept(); c.close()\n"
+                    "    except OSError:\n"
+                    "        pass\n", false, false, "\n");
+                const auto listening = [port]
+                {
+                    juce::StreamingSocket probe;
+                    return probe.connect("127.0.0.1", port, 200);
+                };
+                const auto launches = [&backend]
+                {
+                    return juce::StringArray::fromLines(
+                        backend.getChildFile("launches.txt").loadFileAsString().trim());
+                };
+                const auto waitFor = [](std::function<bool()> condition, int ms)
+                {
+                    const auto until = juce::Time::getMillisecondCounterHiRes() + ms;
+                    while (!condition() && juce::Time::getMillisecondCounterHiRes() < until)
+                        juce::Thread::sleep(50);
+                    return condition();
+                };
+                expect("premise_port_free", port > 0 && !listening());
+
+                // An engine whose hf_backend has no daemon in it -- a working
+                // interpreter named, and nothing for it to run.
+                const auto bare = engineWith("bare", &python);
+                expect("no_daemon_script_nothing_started",
+                       !Renderer::startHfDaemonIfNeeded(bare.getChildFile("WCSNDM.exe"), port));
+
+                const auto started = Renderer::startHfDaemonIfNeeded(engine.getChildFile("WCSNDM.exe"), port);
+                const auto up = waitFor(listening, 15000);
+                expect("started_and_listening", started && up);
+                const auto first = launches();
+                const auto fields = juce::StringArray::fromTokens(first.isEmpty() ? juce::String() : first[0], " ", "");
+                expect("started_once", first.size() == 1);
+                expect("no_handles_handed_on", fields.size() >= 3 && fields[1] == "1" && fields[2] == "1");
+                expect("runs_in_its_own_folder", first.size() == 1
+                       && juce::File(first[0].fromFirstOccurrenceOf(" ", false, false)
+                                         .fromFirstOccurrenceOf(" ", false, false)
+                                         .fromFirstOccurrenceOf(" ", false, false)) == backend);
+
+                // Asked again while it listens -- now and from the background --
+                // nothing more is started.
+                const auto again = Renderer::startHfDaemonIfNeeded(engine.getChildFile("WCSNDM.exe"), port);
+                juce::Thread::sleep(1500);
+                expect("not_started_twice", !again && launches().size() == 1);
+
+                backend.getChildFile("quit.txt").replaceWithText("bye");
+                expect("stand_in_left", waitFor([&listening] { return !listening(); }, 5000));
+                juce::Thread::sleep(300);
+                root.deleteRecursively();
+
+                std::cout << "port=" << port << "|" << report.joinIntoString("|")
+                          << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-ust-vibrato")
+        {
+            // A UST writes a vibrato as VBR: how much of the note's end it
+            // covers, one swing, its depth, the fade in and out, the phase it
+            // starts at, and how far its centre is moved.  None of it was read
+            // -- every imported note came in without a vibrato.
+            //
+            // Read here out of the curves the renderer is sent, which is where
+            // a vibrato ends up: the swing's size, how many swings, where it
+            // begins, that the phase turns it over, that the centre moves, and
+            // that it rides on a note's bend rather than replacing it.
+            [this, &arguments]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-ust-vibrato-" + juce::Uuid().toDashedString());
+                folder.createDirectory();
+                const auto ust = folder.getChildFile("vibrato.ust");
+                // A second at 120 bpm is 960 ticks, which is several swings.
+                ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\nTempo=120.00\r\n"
+                                    "Tracks=1\r\nProjectName=vibrato\r\nMode2=True\r\n"
+                                    "[#0000]\r\nLength=960\r\nLyric=a\r\nNoteNum=60\r\n"
+                                    "VBR=100,180,50,0,0,0,0,0\r\n"
+                                    "[#0001]\r\nLength=960\r\nLyric=i\r\nNoteNum=62\r\n"
+                                    "VBR=50,200,30,20,20,0,0,0\r\n"
+                                    "[#0002]\r\nLength=960\r\nLyric=u\r\nNoteNum=64\r\n"
+                                    "VBR=100,180,50,0,0,50,0,0\r\n"
+                                    "[#0003]\r\nLength=960\r\nLyric=e\r\nNoteNum=65\r\n"
+                                    "VBR=100,180,50,0,0,0,50,0\r\n"
+                                    "[#0004]\r\nLength=960\r\nLyric=o\r\nNoteNum=67\r\n"
+                                    "VBR=0,180,50,20,20,0,0,0\r\n"
+                                    "[#0005]\r\nLength=960\r\nLyric=ka\r\nNoteNum=69\r\n"
+                                    "[#0006]\r\nLength=960\r\nLyric=ki\r\nNoteNum=71\r\n"
+                                    "PBS=-40;-20\r\nPBW=80\r\nPBY=\r\n"
+                                    "VBR=100,180,40,0,0,0,0,0\r\n"
+                                    "[#TRACKEND]\r\n");
+                auto project = std::make_unique<ProjectModel>();
+                juce::String error;
+                juce::StringArray warnings;
+                const auto built = project->addUstFile(ust, error, warnings);
+                const auto data = project->snapshot();
+                std::map<juce::String, NoteData> byLabel;
+                juce::String clipId;
+                if (built)
+                {
+                    clipId = data.tracks.front().clips.front().id;
+                    for (const auto& note : data.tracks.front().clips.front().notes)
+                        byLabel[note.label] = note;
+                }
+                expect("imported_seven_notes", built && byLabel.size() == 7);
+
+                const auto& a = byLabel["a"];
+                expect("numbers_as_written", a.vibratoEnabled
+                    && std::abs(a.vibratoLengthPercent - 100.0) < 1.0e-9
+                    && std::abs(a.vibratoCycleMs - 180.0) < 1.0e-9
+                    && std::abs(a.vibratoDepthCents - 50.0) < 1.0e-9
+                    && std::abs(byLabel["i"].vibratoFadeInPercent - 20.0) < 1.0e-9
+                    && std::abs(byLabel["i"].vibratoFadeOutPercent - 20.0) < 1.0e-9
+                    && std::abs(byLabel["u"].vibratoPhasePercent - 50.0) < 1.0e-9
+                    && std::abs(byLabel["e"].vibratoOffsetPercent - 50.0) < 1.0e-9);
+                expect("no_vibrato_stays_off", !byLabel["o"].vibratoEnabled
+                                               && !byLabel["ka"].vibratoEnabled);
+
+                std::map<juce::String, backend::UtauNoteRenderSpec> sent;
+                for (auto& note : AudioEngine::diagnosticUtauRequestNotes(data, clipId))
+                    sent[note.alias] = std::move(note);
+                const auto curveOf = [&sent](const juce::String& alias, double from, double to)
+                {
+                    std::vector<std::pair<double, float>> points;
+                    const auto found = sent.find(alias);
+                    if (found == sent.end()) return points;
+                    for (const auto& point : found->second.pitchCurve)
+                        if (point.timeSeconds >= from - 1.0e-9 && point.timeSeconds <= to + 1.0e-9)
+                            points.push_back({ point.timeSeconds, point.cents });
+                    return points;
+                };
+                const auto extremes = [](const std::vector<std::pair<double, float>>& points)
+                {
+                    auto low = 1.0e9f, high = -1.0e9f;
+                    for (const auto& [time, cents] : points)
+                    { low = std::min(low, cents); high = std::max(high, cents); }
+                    return std::pair { low, high };
+                };
+                const auto crossings = [](const std::vector<std::pair<double, float>>& points, float about)
+                {
+                    auto count = 0;
+                    for (std::size_t index = 1; index < points.size(); ++index)
+                        if ((points[index - 1].second - about) * (points[index].second - about) < 0.0f)
+                            ++count;
+                    return count;
+                };
+
+                // The swing itself: its size, and one swing every 180 ms.
+                const auto whole = curveOf("a", 0.0, 1.0);
+                const auto [low, high] = extremes(whole);
+                report.add("a_swing=" + juce::String(low, 1) + ".." + juce::String(high, 1));
+                expect("swing_reaches_its_depth", std::abs(high - 50.0f) < 0.6f
+                                                  && std::abs(low + 50.0f) < 0.6f);
+                report.add("a_crossings=" + juce::String(crossings(whole, 0.0f)));
+                expect("one_swing_every_cycle", std::abs(crossings(whole, 0.0f) - 11) <= 1);
+
+                // Measured back from the end of the note, and nothing before.
+                const auto early = curveOf("i", 0.0, 0.48);
+                const auto late = curveOf("i", 0.55, 1.0);
+                expect("covers_the_end_of_the_note",
+                       std::abs(extremes(early).first) < 1.0e-3f && std::abs(extremes(early).second) < 1.0e-3f
+                       && extremes(late).second > 25.0f);
+                // The fade: the swing is 20% of the way in after a fifth of
+                // the fade, and all of it by the middle.  (The vibrato covers
+                // the last half second; its fade-in is a fifth of that.)
+                const auto entering = extremes(curveOf("i", 0.50, 0.52)).second;
+                const auto middle = extremes(curveOf("i", 0.70, 0.80)).second;
+                report.add("i_fade=" + juce::String(entering, 1) + "->" + juce::String(middle, 1));
+                expect("fades_in", entering < 0.25f * 30.0f && middle > 25.0f);
+
+                // Half a swing on: the same curve, turned over.
+                const auto turned = curveOf("u", 0.0, 1.0);
+                auto worstOpposite = 0.0f;
+                for (std::size_t index = 0; index < whole.size() && index < turned.size(); ++index)
+                    worstOpposite = std::max(worstOpposite,
+                        std::abs(whole[index].second + turned[index].second));
+                report.add("phase_mirror_cents=" + juce::String(worstOpposite, 2));
+                expect("phase_turns_it_over", worstOpposite < 0.5f);
+
+                // The centre moved half a depth up.
+                const auto moved = extremes(curveOf("e", 0.0, 1.0));
+                report.add("e_swing=" + juce::String(moved.first, 1) + ".." + juce::String(moved.second, 1));
+                expect("centre_moves", std::abs(moved.second - 75.0f) < 0.6f
+                                       && std::abs(moved.first + 25.0f) < 0.6f);
+
+                // Nothing where the file says none.
+                // Up to where a note turns towards the next one's bend: ki's
+                // starts forty milliseconds before ki, over ka's tail, and
+                // from there ka sings it -- a bend, not a vibrato.
+                const auto silent = [&](const juce::String& alias, double until = 2.0)
+                {
+                    const auto points = curveOf(alias, -1.0, until);
+                    return !points.empty() && std::abs(extremes(points).first) < 1.0e-3f
+                        && std::abs(extremes(points).second) < 1.0e-3f;
+                };
+                expect("length_zero_is_no_vibrato", silent("o"));
+                expect("no_vbr_is_no_vibrato",
+                       silent("ka", byLabel["ka"].durationSeconds - 0.040 - 0.002));
+
+                // On top of the note's bend, not instead of it.
+                const auto& bent = byLabel["ki"];
+                auto worstOnTop = 0.0f;
+                auto lowOnTop = 1.0e9f, highOnTop = -1.0e9f;
+                for (const auto& [time, cents] : curveOf("ki", 0.0, 1.0))
+                {
+                    const auto written = (evaluatePitchCurve(bent.pitchControlPoints, time)
+                                          - bent.midiNote) * 100.0f;
+                    const auto swing = cents - written;
+                    lowOnTop = std::min(lowOnTop, swing);
+                    highOnTop = std::max(highOnTop, swing);
+                    worstOnTop = std::max(worstOnTop, std::abs(swing));
+                }
+                report.add("ki_on_top=" + juce::String(lowOnTop, 1) + ".." + juce::String(highOnTop, 1));
+                expect("rides_on_the_bend", std::abs(highOnTop - 40.0f) < 0.6f
+                                            && std::abs(lowOnTop + 40.0f) < 0.6f
+                                            && !bent.pitchControlPoints.empty());
+
+                // ---- real songs: every VBR the file has is a note that swings
+                auto realFiles = 0, realVibratos = 0;
+                auto realOk = true;
+                for (int index = 1; index < arguments.size(); ++index)
+                {
+                    const juce::File real(arguments[index].unquoted());
+                    if (!real.existsAsFile()) continue;
+                    ++realFiles;
+                    // What the file itself says, counted off its own lines.
+                    juce::MemoryBlock bytes;
+                    real.loadFileAsData(bytes);
+                    juce::String encoding;
+                    const auto text = backend::UstImporter::decode(bytes, encoding);
+                    auto written = 0;
+                    for (const auto& line : juce::StringArray::fromLines(text))
+                    {
+                        if (!line.trim().startsWithIgnoreCase("VBR=")) continue;
+                        auto fields = juce::StringArray::fromTokens(line.fromFirstOccurrenceOf("=", false, false), ",", "");
+                        if (fields.size() >= 3 && fields[0].getDoubleValue() > 0.0
+                            && fields[2].getDoubleValue() != 0.0 && fields[1].getDoubleValue() > 0.0)
+                            ++written;
+                    }
+                    ProjectModel song;
+                    juce::String songError;
+                    juce::StringArray songWarnings;
+                    if (!song.addUstFile(real, songError, songWarnings)) { realOk = false; continue; }
+                    const auto songData = song.snapshot();
+                    const auto& songClip = songData.tracks.front().clips.front();
+                    auto imported = 0;
+                    for (const auto& note : songClip.notes)
+                        if (note.vibratoEnabled) ++imported;
+                    realVibratos += imported;
+                    if (imported != written) realOk = false;
+                    report.add(real.getFileNameWithoutExtension() + "=" + juce::String(imported)
+                               + "/" + juce::String(written));
+                    // And they really swing once rendered.
+                    const auto specs = AudioEngine::diagnosticUtauRequestNotes(songData, songClip.id);
+                    for (std::size_t noteIndex = 0; noteIndex < specs.size()
+                                                    && noteIndex < songClip.notes.size(); ++noteIndex)
+                    {
+                        const auto& note = songClip.notes[noteIndex];
+                        if (!note.vibratoEnabled) continue;
+                        auto lowest = 1.0e9f, highest = -1.0e9f;
+                        for (const auto& point : specs[noteIndex].pitchCurve)
+                        {
+                            const auto written = note.pitchControlPoints.empty() ? 0.0f
+                                : (evaluatePitchCurve(note.pitchControlPoints, point.timeSeconds)
+                                   - note.midiNote) * 100.0f;
+                            lowest = std::min(lowest, point.cents - written);
+                            highest = std::max(highest, point.cents - written);
+                        }
+                        // A vibrato with room for a couple of swings reaches
+                        // most of its depth; a short one -- a fifth of a second
+                        // of a 180 ms swing, fading in and out -- only has to
+                        // move at all, or it was not carried over.
+                        const auto span = note.durationSeconds * note.vibratoLengthPercent / 100.0;
+                        const auto swings = span / std::max(0.001, note.vibratoCycleMs / 1000.0);
+                        const auto reach = static_cast<double>(highest - lowest);
+                        const auto depth = std::abs(note.vibratoDepthCents);
+                        if (swings >= 2.0 ? reach < 1.2 * depth : reach < 0.02 * depth)
+                            realOk = false;
+                    }
+                }
+                if (arguments.size() > 1)
+                {
+                    report.add("real_files=" + juce::String(realFiles)
+                               + ",vibratos=" + juce::String(realVibratos));
+                    expect("real_songs_keep_every_vibrato", realOk && realFiles > 0 && realVibratos > 0);
+                }
+
+                folder.deleteRecursively();
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-mcp-roots")
+        {
+            // What read_file and list_directory may see.  They used to see
+            // everything: any path on the machine, a megabyte at a time, to
+            // whatever the MCP server was connected to.  Now they see only
+            // where the session's own work is -- and "inside a folder" is the
+            // whole rule, so it is worth knowing it means folders and not
+            // names that merely begin alike.
+            //
+            // The refusal being reached from a real call is measured by
+            // tools/check_mcp_roots.py, which drives a server over stdio.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-mcp-roots-" + juce::Uuid().toDashedString());
+                const auto song = work.getChildFile("song");
+                const auto elsewhere = work.getChildFile("elsewhere");
+                // A folder whose name begins with the allowed one's.
+                const auto sibling = work.getChildFile("song-private");
+                const auto deep = song.getChildFile("parts").getChildFile("more");
+                for (const auto& folder : { song, elsewhere, sibling, deep })
+                    folder.createDirectory();
+                const auto inside = song.getChildFile("notes.txt");
+                inside.replaceWithText("work");
+                sibling.getChildFile("secret.txt").replaceWithText("not this");
+
+                const std::vector<juce::File> roots { song };
+                const auto within = [&roots](const juce::File& file)
+                {
+                    return backend::McpServer::pathWithinRoots(roots, file);
+                };
+                expect("the_folder_itself", within(song));
+                expect("a_file_in_it", within(inside));
+                expect("a_file_deeper_in_it", within(deep.getChildFile("piece.wav")));
+                expect("not_the_folder_above", !within(work));
+                expect("not_another_folder", !within(elsewhere.getChildFile("secret.txt")));
+                // The one that looks right until it is read: "song" is not a
+                // parent of "song-private", however much of the name they share.
+                expect("not_a_name_that_merely_begins_alike",
+                       !within(sibling.getChildFile("secret.txt")));
+                // A path that walks out of the folder again.
+                expect("not_a_path_that_climbs_back_out",
+                       !within(juce::File(song.getFullPathName() + "/../song-private/secret.txt")));
+                expect("nothing_when_nothing_is_allowed",
+                       !backend::McpServer::pathWithinRoots({}, inside));
+                expect("an_empty_root_allows_nothing",
+                       !backend::McpServer::pathWithinRoots({ juce::File() }, inside));
+                expect("an_empty_path_is_not_inside_anything",
+                       !within(juce::File()));
+               #if JUCE_WINDOWS
+                // Callers write paths however they please, and this filesystem
+                // does not care which case they are in.
+                expect("case_is_not_what_keeps_a_file_out",
+                       within(juce::File(inside.getFullPathName().toUpperCase())));
+               #endif
+
+                // Where a project's own work lives: the voicebanks its tracks
+                // sing from and the folders its recordings sit in, which is
+                // what a session may read without being told to.
+                ProjectData data;
+                TrackData track;
+                track.id = "t";
+                track.voicebankDirectory = elsewhere;
+                ClipData clip;
+                clip.id = "c";
+                clip.sourceFile = deep.getChildFile("piece.wav");
+                track.clips.push_back(clip);
+                TrackData second;
+                second.id = "t2";
+                // A voicebank that is not on this machine names nothing to read.
+                second.voicebankDirectory = work.getChildFile("gone");
+                ClipData another;
+                another.id = "c2";
+                another.sourceFile = deep.getChildFile("piece2.wav");
+                second.clips.push_back(another);
+                data.tracks.push_back(track);
+                data.tracks.push_back(second);
+                const auto found = backend::McpServer::projectRoots(data);
+                juce::StringArray foundNames;
+                for (const auto& folder : found) foundNames.add(folder.getFullPathName());
+                report.add("project_roots=" + juce::String(static_cast<int>(found.size())));
+                expect("a_project_names_its_voicebank_and_its_media",
+                       found.size() == 2
+                       && foundNames.contains(elsewhere.getFullPathName())
+                       && foundNames.contains(deep.getFullPathName()));
+                expect("and_names_each_folder_once",
+                       !foundNames.contains(work.getChildFile("gone").getFullPathName()));
+                expect("and_what_it_names_is_what_may_be_read",
+                       backend::McpServer::pathWithinRoots(found,
+                           deep.getChildFile("piece2.wav"))
+                       && !backend::McpServer::pathWithinRoots(found,
+                           sibling.getChildFile("secret.txt")));
+
+                work.deleteRecursively();
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-mcp-schema")
+        {
+            // What a client is told each MCP tool takes.  A client shows the
+            // model it drives only the schema, so a tool whose schema names no
+            // properties is one whose parameter names have to be guessed --
+            // and every one of these shared a single empty object, which is
+            // forty-eight tools and a hundred and forty-four parameters no
+            // caller could know the names of.
+            //
+            // The names themselves are held to the dispatcher that reads them
+            // by tools/check_mcp_schemas.py, which reads both sides.  What is
+            // measured here is the shape: that each tool has a schema of its
+            // own, that everything it names is typed and described, and that
+            // the ones which really take nothing are only the ones that do.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto tools = backend::McpServer::diagnosticTools();
+                const auto* listed = tools.getArray();
+                expect("there_are_tools", listed != nullptr && listed->size() >= 40);
+                if (listed == nullptr)
+                {
+                    std::cout << report.joinIntoString("|") << "|ok=0" << std::endl;
+                    setApplicationReturnValue(4);
+                    juce::MessageManager::callAsync([this] { quit(); });
+                    return;
+                }
+
+                // The seven that really take nothing.  Everything else has to
+                // name what it takes; before this they all named nothing, and
+                // a list of names is the only thing that told them apart.
+                const juce::StringArray takeNothing {
+                    "project_new", "project_snapshot", "undo", "redo",
+                    "render_status", "transport_status", "transport_stop" };
+                juce::StringArray names;
+                auto described = true, typed = true, requiredIsNamed = true;
+                auto namedNothing = juce::StringArray();
+                auto parameters = 0, withChoices = 0, withShapes = 0;
+                for (const auto& tool : *listed)
+                {
+                    const auto name = tool.getProperty("name", {}).toString();
+                    names.add(name);
+                    described = described
+                        && tool.getProperty("description", {}).toString().isNotEmpty();
+                    const auto schema = tool.getProperty("inputSchema", {});
+                    if (schema.getProperty("type", {}).toString() != "object") typed = false;
+                    const auto properties = schema.getProperty("properties", {});
+                    const auto* fields = properties.getDynamicObject();
+                    if (fields == nullptr || fields->getProperties().size() == 0)
+                    {
+                        namedNothing.add(name);
+                        continue;
+                    }
+                    for (const auto& field : fields->getProperties())
+                    {
+                        ++parameters;
+                        const auto entry = field.value;
+                        const auto type = entry.getProperty("type", {}).toString();
+                        if (type != "string" && type != "number" && type != "integer"
+                            && type != "boolean" && type != "array" && type != "object")
+                            typed = false;
+                        if (entry.getProperty("description", {}).toString().isEmpty())
+                            described = false;
+                        if (entry.getProperty("enum", {}).isArray()) ++withChoices;
+                        if (entry.getProperty("items", {}).isObject()
+                            || entry.getProperty("properties", {}).isObject()) ++withShapes;
+                    }
+                    // Anything required has to be something the tool takes.
+                    if (const auto* required = schema.getProperty("required", {}).getArray())
+                        for (const auto& entry : *required)
+                            if (!fields->hasProperty(juce::Identifier(entry.toString())))
+                                requiredIsNamed = false;
+                }
+                report.add("tools=" + juce::String(listed->size())
+                           + ",parameters=" + juce::String(parameters)
+                           + ",choices=" + juce::String(withChoices)
+                           + ",shapes=" + juce::String(withShapes));
+                names.sort(true);
+                auto unique = names;
+                unique.removeDuplicates(true);
+                expect("each_is_named_once", unique.size() == names.size());
+                expect("each_is_an_object_schema", typed);
+                expect("everything_is_described", described);
+                expect("what_is_required_is_named", requiredIsNamed);
+                namedNothing.sort(true);
+                auto expected = takeNothing;
+                expected.sort(true);
+                report.add("named_nothing=" + namedNothing.joinIntoString(","));
+                expect("only_the_ones_that_take_nothing_name_nothing",
+                       namedNothing == expected);
+                expect("enough_is_named", parameters >= 120 && withChoices >= 5
+                       && withShapes >= 2);
+
+                // Two tools read closely: the one every caller starts with,
+                // and the one with the most to say.
+                const auto schemaOf = [&listed](const char* wanted)
+                {
+                    for (const auto& tool : *listed)
+                        if (tool.getProperty("name", {}).toString() == wanted)
+                            return tool.getProperty("inputSchema", {});
+                    return juce::var();
+                };
+                const auto names_of = [](const juce::var& schema)
+                {
+                    juce::StringArray found;
+                    if (const auto* fields
+                            = schema.getProperty("properties", {}).getDynamicObject())
+                        for (const auto& field : fields->getProperties())
+                            found.add(field.name.toString());
+                    found.sort(true);
+                    return found;
+                };
+                const auto addNote = schemaOf("add_note");
+                juce::StringArray wantedAddNote { "clip_id", "duration_seconds", "midi",
+                                                  "start_seconds" };
+                juce::StringArray requiredAddNote;
+                if (const auto* required = addNote.getProperty("required", {}).getArray())
+                    for (const auto& entry : *required) requiredAddNote.add(entry.toString());
+                requiredAddNote.sort(true);
+                expect("add_note_says_what_it_takes",
+                       names_of(addNote) == wantedAddNote
+                       && requiredAddNote == juce::StringArray { "clip_id", "start_seconds" });
+                const auto setNote = schemaOf("set_note");
+                expect("set_note_says_all_of_it", names_of(setNote).size() >= 20
+                       && names_of(setNote).contains("robust_pitch_curve")
+                       && names_of(setNote).contains("utau_consonant_velocity"));
+                // The words a value may be, where there are only a few.
+                const auto choicesOf = [](const juce::var& schema, const char* field)
+                {
+                    juce::StringArray found;
+                    if (const auto* values = schema.getProperty("properties", {})
+                            .getProperty(field, {}).getProperty("enum", {}).getArray())
+                        for (const auto& value : *values) found.add(value.toString());
+                    return found;
+                };
+                const auto setTrack = schemaOf("set_track");
+                expect("the_few_words_a_value_may_be_are_listed",
+                       choicesOf(setTrack, "pitch_algorithm").contains("utau")
+                       && choicesOf(setTrack, "pitch_algorithm").contains("mld5")
+                       && choicesOf(setTrack, "render_order").size() == 2
+                       && choicesOf(schemaOf("edit_notes_pitch"), "action").contains("quantize"));
+                // A list of points is a list of something: the shape of an
+                // element, not a bare "array".
+                const auto curve = schemaOf("set_pitch_curve")
+                    .getProperty("properties", {}).getProperty("points", {});
+                const auto point = curve.getProperty("items", {});
+                expect("a_list_says_what_is_in_it",
+                       point.getProperty("type", {}).toString() == "object"
+                       && point.getProperty("properties", {})
+                              .getProperty("time_seconds", {}).isObject()
+                       && point.getProperty("properties", {})
+                              .getProperty("midi", {}).isObject());
+
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-dragged-transition")
+        {
+            // The automatic transition between two touching notes is sung over
+            // the stretch it is drawn over: from where one note's own line
+            // ends to where the next one's begins.  Drag those points apart
+            // and the transition follows -- it used to be a fixed twenty
+            // milliseconds either side of the boundary however far they moved,
+            // so the whole stretch between them carried no pitch at all.
+            const auto passed = [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto point = [](double time, float midi)
+                {
+                    PitchCurveEditPoint made { time, midi };
+                    made.shape = PitchCurveShape::natural;
+                    return made;
+                };
+                // Two notes that touch, both taking the editor's automatic
+                // transition: "a" keeps its default end point, "ka" has had
+                // its start point dragged 127 ms into itself.  "sa" and "ta"
+                // keep the points the editor derives, and stand for every note
+                // nobody has touched.
+                const auto build = [&point](double headOfKa)
+                {
+                    ProjectData data;
+                    TrackData track;
+                    track.id = "track";
+                    track.name = "track";
+                    track.compose = true;
+                    track.pitchAlgorithm = PitchAlgorithm::utau;
+                    ClipData clip;
+                    clip.id = "clip";
+                    clip.durationSeconds = 4.0;
+                    const auto add = [&clip](const char* label, double start, float midi,
+                                             std::vector<PitchCurveEditPoint> points)
+                    {
+                        NoteData note;
+                        note.id = label;
+                        note.label = label;
+                        note.startSeconds = start;
+                        note.durationSeconds = 0.5;
+                        note.midiNote = midi;
+                        note.sourceMidiCenter = midi;
+                        note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                        note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                        note.pitchControlPoints = std::move(points);
+                        note.utauAutoPitchTransition = true;
+                        clip.notes.push_back(std::move(note));
+                    };
+                    add("a", 0.5, 60.0f, { point(0.02, 60.0f), point(0.5, 60.0f) });
+                    add("ka", 1.0, 67.0f, { point(headOfKa, 67.0f), point(0.48, 67.0f) });
+                    add("sa", 2.0, 60.0f, {});
+                    add("ta", 2.5, 64.0f, {});
+                    track.clips.push_back(std::move(clip));
+                    data.tracks.push_back(std::move(track));
+                    return data;
+                };
+
+                const auto sentFor = [](ProjectModel& model)
+                {
+                    std::map<juce::String, backend::UtauNoteRenderSpec> sent;
+                    for (auto& note : AudioEngine::diagnosticUtauRequestNotes(model.snapshot(), "clip"))
+                        sent[note.alias] = std::move(note);
+                    return sent;
+                };
+                const auto sungIn = [](const std::map<juce::String, backend::UtauNoteRenderSpec>& sent,
+                                       const char* lyric, double localSeconds)
+                {
+                    const auto& note = sent.at(lyric);
+                    const auto& curve = note.pitchCurve;
+                    if (curve.empty()) return note.midiNote;
+                    auto cents = curve.back().cents;
+                    if (localSeconds <= curve.front().timeSeconds) cents = curve.front().cents;
+                    else
+                        for (std::size_t index = 1; index < curve.size(); ++index)
+                            if (localSeconds <= curve[index].timeSeconds)
+                            {
+                                const auto& left = curve[index - 1];
+                                const auto& right = curve[index];
+                                const auto width = right.timeSeconds - left.timeSeconds;
+                                const auto amount = width > 1.0e-9
+                                    ? static_cast<float>((localSeconds - left.timeSeconds) / width) : 0.0f;
+                                cents = left.cents + (right.cents - left.cents) * amount;
+                                break;
+                            }
+                    return note.midiNote + cents / 100.0f;
+                };
+
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(build(0.127));
+                auto sent = sentFor(*model);
+
+                I18n strings;
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 1600, 700);
+                roll->setPixelsPerSecond(300.0f);
+                roll->setFocusedTrack("track");
+                roll->setTool(PianoRollComponent::Tool::points);
+                roll->diagnosticRefresh();
+
+                // What the roll draws between them.
+                const auto drawn = roll->diagnosticTransitionBridge("a");
+                report.add("drawn=" + (drawn ? juce::String(drawn->startSeconds, 3) + ".."
+                                                   + juce::String(drawn->endSeconds, 3)
+                                                   + " " + juce::String(drawn->startMidi, 2) + "->"
+                                                   + juce::String(drawn->endMidi, 2)
+                                             : juce::String("-")));
+                expect("the_transition_is_drawn_between_the_two_points",
+                       drawn && std::abs(drawn->startSeconds - 1.0) < 1.0e-6
+                       && std::abs(drawn->endSeconds - 1.127) < 1.0e-6
+                       && std::abs(drawn->startMidi - 60.0f) < 0.01f
+                       && std::abs(drawn->endMidi - 67.0f) < 0.01f);
+
+                // And sung over exactly that stretch, by both notes, in the
+                // shape it is drawn in.
+                auto worstA = 0.0f, worstKa = 0.0f;
+                if (drawn)
+                    for (auto time = drawn->startSeconds; time <= drawn->endSeconds + 1.0e-9;
+                         time += 0.005)
+                    {
+                        const auto u = static_cast<float>((time - drawn->startSeconds)
+                            / (drawn->endSeconds - drawn->startSeconds));
+                        const auto shaped = u * u * (3.0f - 2.0f * u);
+                        const auto wanted = drawn->startMidi
+                            + (drawn->endMidi - drawn->startMidi) * shaped;
+                        worstA = std::max(worstA, std::abs(sungIn(sent, "a", time - 0.5) - wanted));
+                        worstKa = std::max(worstKa, std::abs(sungIn(sent, "ka", time - 1.0) - wanted));
+                    }
+                report.add("worst_a=" + juce::String(worstA, 3)
+                           + ",worst_ka=" + juce::String(worstKa, 3));
+                expect("and_sung_over_it_by_both_notes", worstA < 0.05f && worstKa < 0.05f);
+                // Half way along it is half way up: the old fixed bridge was
+                // already at the top here.
+                const auto middle = sungIn(sent, "ka", 1.0635 - 1.0);
+                report.add("middle=" + juce::String(middle, 2));
+                expect("the_whole_stretch_carries_the_change",
+                       middle > 62.0f && middle < 65.0f);
+
+                // Dragging that point further in moves the transition with it.
+                auto wider = std::make_unique<ProjectModel>();
+                wider->replace(build(0.30));
+                const auto widerSent = sentFor(*wider);
+                const auto atSame = sungIn(widerSent, "ka", 1.127 - 1.0);
+                report.add("wider_at_1.127=" + juce::String(atSame, 2));
+                expect("dragging_the_point_moves_the_transition",
+                       atSame < 66.0f && atSame > 60.0f
+                       && sungIn(widerSent, "ka", 1.30 - 1.0) > 66.9f);
+
+                // A pair nobody has touched still hands over an inset in from
+                // each end, as it is drawn.
+                const auto derived = roll->diagnosticTransitionBridge("sa");
+                report.add("derived=" + (derived ? juce::String(derived->startSeconds, 3) + ".."
+                                                       + juce::String(derived->endSeconds, 3)
+                                                 : juce::String("-")));
+                auto worstDerived = 0.0f;
+                if (derived)
+                    for (auto time = derived->startSeconds; time <= derived->endSeconds + 1.0e-9;
+                         time += 0.002)
+                    {
+                        const auto u = static_cast<float>((time - derived->startSeconds)
+                            / (derived->endSeconds - derived->startSeconds));
+                        const auto shaped = u * u * (3.0f - 2.0f * u);
+                        const auto wanted = derived->startMidi
+                            + (derived->endMidi - derived->startMidi) * shaped;
+                        worstDerived = std::max(worstDerived,
+                            std::abs(sungIn(sent, "sa", time - 2.0) - wanted));
+                        worstDerived = std::max(worstDerived,
+                            std::abs(sungIn(sent, "ta", time - 2.5) - wanted));
+                    }
+                report.add("worst_derived=" + juce::String(worstDerived, 3));
+                expect("an_untouched_pair_is_unchanged",
+                       derived && std::abs(derived->startSeconds - 2.48) < 1.0e-6
+                       && std::abs(derived->endSeconds - 2.52) < 1.0e-6
+                       && worstDerived < 0.05f);
+
+                // Sung the same when rendered on its own.  A render holds only
+                // the notes selected, and a note selected alone had no
+                // transition into it or out of it at all: "ka" was sung at its
+                // first point from its very start, and "a" never left its own.
+                // Compared as the engine is handed it, the encoded PIT.
+                const auto pitchSent = [](const backend::UtauNoteRenderSpec& note)
+                {
+                    return backend::UtauRenderer::diagnosticPitchbend(note, 120.0, 0.1,
+                        0.1 + note.durationSeconds + 0.2);
+                };
+                juce::StringArray differsAlone;
+                for (const auto* lyric : { "a", "ka", "sa", "ta" })
+                {
+                    const auto alone = AudioEngine::diagnosticUtauRequestNotes(
+                        model->snapshot(), "clip", { juce::String(lyric) });
+                    if (alone.size() != 1 || pitchSent(alone.front()) != pitchSent(sent.at(lyric)))
+                        differsAlone.add(lyric);
+                }
+                report.add("differs_alone=" + (differsAlone.isEmpty()
+                    ? juce::String("-") : differsAlone.joinIntoString(",")));
+                expect("a_note_rendered_alone_is_sung_the_same", differsAlone.isEmpty());
+                {
+                    std::map<juce::String, backend::UtauNoteRenderSpec> kaAlone;
+                    for (auto& note : AudioEngine::diagnosticUtauRequestNotes(
+                             model->snapshot(), "clip", { juce::String("ka") }))
+                        kaAlone[note.alias] = std::move(note);
+                    const auto aloneMiddle = kaAlone.contains("ka")
+                        ? sungIn(kaAlone, "ka", 1.0635 - 1.0) : 0.0f;
+                    report.add("ka_alone_middle=" + juce::String(aloneMiddle, 2));
+                    expect("rendered_alone_it_still_rises_into_the_note",
+                           aloneMiddle > 62.0f && aloneMiddle < 65.0f
+                           && sungIn(kaAlone, "ka", 0.0) < 60.5f);
+                }
+
+                std::cout << report.joinIntoString("|");
+                return ok;
+            }();
+            std::cout << "|ok=" << (passed ? 1 : 0) << std::endl;
+            setApplicationReturnValue(passed ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-forward-bend")
+        {
+            // A point dragged past its note's end shapes the way that note
+            // gives over to the next one, so the stretch between it and the
+            // next note's first point is an ordinary stretch of one line: both
+            // notes are sent it, each in its own request, and what is drawn
+            // there is what is sung.  It used to be drawn and never sung --
+            // the request stopped at the note's end, and the next note held
+            // its own first point's pitch until it was reached.
+            const auto passed = [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                ProjectData data;
+                {
+                    TrackData track;
+                    track.id = "track";
+                    track.name = "track";
+                    track.compose = true;
+                    track.pitchAlgorithm = PitchAlgorithm::utau;
+                    ClipData clip;
+                    clip.id = "clip";
+                    clip.startSeconds = 0.0;
+                    clip.durationSeconds = 4.0;
+                    const auto point = [](double time, float midi, PitchCurveShape shape)
+                    {
+                        PitchCurveEditPoint made { time, midi };
+                        made.shape = shape;
+                        return made;
+                    };
+                    const auto add = [&clip](const char* label, double start, float midi,
+                                             std::vector<PitchCurveEditPoint> points)
+                    {
+                        NoteData note;
+                        note.id = label;
+                        note.label = label;
+                        note.startSeconds = start;
+                        note.durationSeconds = 0.5;
+                        note.midiNote = midi;
+                        note.sourceMidiCenter = midi;
+                        note.contour.push_back({ 0.0, 0.0f, 0.0f, true });
+                        note.contour.push_back({ note.durationSeconds, 0.0f, 0.0f, true });
+                        note.pitchControlPoints = std::move(points);
+                        note.utauAutoPitchTransition = false;
+                        clip.notes.push_back(std::move(note));
+                    };
+                    // a's own bend runs 120 ms past its end, into ka, whose own
+                    // first point comes 250 ms after ka starts: between the two
+                    // lies the stretch that carried no pitch.
+                    add("a", 0.5, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                           point(0.62, 67.0f, PitchCurveShape::smooth) });
+                    add("ka", 1.0, 67.0f, { point(0.25, 67.0f, PitchCurveShape::natural),
+                                            point(0.45, 67.0f, PitchCurveShape::smooth) });
+                    // sa's bend runs past its end too, but ta starts a real
+                    // gap after it, so nothing joins them: sa must still be
+                    // sent the points it has out there.  (Touching, a bend now
+                    // carries on into a note with no points of its own.)
+                    add("sa", 2.0, 60.0f, { point(0.0, 60.0f, PitchCurveShape::natural),
+                                            point(0.70, 64.0f, PitchCurveShape::smooth) });
+                    add("ta", 2.6, 64.0f, {});
+                    track.clips.push_back(std::move(clip));
+                    data.tracks.push_back(std::move(track));
+                }
+                auto model = std::make_unique<ProjectModel>();
+                model->replace(data);
+
+                std::map<juce::String, backend::UtauNoteRenderSpec> sent;
+                for (auto& note : AudioEngine::diagnosticUtauRequestNotes(model->snapshot(), "clip"))
+                    sent[note.alias] = std::move(note);
+                const auto sung = [&sent](const char* lyric, double localSeconds)
+                {
+                    const auto& note = sent.at(lyric);
+                    // As the renderer reads it: the evaluator where there is
+                    // one, the samples beside it only a view of it.
+                    if (note.timelinePitchCents)
+                        return note.midiNote + note.timelinePitchCents(localSeconds) / 100.0f;
+                    const auto& curve = note.pitchCurve;
+                    if (curve.empty()) return note.midiNote;
+                    auto cents = curve.back().cents;
+                    if (localSeconds <= curve.front().timeSeconds) cents = curve.front().cents;
+                    else
+                        for (std::size_t index = 1; index < curve.size(); ++index)
+                            if (localSeconds <= curve[index].timeSeconds)
+                            {
+                                const auto& left = curve[index - 1];
+                                const auto& right = curve[index];
+                                const auto width = right.timeSeconds - left.timeSeconds;
+                                const auto amount = width > 1.0e-9
+                                    ? static_cast<float>((localSeconds - left.timeSeconds) / width) : 0.0f;
+                                cents = left.cents + (right.cents - left.cents) * amount;
+                                break;
+                            }
+                    return note.midiNote + cents / 100.0f;
+                };
+                const auto reaches = [&sent](const char* lyric, double localSeconds)
+                {
+                    const auto& curve = sent.at(lyric).pitchCurve;
+                    return !curve.empty() && curve.back().timeSeconds >= localSeconds - 1.0e-6;
+                };
+
+                I18n strings;
+                auto roll = std::make_unique<PianoRollComponent>(*model, strings);
+                roll->setBounds(0, 0, 1600, 700);
+                roll->setPixelsPerSecond(300.0f);
+                roll->setFocusedTrack("track");
+                roll->setTool(PianoRollComponent::Tool::points);
+                roll->diagnosticRefresh();
+
+                // The fixture is real: the drawn line climbs across the
+                // boundary rather than stepping at it.
+                const auto drawnA = roll->diagnosticPitchLineAt("a", 1.05);
+                const auto drawnKa = roll->diagnosticPitchLineAt("ka", 1.05);
+                report.add("drawn_at_1.05=" + (drawnA ? juce::String(*drawnA, 3) : juce::String("-"))
+                           + "/" + (drawnKa ? juce::String(*drawnKa, 3) : juce::String("-")));
+                expect("one_line_across_the_boundary",
+                       drawnA && drawnKa && std::abs(*drawnA - *drawnKa) < 0.01f
+                       && *drawnA > 60.5f && *drawnA < 67.0f);
+
+                // Every ten milliseconds from a's start to ka's end: what each
+                // note is sent is what is drawn, over the whole stretch its own
+                // request covers.
+                auto worstA = 0.0f, worstKa = 0.0f;
+                double worstAt = 0.0;
+                auto covered = true;
+                for (auto absolute = 0.5; absolute <= 1.45 + 1.0e-9; absolute += 0.01)
+                {
+                    const auto drawn = roll->diagnosticPitchLineAt("ka", absolute);
+                    if (!drawn) { covered = false; continue; }
+                    if (absolute <= 1.30 + 1.0e-9)
+                    {
+                        covered = covered && reaches("a", absolute - 0.5);
+                        const auto apart = std::abs(sung("a", absolute - 0.5) - *drawn);
+                        if (apart > worstA) { worstA = apart; worstAt = absolute; }
+                    }
+                    const auto apartKa = std::abs(sung("ka", absolute - 1.0) - *drawn);
+                    worstKa = std::max(worstKa, apartKa);
+                }
+                report.add("worst_a=" + juce::String(worstA, 3) + "@" + juce::String(worstAt, 2)
+                           + ",worst_ka=" + juce::String(worstKa, 3));
+                expect("the_note_sings_its_bend_past_its_end", covered && worstA < 0.05f);
+                expect("and_the_next_note_sings_the_same_line", worstKa < 0.05f);
+
+                // The points out there are still the note's own to drag.
+                const auto offeredA = roll->diagnosticOfferedPitchAnchors("a");
+                const auto offeredKa = roll->diagnosticOfferedPitchAnchors("ka");
+                report.add("offered=a:" + juce::String(static_cast<int>(offeredA.size()))
+                           + ",ka:" + juce::String(static_cast<int>(offeredKa.size())));
+                expect("its_own_points_stay_its_own",
+                       offeredA.size() == 2 && std::abs(offeredA.back().timeSeconds - 0.62) < 1.0e-6
+                       && offeredKa.size() == 2
+                       && std::abs(offeredKa.front().timeSeconds - 0.25) < 1.0e-6);
+
+                // With nothing to join, the note is still sent its own points.
+                const auto beyond = sung("sa", 0.68);
+                report.add("sa_at_0.68=" + juce::String(beyond, 3)
+                           + ",reaches=" + juce::String(reaches("sa", 0.70) ? 1 : 0));
+                expect("a_bend_with_no_note_to_join_is_sent_too",
+                       reaches("sa", 0.70) && beyond > 63.0f && beyond < 64.1f);
+
+                std::cout << report.joinIntoString("|");
+                return ok;
+            }();
+            std::cout << "|ok=" << (passed ? 1 : 0) << std::endl;
+            setApplicationReturnValue(passed ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-midi-track-import")
+        {
+            // 导入 MIDI 轨道, on the track area's menu: one track of a MIDI
+            // file as a new track, with its name and lyrics, on the project's
+            // beats -- asked which when the file has more than one track with
+            // notes on it, and not asked when it has one.  The dialog is the
+            // real one, answered on the message loop the way a click answers it.
+            struct Check
+            {
+                juce::StringArray report;
+                bool ok = true;
+                bool stopped = false;
+                int hops = 0;
+                juce::File folder, twoParts, single;
+                std::unique_ptr<MainComponent> window;
+                void expect(const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                }
+                // The dialog's answer is handled on the message loop: wait
+                // there until no dialog is up, then go on.
+                static void whenNoDialog(std::shared_ptr<Check> check, std::function<void()> next)
+                {
+                    juce::MessageManager::callAsync([check, next]
+                    {
+                        if (juce::Component::getCurrentlyModalComponent() != nullptr && ++check->hops < 400)
+                            whenNoDialog(check, next);
+                        else
+                            next();
+                    });
+                }
+            };
+            auto check = std::make_shared<Check>();
+            const std::function<void()> finish = [this, check]
+            {
+                check->window.reset();
+                check->folder.deleteRecursively();
+                std::cout << check->report.joinIntoString("|") << "|ok=" << (check->ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(check->ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            };
+            const auto utf8 = [](const char* text) { return juce::String::fromUTF8(text); };
+            [check, utf8]
+            {
+                auto& c = *check;
+                c.folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-midi-track-" + juce::Uuid().toDashedString());
+                c.folder.createDirectory();
+
+                // ---- the files
+                // Two parts and a conductor track, as this editor writes a song:
+                // three to the bar, a change of speed partway, lyrics in kana
+                // and in hanzi on the lead and none on the bass.
+                ProjectData song;
+                song.name = "two";
+                song.bpm = 150.0;
+                song.numerator = 3;
+                song.denominator = 4;
+                song.tempoChanges = { { 4.0, 100.0 } };
+                const auto note = [&song](double quarter, double quarters, float midi,
+                                          const juce::String& lyric)
+                {
+                    NoteData made;
+                    made.id = "n" + juce::String(quarter) + "-" + juce::String(midi);
+                    made.startSeconds = song.secondsForQuarterPosition(quarter);
+                    made.durationSeconds = song.secondsForQuarterPosition(quarter + quarters)
+                        - made.startSeconds;
+                    made.midiNote = midi;
+                    made.sourceMidiCenter = midi;
+                    made.label = lyric;
+                    return made;
+                };
+                const auto part = [](const char* name, std::vector<NoteData> notes)
+                {
+                    TrackData track;
+                    track.id = name;
+                    track.name = name;
+                    track.compose = true;
+                    ClipData clip;
+                    clip.id = juce::String(name) + "-clip";
+                    clip.notes = std::move(notes);
+                    track.clips.push_back(std::move(clip));
+                    return track;
+                };
+                song.tracks.push_back(part("Lead", { note(0.0, 1.0, 60.0f, utf8("さ")),
+                                                     note(1.0, 1.0, 62.0f, utf8("く")),
+                                                     note(2.0, 1.0, 64.0f, utf8("ら")),
+                                                     note(5.0, 1.0, 65.0f, utf8("你")) }));
+                song.tracks.push_back(part("Bass", { note(0.0, 2.0, 40.0f, {}),
+                                                     note(2.0, 2.0, 43.0f, {}) }));
+                c.twoParts = c.folder.getChildFile("two.mid");
+                juce::String error;
+                const auto written = ProjectModel::writeMidiFile(song, c.twoParts, error);
+
+                // One track and nothing else, its name and lyrics in Shift-JIS,
+                // the way a Japanese tool writes them: "うた", and "さ" "く" "ら".
+                {
+                    juce::MidiFile raw;
+                    raw.setTicksPerQuarterNote(480);
+                    juce::MidiMessageSequence only;
+                    const auto meta = [](std::vector<int> bytes, double tick)
+                    {
+                        std::vector<juce::uint8> data;
+                        for (const auto byte : bytes) data.push_back(static_cast<juce::uint8>(byte));
+                        return juce::MidiMessage(data.data(), static_cast<int>(data.size()), tick);
+                    };
+                    only.addEvent(meta({ 0xFF, 0x03, 0x04, 0x82, 0xA4, 0x82, 0xBD }, 0.0));
+                    only.addEvent(juce::MidiMessage::tempoMetaEvent(500000), 0.0);
+                    const std::vector<std::pair<int, int>> kana { { 0x82, 0xB3 }, { 0x82, 0xAD },
+                                                                  { 0x82, 0xE7 } };
+                    for (std::size_t index = 0; index < kana.size(); ++index)
+                    {
+                        const auto tick = 480.0 * static_cast<double>(index);
+                        const auto number = 67 + 2 * static_cast<int>(index);
+                        only.addEvent(meta({ 0xFF, 0x05, 0x02, kana[index].first, kana[index].second }, tick));
+                        only.addEvent(juce::MidiMessage::noteOn(1, number, static_cast<juce::uint8>(100)), tick);
+                        only.addEvent(juce::MidiMessage::noteOff(1, number), tick + 480.0);
+                    }
+                    only.updateMatchedPairs();
+                    raw.addTrack(only);
+                    c.single = c.folder.getChildFile("single.mid");
+                    juce::FileOutputStream out(c.single);
+                    raw.writeTo(out);
+                }
+
+                // ---- what is offered
+                const auto choices = ProjectModel::midiTrackChoices(c.twoParts, error);
+                juce::String offered;
+                for (const auto& choice : choices)
+                    offered << " " << choice.index << ":" << choice.name << ":" << choice.noteCount;
+                c.report.add("offered=" + offered.trim());
+                c.expect("each_track_with_notes_is_offered",
+                         written && choices.size() == 2
+                         && choices[0].index == 1 && choices[0].name == "Lead" && choices[0].noteCount == 4
+                         && choices[1].index == 2 && choices[1].name == "Bass" && choices[1].noteCount == 2);
+                const auto singleChoices = ProjectModel::midiTrackChoices(c.single, error);
+                c.expect("a_file_with_one_part_offers_one",
+                         singleChoices.size() == 1 && singleChoices[0].index == 0
+                         && singleChoices[0].name == utf8("うた") && singleChoices[0].noteCount == 3);
+
+                const auto trackOf = [](const ProjectData& data, const juce::String& id) -> const TrackData*
+                {
+                    for (const auto& track : data.tracks)
+                        if (track.id == id) return &track;
+                    return nullptr;
+                };
+                const auto notesOf = [](const TrackData* track)
+                {
+                    std::vector<NoteData> notes;
+                    if (track != nullptr)
+                        for (const auto& clip : track->clips)
+                            for (const auto& each : clip.notes) notes.push_back(each);
+                    return notes;
+                };
+                const auto near = [](double left, double right) { return std::abs(left - right) < 1.0e-6; };
+
+                // ---- into an empty project: the song's own tempo map and meter
+                {
+                    auto model = std::make_unique<ProjectModel>();
+                    const auto before = model->snapshot();
+                    const auto id = model->addMidiTrack(c.twoParts, 1, error);
+                    const auto after = model->snapshot();
+                    const auto* track = trackOf(after, id);
+                    const auto notes = notesOf(track);
+                    juce::String lyrics, starts;
+                    for (const auto& each : notes)
+                    {
+                        lyrics << each.label << "/";
+                        starts << juce::String(each.startSeconds, 3) << "/";
+                    }
+                    c.report.add("lead=" + lyrics + ",starts=" + starts);
+                    c.expect("the_chosen_track_comes_in_with_its_lyrics",
+                             track != nullptr && track->name == "Lead" && notes.size() == 4
+                             && lyrics == utf8("さ/く/ら/你/")
+                             && notes[0].midiNote == 60.0f && notes[3].midiNote == 65.0f);
+                    c.expect("an_empty_project_takes_the_songs_tempo",
+                             near(after.bpm, 150.0) && after.tempoChanges.size() == 1
+                             && near(after.tempoChanges[0].quarterPosition, 4.0)
+                             && near(after.tempoChanges[0].bpm, 100.0)
+                             && after.numerator == 3 && after.denominator == 4);
+                    c.expect("on_the_songs_beats",
+                             notes.size() == 4 && near(notes[0].startSeconds, 0.0)
+                             && near(notes[1].startSeconds, 0.4) && near(notes[2].startSeconds, 0.8)
+                             && near(notes[3].startSeconds, song.secondsForQuarterPosition(5.0))
+                             && near(notes[3].durationSeconds, 0.6));
+                    model->undo();
+                    const auto undone = model->snapshot();
+                    c.expect("one_undo_takes_it_away",
+                             undone.tracks.empty() && near(undone.bpm, before.bpm)
+                             && undone.tempoChanges.empty() && undone.numerator == before.numerator);
+                }
+
+                // ---- beside a track already there: the project's beats, its
+                // tempo and its way of working
+                {
+                    auto model = std::make_unique<ProjectModel>();
+                    ProjectData existing;
+                    existing.bpm = 120.0;
+                    TrackData first;
+                    first.id = "first";
+                    first.name = "first";
+                    first.compose = true;
+                    first.pitchAlgorithm = PitchAlgorithm::utau;
+                    existing.tracks.push_back(first);
+                    model->replace(existing);
+                    const auto id = model->addMidiTrack(c.twoParts, 2, error);
+                    const auto after = model->snapshot();
+                    const auto* track = trackOf(after, id);
+                    const auto notes = notesOf(track);
+                    c.report.add("bass_beside=" + (notes.size() == 2
+                        ? juce::String(notes[1].startSeconds, 3) + "+" + juce::String(notes[1].durationSeconds, 3)
+                        : juce::String("-")));
+                    c.expect("beside_others_it_lands_on_the_projects_beats",
+                             notes.size() == 2 && near(notes[0].startSeconds, 0.0)
+                             && near(notes[1].startSeconds, 1.0) && near(notes[1].durationSeconds, 1.0)
+                             && notes[0].label.isEmpty());
+                    c.expect("and_keeps_the_projects_tempo",
+                             near(after.bpm, 120.0) && after.tempoChanges.empty() && after.numerator == 4);
+                    c.expect("and_is_made_the_way_a_new_track_is",
+                             track != nullptr && track->compose && track->pitchAlgorithm == PitchAlgorithm::utau
+                             && after.tracks.size() == 2 && after.tracks.back().id == id);
+                    juce::String refused;
+                    const auto none = model->addMidiTrack(c.twoParts, 0, refused);
+                    c.expect("a_track_with_no_notes_is_refused",
+                             none.isEmpty() && refused.isNotEmpty() && model->snapshot().tracks.size() == 2);
+                }
+
+                // ---- text that is not UTF-8: read as the kana it is
+                {
+                    auto model = std::make_unique<ProjectModel>();
+                    const auto id = model->addMidiTrack(c.single, 0, error);
+                    const auto after = model->snapshot();
+                    const auto* track = trackOf(after, id);
+                    juce::String lyrics;
+                    for (const auto& each : notesOf(track)) lyrics << each.label << "/";
+                    c.report.add("single=" + (track != nullptr ? track->name : juce::String("-")) + ":" + lyrics);
+                    c.expect("shift_jis_is_read_as_kana",
+                             track != nullptr && track->name == utf8("うた") && lyrics == utf8("さ/く/ら/"));
+                }
+                {
+                    const auto notMidi = c.folder.getChildFile("not.mid");
+                    notMidi.replaceWithText("hello");
+                    juce::String refused;
+                    c.expect("a_file_that_is_not_midi_is_refused",
+                             ProjectModel::midiTrackChoices(notMidi, refused).empty() && refused.isNotEmpty());
+                }
+
+                // ---- in the window
+                c.window = std::make_unique<MainComponent>();
+                c.window->setBounds(0, 0, 1280, 760);
+                c.window->diagnosticProject().replace(ProjectData{});
+                const auto items = c.window->diagnosticTrackAreaMenu();
+                int at = -1, reference = -1, deletion = -1;
+                for (std::size_t index = 0; index < items.size(); ++index)
+                {
+                    if (items[index].id == MainComponent::importMidiTrackMenuItem) at = static_cast<int>(index);
+                    if (items[index].id == 3) reference = static_cast<int>(index);
+                    if (items[index].id == 2) deletion = static_cast<int>(index);
+                }
+                c.expect("the_track_area_menu_offers_it",
+                         at >= 0 && items[static_cast<std::size_t>(at)].enabled
+                         && items[static_cast<std::size_t>(at)].text.contains("MIDI")
+                         && reference < at && at < deletion);
+
+                // One part: in it comes, and nothing is asked.
+                c.window->importMidiTrackFrom(c.single);
+                const auto askedForOne = juce::Component::getCurrentlyModalComponent() != nullptr;
+                const auto afterOne = c.window->diagnosticProject().snapshot();
+                c.expect("one_part_is_imported_without_asking",
+                         !askedForOne && afterOne.tracks.size() == 1
+                         && afterOne.tracks.front().name == utf8("うた")
+                         && c.window->diagnosticSelectedTrack() == afterOne.tracks.front().id
+                         && c.window->diagnosticStatusText().contains(utf8("うた")));
+
+                // Two: asked which, and the second one taken.
+                c.window->importMidiTrackFrom(c.twoParts);
+                auto* dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
+                auto* box = dialog != nullptr ? dialog->getComboBoxComponent("track") : nullptr;
+                c.report.add("asked=" + (box != nullptr ? box->getItemText(0) + " / " + box->getItemText(1)
+                                                        : juce::String("-")));
+                c.expect("two_parts_ask_which",
+                         box != nullptr && box->getNumItems() == 2
+                         && box->getItemText(0).startsWith("Lead") && box->getItemText(0).contains("4")
+                         && box->getItemText(1).contains("Bass"));
+                if (box == nullptr)
+                {
+                    c.stopped = true;
+                    return;
+                }
+                box->setSelectedItemIndex(1);
+                dialog->exitModalState(1);
+            }();
+            if (check->stopped)
+            {
+                finish();
+                return;
+            }
+            Check::whenNoDialog(check, [check, finish]
+            {
+                auto& c = *check;
+                const auto afterTwo = c.window->diagnosticProject().snapshot();
+                const auto& added = afterTwo.tracks.back();
+                auto notes = 0;
+                for (const auto& clip : added.clips) notes += static_cast<int>(clip.notes.size());
+                c.report.add("picked=" + added.name + ":" + juce::String(notes));
+                c.expect("the_one_picked_comes_in",
+                         afterTwo.tracks.size() == 2 && added.name == "Bass" && notes == 2
+                         && c.window->diagnosticSelectedTrack() == added.id);
+
+                // Asked again, and cancelled: nothing comes in.
+                c.window->importMidiTrackFrom(c.twoParts);
+                auto* dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
+                if (dialog == nullptr)
+                {
+                    c.expect("cancelling_imports_nothing", false);
+                    finish();
+                    return;
+                }
+                dialog->exitModalState(0);
+                Check::whenNoDialog(check, [check, finish]
+                {
+                    check->expect("cancelling_imports_nothing",
+                                  check->window->diagnosticProject().snapshot().tracks.size() == 2);
+                    finish();
+                });
+            });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-midi-export")
+        {
+            // The project written back out as a MIDI file.  Read two ways: by
+            // the editor's own MIDI reader, which has to land the notes back
+            // on the same seconds, and event by event, because what a reader
+            // agrees with it about says nothing of the tempo map, the lyrics
+            // or a note left hanging with no note-off to end it.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-midi-export-" + juce::Uuid().toDashedString());
+                folder.createDirectory();
+
+                // A song that changes speed partway: a file written in seconds
+                // rather than in beats is still right up to the change and
+                // wrong after it, which nothing but a tempo change can show.
+                const auto ust = folder.getChildFile("song.ust");
+                ust.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\nTempo=90.00\r\n"
+                                    "Tracks=1\r\nProjectName=song\r\nMode2=True\r\n"
+                                    "[#0000]\r\nLength=480\r\nLyric=a\r\nNoteNum=60\r\n"
+                                    "[#0001]\r\nLength=480\r\nLyric=i\r\nNoteNum=62\r\nIntensity=80\r\n"
+                                    "[#0002]\r\nLength=240\r\nLyric=R\r\nNoteNum=62\r\n"
+                                    "[#0003]\r\nLength=480\r\nLyric=u\r\nNoteNum=64\r\nTempo=150.00\r\n"
+                                    "[#0004]\r\nLength=480\r\nLyric=e\r\nNoteNum=65\r\n"
+                                    "[#TRACKEND]\r\n");
+                auto project = std::make_unique<ProjectModel>();
+                juce::String error;
+                juce::StringArray warnings;
+                project->addUstFile(ust, error, warnings,
+                                    ProjectModel::UstImportMode::replaceProject);
+                // A second track, because a file with one says nothing about
+                // whether each track goes to its own.
+                project->addUstFile(ust, error, warnings,
+                                    ProjectModel::UstImportMode::addTrack);
+                const auto data = project->snapshot();
+                const auto target = folder.getChildFile("song.mid");
+                expect("a_file_is_written",
+                       ProjectModel::writeMidiFile(data, target, error)
+                       && target.existsAsFile() && target.getSize() > 0);
+
+                juce::MidiFile midi;
+                {
+                    std::unique_ptr<juce::FileInputStream> stream(target.createInputStream());
+                    if (stream != nullptr) midi.readFrom(*stream);
+                }
+                expect("in_ticks_of_a_quarter", midi.getTimeFormat() == 480);
+                expect("a_track_each_behind_the_conductor", midi.getNumTracks() == 3);
+
+                // ---- the conductor track: the speed, and where it changes
+                std::vector<std::pair<double, double>> tempi;   // tick, bpm
+                auto signatures = 0, names = 0;
+                if (midi.getNumTracks() > 0)
+                    if (const auto* conductor = midi.getTrack(0))
+                        for (int index = 0; index < conductor->getNumEvents(); ++index)
+                        {
+                            const auto& message = conductor->getEventPointer(index)->message;
+                            if (message.isTempoMetaEvent())
+                            {
+                                const auto perQuarter = message.getTempoSecondsPerQuarterNote();
+                                tempi.emplace_back(message.getTimeStamp(),
+                                                   perQuarter > 1.0e-9 ? 60.0 / perQuarter : 0.0);
+                            }
+                            if (message.isTimeSignatureMetaEvent()) ++signatures;
+                            if (message.isTrackNameEvent()
+                                && message.getTextFromTextMetaEvent() == data.name) ++names;
+                        }
+                for (const auto& [tick, bpm] : tempi)
+                    report.add("tempo@" + juce::String(tick, 0) + "=" + juce::String(bpm, 2));
+                // 90 from the start, 150 from the fourth note -- two quarters
+                // and a half-quarter rest in, which is tick 1200.
+                expect("the_speed_and_its_change_are_written",
+                       tempi.size() == 2
+                       && std::abs(tempi[0].first) < 1.0e-9
+                       && std::abs(tempi[0].second - 90.0) < 0.01
+                       && std::abs(tempi[1].first - 1200.0) < 1.0
+                       && std::abs(tempi[1].second - 150.0) < 0.01);
+                expect("counted_and_named", signatures == 1 && names == 1);
+
+                // ---- a track: its name, its notes, its lyrics, nothing left on
+                auto lyrics = juce::StringArray();
+                auto trackNamed = false, everyNoteEnds = true, lyricsOnTheirNotes = true;
+                auto notesOn = 0;
+                std::map<int, int> sounding;
+                auto velocityOfTheQuietNote = 0;
+                if (midi.getNumTracks() > 1)
+                    if (const auto* first = midi.getTrack(1))
+                        for (int index = 0; index < first->getNumEvents(); ++index)
+                        {
+                            const auto& message = first->getEventPointer(index)->message;
+                            if (message.isTrackNameEvent())
+                                trackNamed = trackNamed
+                                    || message.getTextFromTextMetaEvent() == data.tracks.front().name;
+                            if (message.isTextMetaEvent() && message.getMetaEventType() == 5)
+                            {
+                                lyrics.add(message.getTextFromTextMetaEvent());
+                                // The lyric belongs to the note it is sung on,
+                                // so a note has to start where it is written.
+                                auto onHere = false;
+                                for (int other = 0; other < first->getNumEvents(); ++other)
+                                {
+                                    const auto* candidate = first->getEventPointer(other);
+                                    onHere = onHere || (candidate->message.isNoteOn()
+                                        && std::abs(candidate->message.getTimeStamp()
+                                                    - message.getTimeStamp()) < 1.0e-9);
+                                }
+                                lyricsOnTheirNotes = lyricsOnTheirNotes && onHere;
+                            }
+                            if (message.isNoteOn())
+                            {
+                                ++notesOn;
+                                // Two of the same pitch at once is a note that
+                                // never ends: the second off ends the first.
+                                everyNoteEnds = everyNoteEnds
+                                    && sounding[message.getNoteNumber()] == 0;
+                                ++sounding[message.getNoteNumber()];
+                                if (message.getNoteNumber() == 62)
+                                    velocityOfTheQuietNote = message.getVelocity();
+                            }
+                            if (message.isNoteOff()) --sounding[message.getNoteNumber()];
+                        }
+                for (const auto& [number, count] : sounding)
+                {
+                    juce::ignoreUnused(number);
+                    everyNoteEnds = everyNoteEnds && count == 0;
+                }
+                report.add("notes=" + juce::String(notesOn) + ",lyrics="
+                           + lyrics.joinIntoString(""));
+                expect("the_notes_and_their_words",
+                       trackNamed && notesOn == 4 && lyrics.joinIntoString("") == "aiue"
+                       && lyricsOnTheirNotes);
+                expect("nothing_is_left_sounding", everyNoteEnds);
+                // Intensity 80 came in as a note at 80% of its own level.
+                expect("how_loud_each_note_is",
+                       velocityOfTheQuietNote == 80);
+
+                // ---- read back into the editor: the same song, same seconds
+                auto reopened = std::make_unique<ProjectModel>();
+                const auto opens = reopened->addMidiFile(target, error);
+                const auto back = reopened->snapshot();
+                auto sameTiming = opens && back.tracks.size() == data.tracks.size();
+                auto worstSeconds = 0.0;
+                for (std::size_t index = 0; index < back.tracks.size() && sameTiming; ++index)
+                {
+                    const auto& was = data.tracks[index].clips.front().notes;
+                    const auto& now = back.tracks[index].clips.front().notes;
+                    if (was.size() != now.size()) { sameTiming = false; break; }
+                    for (std::size_t note = 0; note < was.size(); ++note)
+                    {
+                        worstSeconds = std::max(worstSeconds,
+                            std::abs(was[note].startSeconds - now[note].startSeconds));
+                        worstSeconds = std::max(worstSeconds,
+                            std::abs(was[note].durationSeconds - now[note].durationSeconds));
+                        sameTiming = sameTiming
+                            && std::abs(was[note].midiNote - now[note].midiNote) < 0.01f;
+                    }
+                }
+                report.add("worst_seconds=" + juce::String(worstSeconds, 4));
+                // Half a tick at the slower of the two speeds.
+                expect("it_opens_again_where_it_was",
+                       sameTiming && worstSeconds < 60.0 / 90.0 / 480.0);
+
+                // ---- a speed written at the very start is the song's speed,
+                //      not a second answer beside the one it replaces
+                ProjectData restarted;
+                restarted.bpm = 400.0;
+                restarted.tempoChanges.push_back({ 0.0, 125.0 });
+                restarted.tempoChanges.push_back({ 2.0, 90.0 });
+                restarted.tracks = data.tracks;
+                const auto restartedFile = folder.getChildFile("restarted.mid");
+                juce::MidiFile third;
+                if (ProjectModel::writeMidiFile(restarted, restartedFile, error))
+                {
+                    std::unique_ptr<juce::FileInputStream> stream(
+                        restartedFile.createInputStream());
+                    if (stream != nullptr) third.readFrom(*stream);
+                }
+                std::vector<std::pair<double, double>> restartedTempi;
+                if (third.getNumTracks() > 0)
+                    if (const auto* conductor = third.getTrack(0))
+                        for (int index = 0; index < conductor->getNumEvents(); ++index)
+                        {
+                            const auto& message = conductor->getEventPointer(index)->message;
+                            if (!message.isTempoMetaEvent()) continue;
+                            const auto perQuarter = message.getTempoSecondsPerQuarterNote();
+                            restartedTempi.emplace_back(message.getTimeStamp(),
+                                perQuarter > 1.0e-9 ? 60.0 / perQuarter : 0.0);
+                        }
+                for (const auto& [tick, bpm] : restartedTempi)
+                    report.add("restarted@" + juce::String(tick, 0) + "=" + juce::String(bpm, 2));
+                expect("one_speed_at_a_time",
+                       restartedTempi.size() == 2
+                       && std::abs(restartedTempi[0].first) < 1.0e-9
+                       && std::abs(restartedTempi[0].second - 125.0) < 0.01
+                       && std::abs(restartedTempi[1].first - 960.0) < 1.0
+                       && std::abs(restartedTempi[1].second - 90.0) < 0.01);
+
+                // ---- projects a song does not make, held to the writer alone
+                ProjectData made;
+                made.bpm = 120.0;
+                made.name = "made";
+                TrackData track;
+                track.id = "t";
+                track.name = "made track";
+                track.compose = true;
+                ClipData clip;
+                clip.id = "c";
+                clip.startSeconds = 0.0;
+                const auto note = [](const juce::String& id, double start, double length,
+                                     float midiNote)
+                {
+                    NoteData made;
+                    made.id = id;
+                    made.startSeconds = start;
+                    made.durationSeconds = length;
+                    made.midiNote = midiNote;
+                    return made;
+                };
+                // Two of one pitch, overlapping, and one before the timeline
+                // starts -- neither of which a MIDI file has any way to say.
+                clip.notes.push_back(note("n1", 0.0, 2.0, 60.0f));
+                clip.notes.push_back(note("n2", 1.0, 1.0, 60.0f));
+                clip.notes.push_back(note("n3", -1.0, 0.5, 67.0f));
+                track.clips.push_back(clip);
+                made.tracks.push_back(track);
+                const auto awkward = folder.getChildFile("awkward.mid");
+                expect("an_awkward_project_still_writes",
+                       ProjectModel::writeMidiFile(made, awkward, error));
+                juce::MidiFile second;
+                {
+                    std::unique_ptr<juce::FileInputStream> stream(awkward.createInputStream());
+                    if (stream != nullptr) second.readFrom(*stream);
+                }
+                auto overlapEnded = false, startsAtZero = false;
+                auto stillSounding = 0;
+                if (second.getNumTracks() > 1)
+                    if (const auto* only = second.getTrack(1))
+                        for (int index = 0; index < only->getNumEvents(); ++index)
+                        {
+                            const auto& message = only->getEventPointer(index)->message;
+                            if (message.isNoteOn())
+                            {
+                                ++stillSounding;
+                                // The one that starts before the timeline is
+                                // pulled to its start rather than to a
+                                // negative tick, which no file can hold.
+                                if (message.getNoteNumber() == 67)
+                                    startsAtZero = std::abs(message.getTimeStamp()) < 1.0e-9;
+                            }
+                            if (message.isNoteOff())
+                            {
+                                --stillSounding;
+                                // The first of the pair gives way where the
+                                // second begins: a second at 120 is two
+                                // quarters, so tick 960.
+                                if (message.getNoteNumber() == 60)
+                                {
+                                    report.add("first_off@"
+                                               + juce::String(message.getTimeStamp(), 0));
+                                    overlapEnded = overlapEnded
+                                        || std::abs(message.getTimeStamp() - 960.0) < 1.0;
+                                }
+                            }
+                            // Never two of the same pitch at once.
+                            if (stillSounding < 0) stillSounding = 99;
+                        }
+                expect("the_earlier_of_two_gives_way", overlapEnded);
+                expect("and_nothing_starts_before_the_song", startsAtZero);
+                expect("and_none_of_it_hangs", stillSounding == 0);
+
+                // ---- a project with nothing in it is refused, and the file
+                //      that was there is left alone
+                const auto kept = folder.getChildFile("kept.mid");
+                kept.replaceWithText("not a MIDI file");
+                juce::String emptyError;
+                const auto refused = !ProjectModel::writeMidiFile(ProjectData{}, kept, emptyError);
+                expect("an_empty_project_is_refused",
+                       refused && emptyError.isNotEmpty()
+                       && kept.loadFileAsString() == "not a MIDI file");
+
+                folder.deleteRecursively();
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-ust-import")
+        {
+            // Importing a second UST.  It used to be added behind the first:
+            // its track went to the bottom, the roll kept showing the song
+            // already open, and -- because a UST only owns the tempo when it
+            // is the first thing in the project -- the new song was bent to
+            // the old one's speed.  Nothing of it was visible, so the file
+            // looked unread.
+            //
+            // Two songs in one project is still worth having, so both ways are
+            // measured here: opening one, which leaves nothing of the old
+            // project, and adding one, which leaves all of it.
+            [this]
+            {
+                juce::StringArray report;
+                auto ok = true;
+                const auto expect = [&report, &ok](const char* name, bool value)
+                {
+                    report.add(juce::String(name) + "=" + (value ? "1" : "0"));
+                    ok = ok && value;
+                };
+                const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-ust-import-" + juce::Uuid().toDashedString());
+                folder.createDirectory();
+                // Two songs that agree about nothing: a different tempo, a
+                // different length, a different name, and one of them with a
+                // tempo change partway through.
+                const auto first = folder.getChildFile("first.ust");
+                first.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\nTempo=90.00\r\n"
+                                      "Tracks=1\r\nProjectName=first\r\nMode2=True\r\n"
+                                      "[#0000]\r\nLength=480\r\nLyric=a\r\nNoteNum=60\r\n"
+                                      "[#0001]\r\nLength=480\r\nLyric=i\r\nNoteNum=62\r\n"
+                                      "[#0002]\r\nLength=480\r\nLyric=u\r\nNoteNum=64\r\n"
+                                      "[#TRACKEND]\r\n");
+                const auto second = folder.getChildFile("second.ust");
+                second.replaceWithText("[#VERSION]\r\nUST Version1.2\r\n[#SETTING]\r\nTempo=140.00\r\n"
+                                       "Tracks=1\r\nProjectName=second\r\nMode2=True\r\n"
+                                       "[#0000]\r\nLength=480\r\nLyric=ka\r\nNoteNum=65\r\n"
+                                       "[#0001]\r\nLength=480\r\nLyric=ki\r\nNoteNum=67\r\n"
+                                       "[#0002]\r\nLength=480\r\nLyric=ku\r\nNoteNum=69\r\nTempo=100.00\r\n"
+                                       "[#0003]\r\nLength=480\r\nLyric=ke\r\nNoteNum=71\r\n"
+                                       "[#0004]\r\nLength=480\r\nLyric=ko\r\nNoteNum=72\r\n"
+                                       "[#TRACKEND]\r\n");
+
+                auto project = std::make_unique<ProjectModel>();
+                juce::String error;
+                juce::StringArray warnings;
+                juce::String firstTrack, secondTrack;
+                const auto opened = project->addUstFile(first, error, warnings,
+                    ProjectModel::UstImportMode::replaceProject, &firstTrack);
+                auto data = project->snapshot();
+                const auto lyricsOf = [](const ProjectData& song, std::size_t track)
+                {
+                    juce::StringArray lyrics;
+                    if (track < song.tracks.size() && !song.tracks[track].clips.empty())
+                        for (const auto& note : song.tracks[track].clips.front().notes)
+                            lyrics.add(note.label);
+                    return lyrics.joinIntoString("");
+                };
+                expect("a_song_opens", opened && data.tracks.size() == 1
+                       && lyricsOf(data, 0) == "aiu"
+                       && std::abs(data.bpm - 90.0) < 1.0e-9);
+                expect("the_track_is_named", firstTrack.isNotEmpty()
+                       && data.tracks.front().id == firstTrack);
+                // Nothing open, nothing to ask about; with a song open the
+                // choice between the two ways is the user's to make.
+                expect("no_question_on_an_empty_project",
+                       !MainComponent::ustImportNeedsChoice(ProjectData{}));
+                expect("a_question_once_a_song_is_open",
+                       MainComponent::ustImportNeedsChoice(data));
+
+                // ---- opening the second one: nothing of the first is left
+                const auto replaced = project->addUstFile(second, error, warnings,
+                    ProjectModel::UstImportMode::replaceProject, &secondTrack);
+                data = project->snapshot();
+                expect("the_second_song_replaces_the_first",
+                       replaced && data.tracks.size() == 1
+                       && lyricsOf(data, 0) == "kakikukeko");
+                expect("and_is_the_track_shown", data.tracks.front().id == secondTrack
+                       && secondTrack != firstTrack);
+                // The tempo is the reason a second import sounded wrong even
+                // when the track was found: a song that is not the first thing
+                // in the project does not own it.
+                expect("and_brings_its_own_tempo", std::abs(data.bpm - 140.0) < 1.0e-9
+                       && data.tempoChanges.size() == 1
+                       && std::abs(data.tempoChanges.front().bpm - 100.0) < 1.0e-9);
+                report.add("bpm=" + juce::String(data.bpm, 2) + ",changes="
+                           + juce::String(static_cast<int>(data.tempoChanges.size())));
+                // Note lengths follow that tempo: a quarter note at 140.
+                const auto quarter = 60.0 / 140.0;
+                const auto& opening = data.tracks.front().clips.front().notes.front();
+                expect("and_the_notes_are_that_long",
+                       std::abs(opening.durationSeconds - quarter) < 1.0e-6);
+
+                // ---- one undo, and the project that was replaced is back
+                const auto undone = project->undo();
+                data = project->snapshot();
+                expect("one_undo_brings_the_old_song_back",
+                       undone && data.tracks.size() == 1 && lyricsOf(data, 0) == "aiu"
+                       && std::abs(data.bpm - 90.0) < 1.0e-9);
+                project->redo();
+
+                // ---- a file that cannot be read takes nothing with it
+                const auto broken = folder.getChildFile("broken.ust");
+                broken.replaceWithText("this is not a UST at all\r\n");
+                juce::String brokenError;
+                const auto refused = !project->addUstFile(broken, brokenError, warnings,
+                    ProjectModel::UstImportMode::replaceProject);
+                data = project->snapshot();
+                expect("an_unreadable_file_keeps_the_project",
+                       refused && brokenError.isNotEmpty() && data.tracks.size() == 1
+                       && lyricsOf(data, 0) == "kakikukeko");
+
+                // ---- adding: the song already open is left exactly as it was
+                auto both = std::make_unique<ProjectModel>();
+                juce::String addedFirst, addedSecond;
+                both->addUstFile(first, error, warnings,
+                                 ProjectModel::UstImportMode::addTrack, &addedFirst);
+                const auto before = both->snapshot();
+                const auto added = both->addUstFile(second, error, warnings,
+                    ProjectModel::UstImportMode::addTrack, &addedSecond);
+                const auto after = both->snapshot();
+                expect("adding_keeps_both", added && after.tracks.size() == 2
+                       && lyricsOf(after, 0) == "aiu" && lyricsOf(after, 1) == "kakikukeko");
+                expect("and_shows_the_one_just_added",
+                       after.tracks.back().id == addedSecond && addedSecond != addedFirst);
+                // The first song still owns the project, which is why the
+                // choice is worth putting to the user rather than guessing.
+                expect("and_leaves_the_tempo_to_the_song_that_was_first",
+                       std::abs(after.bpm - before.bpm) < 1.0e-9
+                       && std::abs(after.bpm - 90.0) < 1.0e-9);
+                expect("and_does_not_move_it",
+                       after.tracks.front().clips.front().notes.front().startSeconds
+                           == before.tracks.front().clips.front().notes.front().startSeconds);
+
+                folder.deleteRecursively();
+                std::cout << report.joinIntoString("|") << "|ok=" << (ok ? 1 : 0) << std::endl;
+                setApplicationReturnValue(ok ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
+            return;
+        }
+        if (arguments.size() >= 2 && arguments[0] == "--smoke-ust-encoding")
+        {
+            // A UST from a Japanese machine opened here came out garbled: it
+            // is Shift-JIS, and anything not UTF-8 was read in the local code
+            // page, which on a Chinese machine is GBK.  Every kana became a
+            // rare hanzi.  But the USTs on this machine are GBK, kana lyrics
+            // and all, and must keep reading as they did.
+            //
+            // The fixtures are encoded by Python's codecs (see
+            // make_ust_encoding_fixtures.py), so the Windows decoding is held
+            // to a second implementation.  Each is named for the encoding it
+            // was written in and has the text it must come back as beside it.
+            //
+            // Every fixture is read as five machines would read it: this one,
+            // and Chinese, Japanese, Korean and Taiwanese ones.  Shift-JIS and
+            // UTF-8 must come back right on all of them, GBK on the Chinese and
+            // Japanese ones, and Big5 and Korean files on their own machines,
+            // where they read correctly before and must go on doing so.  Kana
+            // are what decide, so a Shift-JIS or GBK file with none is held
+            // only to the machine it was written on.  On
+            // this machine the e2e fixtures -- a real song carried to
+            // Shift-JIS and every real UST on the disk -- are also imported
+            // through ProjectModel and compared lyric by lyric.
+            [this, &arguments]
+            {
+                const juce::File directory(arguments[1].unquoted());
+                auto fixtures = directory.findChildFiles(juce::File::findFiles, false, "*.ust");
+                fixtures.sort();
+
+                // 0 is this machine, through the overload the importer uses.
+                const std::vector<int> machines { 0, 936, 932, 949, 950 };
+                const auto expectation = [](const juce::String& name, bool hasKana, int machine)
+                {
+                    const auto kind = name.upToFirstOccurrenceOf("-", false, false);
+                    const auto local = machine == 0 ? 936 : machine;
+                    // Kana decide the reading.  Without any, the local code
+                    // page settles it as it always did, so such a file can
+                    // only be held to the machine it was written on.
+                    if (!hasKana && (kind == "sjis" || kind == "gbk"))
+                    {
+                        if (kind == "sjis" && local == 932) return juce::String("Shift-JIS");
+                        if (kind == "gbk" && local == 936) return juce::String("GBK");
+                        return juce::String();
+                    }
+                    if (kind == "sjis") return juce::String("Shift-JIS");
+                    if (kind == "utf8") return juce::String("UTF-8");
+                    if (kind == "gbk" && (local == 936 || local == 932)) return juce::String("GBK");
+                    if (kind == "big5" && local == 950) return juce::String("code page 950");
+                    if (kind == "euckr" && local == 949) return juce::String("code page 949");
+                    return juce::String();
+                };
+
+                auto failures = 0;
+                auto endToEnd = 0;
+                auto lyricsCompared = 0;
+                std::map<int, int> asserted;
+                for (const auto& file : fixtures)
+                {
+                    const auto name = file.getFileNameWithoutExtension();
+                    const auto kind = name.upToFirstOccurrenceOf("-", false, false);
+                    juce::MemoryBlock bytes, referenceBytes;
+                    if (!file.loadFileAsData(bytes)
+                        || !file.withFileExtension("utf8").loadFileAsData(referenceBytes))
+                    {
+                        std::cout << name << "=unreadable|";
+                        ++failures;
+                        continue;
+                    }
+                    const auto reference = juce::String::fromUTF8(
+                        static_cast<const char*>(referenceBytes.getData()),
+                        static_cast<int>(referenceBytes.getSize()));
+                    auto hasKana = false;
+                    for (const auto character : reference)
+                        hasKana = hasKana || (character >= 0x3041 && character <= 0x3096)
+                            || (character >= 0x30A1 && character <= 0x30FA);
+
+                    for (const auto machine : machines)
+                    {
+                        const auto expected = expectation(name, hasKana, machine);
+                        if (expected.isEmpty()) continue;
+                        juce::String used;
+                        const auto text = machine == 0
+                            ? backend::UstImporter::decode(bytes, used)
+                            : backend::UstImporter::decode(bytes, used, machine);
+                        ++asserted[machine];
+                        if (text == reference && used == expected) continue;
+                        ++failures;
+                        // Where it went wrong, as line number and code points,
+                        // so a failure reads without a console that shows CJK.
+                        juce::StringArray gotLines, wantLines;
+                        gotLines.addLines(text);
+                        wantLines.addLines(reference);
+                        auto line = 0;
+                        while (line < gotLines.size() && line < wantLines.size()
+                               && gotLines[line] == wantLines[line])
+                            ++line;
+                        juce::String codes;
+                        for (const auto character : gotLines[line])
+                            if (character > 0x7f)
+                                codes << juce::String::toHexString(static_cast<int>(character)) << " ";
+                        std::cout << name << "@" << (machine == 0 ? juce::String("here")
+                                                                  : juce::String(machine))
+                                  << "=FAIL(read_as=" << used << " first_bad_line=" << line
+                                  << " codes=" << codes.trim() << ")|";
+                    }
+
+                    if (!name.contains("-e2e-")) continue;
+                    ++endToEnd;
+                    auto project = std::make_unique<ProjectModel>();
+                    juce::String error;
+                    juce::StringArray warnings, parseWarnings;
+                    std::vector<juce::String> want, got;
+                    const auto parsed = backend::UstImporter::parse(reference, parseWarnings);
+                    for (const auto& note : parsed.notes)
+                        if (!note.isRest() && note.lengthTicks > 0)
+                            want.push_back(note.lyric.trim());
+                    if (project->addUstFile(file, error, warnings))
+                    {
+                        const auto data = project->snapshot();
+                        for (const auto& track : data.tracks)
+                            for (const auto& clip : track.clips)
+                                for (const auto& note : clip.notes)
+                                    got.push_back(note.label);
+                    }
+                    // A file holding only a rest has no lyrics on either side;
+                    // the total below is what keeps that honest.
+                    lyricsCompared += static_cast<int>(got.size());
+                    if (got != want)
+                    {
+                        ++failures;
+                        std::cout << name << "=LYRICS_FAIL(got=" << got.size()
+                                  << " want=" << want.size() << ")|";
+                    }
+                }
+
+                // A directory short of fixtures must not pass for having
+                // nothing in it to fail.
+                const auto enough = asserted[0] >= 22 && asserted[936] >= 22
+                    && asserted[932] >= 19 && asserted[949] >= 10 && asserted[950] >= 10
+                    && endToEnd >= 12 && lyricsCompared >= 3000;
+                std::cout << "read_here=" << asserted[0] << "|as_936=" << asserted[936]
+                          << "|as_932=" << asserted[932] << "|as_949=" << asserted[949]
+                          << "|as_950=" << asserted[950]
+                          << "|through_project=" << endToEnd
+                          << "|lyrics_compared=" << lyricsCompared
+                          << "|failures=" << failures
+                          << "|enough_fixtures=" << (enough ? 1 : 0) << std::endl;
+                setApplicationReturnValue(failures == 0 && enough ? 0 : 4);
+                juce::MessageManager::callAsync([this] { quit(); });
+            }();
             return;
         }
         if (arguments.size() >= 2 && arguments[0] == "--smoke-ust")
@@ -7197,7 +13329,7 @@ public:
 
             auto enveloped = 0, silentEnds = 0, monotonic = 0;
             auto anchoredAtLeadIn = 0, endsAtTheNote = 0, releaseAtP3 = 0, unityIsUnity = 0;
-            auto comparable = 0;
+            auto comparable = 0, endsComparable = 0;
             const auto paired = sourceNotes.size() == clip.notes.size();
             for (std::size_t index = 0; index < clip.notes.size() && paired; ++index)
             {
@@ -7218,8 +13350,17 @@ public:
                     ? note.utauPreutteranceSeconds : 0.0;
                 if (std::abs(envelope.front().timeSeconds + lead) < 1.0e-6)
                     ++anchoredAtLeadIn;
-                if (std::abs(envelope.back().timeSeconds - note.durationSeconds) < 1.0e-6)
-                    ++endsAtTheNote;
+                // On a note too short to hold its opening ramps the points
+                // are pushed forward rather than dropped, and the last of them
+                // then sits past the note's end.  That is the squeeze, not a
+                // misread envelope, so only the ones with room are compared.
+                if (envelope[envelope.size() - 2].timeSeconds
+                        <= note.durationSeconds + 1.0e-9)
+                {
+                    ++endsComparable;
+                    if (std::abs(envelope.back().timeSeconds - note.durationSeconds) < 1.0e-6)
+                        ++endsAtTheNote;
+                }
                 // The closing ramp begins p3 before the end.  On a note too
                 // short to hold both ramps the points are squeezed together,
                 // so only the ones with room are compared.
@@ -7237,7 +13378,8 @@ public:
             }
             const auto envelopesRead = paired && enveloped > 0
                 && silentEnds == enveloped && monotonic == enveloped
-                && anchoredAtLeadIn == enveloped && endsAtTheNote == enveloped
+                && anchoredAtLeadIn == enveloped
+                && endsComparable > 0 && endsAtTheNote == endsComparable
                 && comparable > 0 && releaseAtP3 == comparable
                 && unityIsUnity > 0;
 
@@ -7247,6 +13389,7 @@ public:
                       << "|times_in_order=" << monotonic
                       << "|anchored_one_preutterance_early=" << anchoredAtLeadIn
                       << "|ends_at_the_note_end=" << endsAtTheNote
+                      << "/" << endsComparable
                       << "|release_starts_at_p3=" << releaseAtP3 << "/" << comparable
                       << "|full_volume_is_unity=" << unityIsUnity
                       << "|envelopes_read=" << (envelopesRead ? 1 : 0)
@@ -7566,6 +13709,947 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-note-oto")
+        {
+            // 单独OTO编辑: the OTO editor working on one note's own copy of its
+            // entry.  What it saves has to reach that note's sound and nothing
+            // else -- not the note beside it on the same lyric, and not the oto
+            // file, which has to come out byte for byte as it went in.
+            I18n strings;
+            const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-note-oto-" + juce::Uuid().toDashedString());
+            // "bank" cannot be read as a note name; a uuid can.
+            const auto folder = work.getChildFile("bank");
+            folder.createDirectory();
+            constexpr auto rate = 44100.0;
+            constexpr auto lowHz = 220.0;
+            constexpr auto highHz = 880.0;
+            // An engine sings whatever it reads at the note's own pitch, so
+            // through one the pitch cannot say which part was read: there the
+            // second half is silence instead, and heard or not heard is what
+            // tells the two apart.
+            const auto throughAnEngine = arguments.size() >= 2;
+            {
+                // A low second and a high second: which one comes out says
+                // which part of the recording a note read.
+                juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * 2.0));
+                for (int index = 0; index < buffer.getNumSamples(); ++index)
+                {
+                    const auto time = static_cast<double>(index) / rate;
+                    const auto hertz = time < 1.0 ? lowHz : highHz;
+                    const auto phase = 2.0 * juce::MathConstants<double>::pi * hertz
+                        * (time < 1.0 ? time : time - 1.0);
+                    const auto level = time < 1.0 || !throughAnEngine ? 0.5f : 0.0f;
+                    buffer.setSample(0, index, level * std::sin(static_cast<float>(phase)));
+                }
+                juce::WavAudioFormat format;
+                std::unique_ptr<juce::FileOutputStream> stream(
+                    folder.getChildFile("tone.wav").createOutputStream());
+                std::unique_ptr<juce::AudioFormatWriter> writer(
+                    format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                if (writer != nullptr)
+                {
+                    stream.release();
+                    writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                }
+            }
+            // The entry is the first half second: the low tone.
+            folder.getChildFile("oto.ini").replaceWithText("tone.wav=aa,0,100,1500,80,40\n");
+            backend::UtauRenderer::invalidateVoicebankCache();
+            // What is on disk, to compare against once everything is done.
+            const auto listing = [&folder]
+            {
+                juce::StringArray lines;
+                // Every oto file there is, by name and content.  Only those: an
+                // engine is free to leave its analysis beside a recording.
+                for (const auto& file : folder.findChildFiles(juce::File::findFiles,
+                                                              false, "*.ini"))
+                    lines.add(file.getFileName() + ":" + file.loadFileAsString());
+                lines.sort(false);
+                return lines.joinIntoString("\n");
+            };
+            const auto onDiskBefore = listing();
+
+            ProjectModel project;
+            const auto clipId = project.addAudioFile(folder.getChildFile("tone.wav"), 2.0, 0.0, {});
+            const auto trackId = project.snapshot().tracks.front().id;
+            project.setTrackCompose(trackId, true);
+            project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+            project.setTrackVoicebankDirectory(trackId, folder);
+            // Two notes on the same lyric, so the same entry.
+            const auto edited = project.addNote(clipId, 0.5, 0.5, 60.0f);
+            const auto beside = project.addNote(clipId, 1.2, 0.5, 60.0f);
+            project.setNoteLabel(edited, "aa");
+            project.setNoteLabel(beside, "aa");
+
+            PianoRollComponent roll(project, strings);
+            roll.setBounds(0, 0, 1400, 700);
+            roll.setPixelsPerSecond(200.0f);
+            roll.setFocusedTrack(trackId);
+            roll.setFocusedClip(clipId);
+            roll.diagnosticRefresh();
+
+            // On the UTAU menu, not the plain one, and choosing it opens the
+            // editor for that note.
+            const auto has = [](const std::vector<int>& items, int id)
+            {
+                return std::find(items.begin(), items.end(), id) != items.end();
+            };
+            const auto onTheUtauMenu = has(roll.diagnosticNoteMenuIds(edited), 21);
+            const auto notOnThePlainMenu = !has(PianoRollComponent::noteMenuItemsFor(false), 21);
+            juce::String openedFor;
+            roll.onOpenNoteOtoEditor = [&openedFor](const juce::String& id) { openedFor = id; };
+            roll.applyNoteMenuChoice(edited, 21, 0.0, {});
+            const auto choosingOpensIt = openedFor == edited;
+            // 恢复为音源OTO beside it, on the UTAU menu only, and greyed out
+            // while the note has no oto of its own to go back from.
+            const auto restoreOnTheMenu = has(roll.diagnosticNoteMenuIds(edited), 22)
+                && !has(PianoRollComponent::noteMenuItemsFor(false), 22);
+            const auto restoreGreyedWithoutOne =
+                !has(roll.diagnosticEnabledNoteMenuIds(edited), 22);
+
+            // The note's own oto, as the model holds it.
+            const auto ownOtoOf = [&project](const juce::String& id)
+            {
+                const auto current = project.snapshot();
+                for (const auto& track : current.tracks)
+                    for (const auto& clip : track.clips)
+                        for (const auto& note : clip.notes)
+                            if (note.id == id) return note.utauOto;
+                return backend::UtauOtoOverride {};
+            };
+            // The editor exactly as the window opens it for this note, wired to
+            // the note by the same call: the entry cut 500 ms after its offset,
+            // the offset moved a second and a fifth along into the high tone,
+            // and the lead-in lengthened.
+            juce::String openError;
+            juce::String saveCaption;
+            if (auto editor = OtoWaveformEditorComponent::forNote(project, edited, openError))
+            {
+                editor->setBounds(0, 0, 1460, 800);
+                saveCaption = editor->diagnosticSaveCaption();
+                editor->diagnosticTypeParameter(2, "-500");   // 500 ms from the offset
+                editor->diagnosticTypeParameter(0, "1200");   // offset
+                editor->diagnosticTypeParameter(3, "200");    // preutterance
+                editor->diagnosticSave();
+            }
+            const auto given = ownOtoOf(edited);
+            const auto handedToTheNote = given.enabled
+                && std::abs(given.offsetMs - 1200.0) < 1.0e-6
+                && std::abs(given.cutoffMs + 500.0) < 1.0e-6
+                && std::abs(given.preutteranceMs - 200.0) < 1.0e-6
+                && !ownOtoOf(beside).enabled;
+            const auto captionSaysSo = saveCaption == juce::String::fromUTF8("应用到此音符");
+            // Saving wrote nothing: every oto file in the bank as it was.
+            const auto filesUntouchedBySaving = listing() == onDiskBefore;
+            // Opened again, it carries on from the note's own numbers rather
+            // than starting over from the voicebank's.
+            auto reopensOnItsOwn = false;
+            if (auto again = OtoWaveformEditorComponent::forNote(project, edited, openError))
+                reopensOnItsOwn = again->diagnosticParameterText(0) == "1200"
+                    && again->diagnosticParameterText(3) == "200";
+
+            // Rendered, one note at a time.
+            // The loudest sample of the last render.
+            auto lastPeak = 0.0f;
+            const auto renderedHz = [&](const juce::String& only)
+            {
+                lastPeak = 0.0f;
+                AudioEngine engine;
+                if (arguments.size() >= 2)
+                    engine.setUtauResamplerFile(juce::File(arguments[1].unquoted()));
+                engine.setUtauRenderNoteSelection({ only });
+                engine.syncProject(project.snapshot());
+                for (int spin = 0; spin < 600 && !engine.renderProgress(); ++spin)
+                    juce::Thread::sleep(5);
+                for (int spin = 0; spin < 1200 && engine.renderProgress(); ++spin)
+                    juce::Thread::sleep(50);
+                juce::Thread::sleep(200);
+                auto output = work.getChildFile("out.wav");
+                output.deleteFile();
+                juce::String error;
+                if (!engine.exportWav(output, error)) return -1.0;
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats();
+                auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                    formats.createReaderFor(output));
+                if (reader == nullptr) return -1.0;
+                juce::AudioBuffer<float> buffer(static_cast<int>(reader->numChannels),
+                                                static_cast<int>(reader->lengthInSamples));
+                reader->read(&buffer, 0, buffer.getNumSamples(), 0, true, true);
+                const auto outputRate = reader->sampleRate;
+                reader.reset();
+                output.deleteFile();
+                lastPeak = buffer.getMagnitude(0, 0, buffer.getNumSamples());
+                const auto window = static_cast<int>(outputRate * 0.1);
+                if (buffer.getNumSamples() <= window) return -1.0;
+                auto bestStart = 0;
+                auto bestEnergy = -1.0;
+                for (int start = 0; start + window < buffer.getNumSamples(); start += window / 4)
+                {
+                    auto energy = 0.0;
+                    for (int index = start; index < start + window; ++index)
+                    {
+                        const auto value = buffer.getSample(0, index);
+                        energy += static_cast<double>(value) * value;
+                    }
+                    if (energy > bestEnergy) { bestEnergy = energy; bestStart = start; }
+                }
+                if (bestEnergy <= 1.0e-6) return 0.0;
+                std::vector<double> block(static_cast<std::size_t>(window));
+                auto mean = 0.0;
+                for (int index = 0; index < window; ++index)
+                    mean += buffer.getSample(0, bestStart + index);
+                mean /= static_cast<double>(window);
+                for (int index = 0; index < window; ++index)
+                    block[static_cast<std::size_t>(index)] =
+                        buffer.getSample(0, bestStart + index) - mean;
+                const auto shortest = static_cast<int>(outputRate / 1200.0);
+                const auto longest = std::min(window / 2, static_cast<int>(outputRate / 100.0));
+                std::vector<double> scores;
+                auto bestScore = -1.0;
+                for (auto lag = shortest; lag <= longest; ++lag)
+                {
+                    auto sum = 0.0;
+                    for (int index = 0; index + lag < window; ++index)
+                        sum += block[static_cast<std::size_t>(index)]
+                            * block[static_cast<std::size_t>(index + lag)];
+                    const auto score = sum / static_cast<double>(window - lag);
+                    scores.push_back(score);
+                    bestScore = std::max(bestScore, score);
+                }
+                if (bestScore <= 0.0) return 0.0;
+                for (std::size_t index = 0; index < scores.size(); ++index)
+                    if (scores[index] >= bestScore * 0.9)
+                        return outputRate / static_cast<double>(shortest + static_cast<int>(index));
+                return 0.0;
+            };
+            const auto near = [](double value, double wanted)
+            {
+                return value > wanted * 0.85 && value < wanted * 1.15;
+            };
+            const auto editedHz = renderedHz(edited);
+            const auto editedPeak = lastPeak;
+            const auto besideHz = renderedHz(beside);
+            const auto besidePeak = lastPeak;
+            // The edited note reads the part of the recording its own oto
+            // points at -- the high tone, or through an engine the silence...
+            const auto editedFollowsItsOwnOto = throughAnEngine
+                ? besidePeak > 0.05f && editedPeak < besidePeak * 0.01f
+                : near(editedHz, highHz);
+            // ...and the note beside it, on the same lyric, still reads the
+            // low tone its entry does.
+            const auto besideUntouched = throughAnEngine ? besidePeak > 0.05f
+                                                         : near(besideHz, lowHz);
+            const auto filesUntouchedByRendering = listing() == onDiskBefore;
+
+            // Drawn from it too: its lead-in is the 200 ms it was given, the
+            // note beside it keeps the entry's 80.
+            roll.diagnosticRefresh();
+            const auto editedLeadIn = 0.5 - roll.diagnosticSoundingSpan(edited).first;
+            const auto besideLeadIn = 1.2 - roll.diagnosticSoundingSpan(beside).first;
+            const auto drawnFromItsOwnOto = std::abs(editedLeadIn - 0.2) < 1.0e-6
+                && std::abs(besideLeadIn - 0.08) < 1.0e-6;
+
+            // Now it has one, the item can be chosen for it -- and not for the
+            // note beside it.  Choosing it gives the note back its voicebank
+            // entry, and undo takes exactly that step back.
+            const auto restoreOfferedWithOne =
+                has(roll.diagnosticEnabledNoteMenuIds(edited), 22)
+                && !has(roll.diagnosticEnabledNoteMenuIds(beside), 22);
+            roll.applyNoteMenuChoice(edited, 22, 0.0, {});
+            roll.diagnosticRefresh();
+            const auto restoredLeadIn = 0.5 - roll.diagnosticSoundingSpan(edited).first;
+            const auto restoreGivesTheEntryBack = !ownOtoOf(edited).enabled
+                && std::abs(restoredLeadIn - 0.08) < 1.0e-6;
+            project.undo();
+            roll.diagnosticRefresh();
+            const auto restoreUndoesInOneStep = ownOtoOf(edited) == given;
+            // With both notes selected the menu acts on the selection: offered
+            // from the note that has none, because the other has one, and
+            // choosing it there restores that other note.
+            roll.setSelectedNoteIds({ edited, beside });
+            const auto restoreOfferedForASelection =
+                has(roll.diagnosticEnabledNoteMenuIds(beside), 22);
+            roll.applyNoteMenuChoice(beside, 22, 0.0, {});
+            const auto selectionRestored = !ownOtoOf(edited).enabled;
+            project.undo();
+            roll.clearNoteSelection();
+            roll.diagnosticRefresh();
+            const auto selectionUndone = ownOtoOf(edited) == given;
+
+            // In 界 and 谋 the regions come from it as well.
+            backend::UtauOtoOverride withRegions;
+            withRegions.enabled = true;
+            withRegions.consonantMs = 100.0;
+            withRegions.cutoffMs = -500.0;
+            withRegions.preutteranceMs = 80.0;
+            withRegions.overlapMs = 40.0;
+            withRegions.hasRegions = true;
+            withRegions.onsetMs = 80.0;
+            withRegions.glideMs = 200.0;
+            withRegions.nucleusMs = 350.0;
+            const auto regionTiming = backend::UtauRenderer::sampleTiming(
+                folder, "aa", 60.0f, 100, true, false, &withRegions);
+            const auto regionsFromItsOwnOto = regionTiming && regionTiming->hasRegions
+                && std::abs(regionTiming->regionSeconds[0] - 0.08) < 1.0e-6
+                && std::abs(regionTiming->regionSeconds[1] - 0.12) < 1.0e-6
+                && std::abs(regionTiming->regionSeconds[2] - 0.15) < 1.0e-6
+                && std::abs(regionTiming->regionSeconds[3] - 0.15) < 1.0e-6;
+
+            // Read the way the track's mode reads a row, whatever mode it was
+            // edited in: UTAU reads no regions, 界 reads them without classes,
+            // and 谋 reads both -- three classes, so three regions.
+            auto threeClasses = withRegions;
+            threeClasses.classes = "CVV";
+            const auto classicTiming = backend::UtauRenderer::sampleTiming(
+                folder, "aa", 60.0f, 100, false, false, &threeClasses);
+            const auto jieTiming = backend::UtauRenderer::sampleTiming(
+                folder, "aa", 60.0f, 100, true, false, &threeClasses);
+            const auto mouTiming = backend::UtauRenderer::sampleTiming(
+                folder, "aa", 60.0f, 100, true, true, &threeClasses);
+            const auto classicReadsNoRegions = classicTiming && !classicTiming->hasRegions
+                && jieTiming && jieTiming->hasRegions;
+            const auto onlyMouReadsClasses = jieTiming && jieTiming->mouClasses.isEmpty()
+                && std::abs(jieTiming->regionSeconds[3] - 0.15) < 1.0e-6
+                && mouTiming && mouTiming->hasRegions && mouTiming->mouClasses == "CVV"
+                && std::abs(mouTiming->regionSeconds[2] - 0.30) < 1.0e-6
+                && mouTiming->regionSeconds[3] == 0.0;
+
+            // Saved with the project and opened again.
+            const auto saved = work.getChildFile("note-oto.hjpx");
+            juce::String saveError, loadError;
+            auto survivesSaving = false;
+            if (project.save(saved, saveError))
+            {
+                ProjectModel reopened;
+                if (reopened.load(saved, loadError))
+                {
+                    const auto reloaded = reopened.snapshot();
+                    for (const auto& track : reloaded.tracks)
+                        for (const auto& clip : track.clips)
+                            for (const auto& note : clip.notes)
+                            {
+                                if (note.id == edited)
+                                    survivesSaving = note.utauOto.enabled
+                                        && std::abs(note.utauOto.offsetMs - 1200.0) < 1.0e-6;
+                                if (note.id == beside && note.utauOto.enabled)
+                                    survivesSaving = false;
+                            }
+                }
+            }
+            // One step back takes it away, and only it: the lyric typed into
+            // the note beside it, the step before, is still there.  Undo puts
+            // back a whole earlier project, so an edit with no step of its own
+            // vanishes just the same -- taking that lyric with it.
+            project.undo();
+            const auto labelOf = [&project](const juce::String& id)
+            {
+                const auto current = project.snapshot();
+                for (const auto& track : current.tracks)
+                    for (const auto& clip : track.clips)
+                        for (const auto& note : clip.notes)
+                            if (note.id == id) return note.label;
+                return juce::String {};
+            };
+            const auto undoneInOneStep = !ownOtoOf(edited).enabled
+                && labelOf(beside) == "aa";
+            // And a new lyric takes it away: another lyric is another recording.
+            project.setNoteUtauOto(edited, given);
+            const auto reappliedForRelabel = ownOtoOf(edited).enabled;
+            project.setNoteLabel(edited, "aa2");
+            const auto aNewLyricClearsIt = reappliedForRelabel && !ownOtoOf(edited).enabled;
+            // In 界 and 谋 as well: the item is on their menus, and 谋's classes
+            // go to the note with the rest of its entry.
+            project.setTrackUtauMode(trackId, UtauMode::jie);
+            roll.diagnosticRefresh();
+            const auto onTheJieMenu = has(roll.diagnosticNoteMenuIds(beside), 21);
+            project.setTrackUtauMode(trackId, UtauMode::mou);
+            roll.diagnosticRefresh();
+            const auto onTheMouMenu = has(roll.diagnosticNoteMenuIds(beside), 21);
+            if (auto editor = OtoWaveformEditorComponent::forNote(project, beside, openError))
+            {
+                editor->setBounds(0, 0, 1460, 800);
+                editor->diagnosticSetRegionCount(3);
+                editor->diagnosticSave();
+            }
+            const auto mouGiven = ownOtoOf(beside);
+            const auto mouClassesGoToTheNote = mouGiven.enabled && mouGiven.hasRegions
+                && mouGiven.classes.length() == 3;
+            // Restoring a note with nothing to restore is no step at all: undo
+            // then takes back the step before it, the oto just given.
+            project.clearNotesUtauOto({ edited });
+            project.undo();
+            const auto nothingToRestoreIsNoStep = !ownOtoOf(beside).enabled;
+            const auto filesUntouchedAtTheEnd = listing() == onDiskBefore;
+            work.deleteRecursively();
+
+            const auto ok = onTheUtauMenu && notOnThePlainMenu && choosingOpensIt
+                && handedToTheNote && captionSaysSo && filesUntouchedBySaving
+                && editedFollowsItsOwnOto && besideUntouched && filesUntouchedByRendering
+                && drawnFromItsOwnOto && regionsFromItsOwnOto && survivesSaving
+                && undoneInOneStep && aNewLyricClearsIt && filesUntouchedAtTheEnd
+                && reopensOnItsOwn && onTheJieMenu && onTheMouMenu
+                && mouClassesGoToTheNote && classicReadsNoRegions && onlyMouReadsClasses
+                && restoreOnTheMenu && restoreGreyedWithoutOne && restoreOfferedWithOne
+                && restoreGivesTheEntryBack && restoreUndoesInOneStep
+                && restoreOfferedForASelection && selectionRestored && selectionUndone
+                && nothingToRestoreIsNoStep;
+            std::cout << "on_the_utau_menu=" << (onTheUtauMenu ? 1 : 0)
+                      << "|not_on_the_plain_menu=" << (notOnThePlainMenu ? 1 : 0)
+                      << "|choosing_opens_it=" << (choosingOpensIt ? 1 : 0)
+                      << "|handed_to_the_note=" << (handedToTheNote ? 1 : 0)
+                      << "|caption_says_so=" << (captionSaysSo ? 1 : 0)
+                      << "|files_untouched_by_saving=" << (filesUntouchedBySaving ? 1 : 0)
+                      << "|edited_follows_its_own_oto=" << (editedFollowsItsOwnOto ? 1 : 0)
+                      << "|beside_untouched=" << (besideUntouched ? 1 : 0)
+                      << "|files_untouched_by_rendering=" << (filesUntouchedByRendering ? 1 : 0)
+                      << "|drawn_from_its_own_oto=" << (drawnFromItsOwnOto ? 1 : 0)
+                      << "|regions_from_its_own_oto=" << (regionsFromItsOwnOto ? 1 : 0)
+                      << "|classic_reads_no_regions=" << (classicReadsNoRegions ? 1 : 0)
+                      << "|only_mou_reads_classes=" << (onlyMouReadsClasses ? 1 : 0)
+                      << "|survives_saving=" << (survivesSaving ? 1 : 0)
+                      << "|undone_in_one_step=" << (undoneInOneStep ? 1 : 0)
+                      << "|a_new_lyric_clears_it=" << (aNewLyricClearsIt ? 1 : 0)
+                      << "|files_untouched_at_the_end=" << (filesUntouchedAtTheEnd ? 1 : 0)
+                      << "|reopens_on_its_own=" << (reopensOnItsOwn ? 1 : 0)
+                      << "|on_the_jie_menu=" << (onTheJieMenu ? 1 : 0)
+                      << "|on_the_mou_menu=" << (onTheMouMenu ? 1 : 0)
+                      << "|mou_classes_go_to_the_note=" << (mouClassesGoToTheNote ? 1 : 0)
+                      << "|restore_on_the_menu=" << (restoreOnTheMenu ? 1 : 0)
+                      << "|restore_greyed_without_one=" << (restoreGreyedWithoutOne ? 1 : 0)
+                      << "|restore_offered_with_one=" << (restoreOfferedWithOne ? 1 : 0)
+                      << "|restore_gives_the_entry_back=" << (restoreGivesTheEntryBack ? 1 : 0)
+                      << "|restore_undoes_in_one_step=" << (restoreUndoesInOneStep ? 1 : 0)
+                      << "|restore_offered_for_a_selection=" << (restoreOfferedForASelection ? 1 : 0)
+                      << "|selection_restored=" << (selectionRestored ? 1 : 0)
+                      << "|selection_undone=" << (selectionUndone ? 1 : 0)
+                      << "|nothing_to_restore_is_no_step=" << (nothingToRestoreIsNoStep ? 1 : 0)
+                      << "|restored_lead_in=" << juce::String(restoredLeadIn, 4)
+                      << "|mou_classes=" << mouGiven.classes
+                      << "|open_error=" << openError
+                      << "|hz=" << juce::String(editedHz, 1) << "/" << juce::String(besideHz, 1)
+                      << "|peak=" << juce::String(editedPeak, 4)
+                      << "/" << juce::String(besidePeak, 4)
+                      << "|lead_in=" << juce::String(editedLeadIn, 4)
+                      << "/" << juce::String(besideLeadIn, 4)
+                      << "|resampler=" << (arguments.size() >= 2 ? 1 : 0)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-prefix-jie")
+        {
+            // 界: a 拼字 note reads the first two regions of its entry -- the
+            // onset and the glide -- and nothing after them, like a
+            // two-region note.  A four-region entry is cut where its second
+            // region ends.
+            I18n strings;
+            const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-prefix-jie-" + juce::Uuid().toDashedString());
+            // "bank" cannot be read as a note name; a uuid can.
+            const auto folder = work.getChildFile("bank");
+            folder.createDirectory();
+            constexpr auto rate = 44100.0;
+            // Sound for the first 200 ms, silence after: the onset and glide
+            // are audible, the nucleus and coda are not.
+            const auto writeRecording = [&](const juce::File& file, double seconds,
+                                            double soundedSeconds)
+            {
+                juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * seconds));
+                buffer.clear();
+                for (int index = 0; index < buffer.getNumSamples(); ++index)
+                {
+                    const auto time = static_cast<double>(index) / rate;
+                    if (time >= soundedSeconds) break;
+                    buffer.setSample(0, index, 0.5f * std::sin(static_cast<float>(
+                        2.0 * juce::MathConstants<double>::pi * 220.0 * time)));
+                }
+                juce::WavAudioFormat format;
+                std::unique_ptr<juce::FileOutputStream> stream(file.createOutputStream());
+                std::unique_ptr<juce::AudioFormatWriter> writer(
+                    format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                if (writer != nullptr)
+                {
+                    stream.release();
+                    writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                }
+            };
+            writeRecording(folder.getChildFile("spell.wav"), 2.0, 0.2);
+            writeRecording(folder.getChildFile("quiet.wav"), 1.0, 0.0);
+            // offset 0, consonant 80, cutoff 1500 (so 500 ms of entry),
+            // preutterance 80, overlap 40.
+            folder.getChildFile("oto.ini").replaceWithText(
+                "spell.wav=sp,0,80,1500,80,40\n"
+                "quiet.wav=bb,0,80,0,80,40\n");
+            // Onset to 80, glide to 200, nucleus to 350, coda to 500.
+            folder.getChildFile("oto4.ini").replaceWithText(
+                "spell.wav=0,80,200,350\n"
+                "quiet.wav=0,80,200,350\n");
+            backend::UtauRenderer::invalidateVoicebankCache();
+            constexpr auto beat = 1.0;
+
+            ProjectModel project;
+            // Two seconds of clip: a note that starts where its clip ends has
+            // no room and is never made.
+            const auto clipId = project.addAudioFile(
+                folder.getChildFile("spell.wav"), 2.0, 0.0, {});
+            const auto trackId = project.snapshot().tracks.front().id;
+            project.setTrackCompose(trackId, true);
+            project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+            project.setTrackUtauMode(trackId, UtauMode::jie);
+            project.setTrackVoicebankDirectory(trackId, folder);
+            const auto lead = project.addNote(clipId, 0.0, beat, 60.0f);
+            const auto target = project.addNote(clipId, beat, 0.5, 60.0f);
+            project.setNoteLabel(lead, "bb");
+            project.setNoteLabel(target, "bb");
+
+            PianoRollComponent roll(project, strings);
+            roll.setBounds(0, 0, 1400, 700);
+            roll.setPixelsPerSecond(200.0f);
+            roll.setFocusedTrack(trackId);
+            roll.setFocusedClip(clipId);
+            roll.diagnosticRefresh();
+            roll.applyNoteMenuChoice(target, 20, 0.0, {});
+            roll.diagnosticRefresh();
+            juce::String prefix;
+            // Held first: walking into snapshot() inside the range expression
+            // reads the project after it has been destroyed.
+            const auto afterInsert = project.snapshot();
+            for (const auto& note : afterInsert.tracks.front().clips.front().notes)
+                if (note.id != lead && note.id != target) prefix = note.id;
+            const auto notesMade = lead.isNotEmpty() && target.isNotEmpty()
+                && prefix.isNotEmpty();
+            const auto spellTiming = backend::UtauRenderer::sampleTiming(
+                folder, "sp", 60.0f, 100, true, false);
+            const auto entryHasRegions = spellTiming && spellTiming->hasRegions;
+            project.setNoteLabel(prefix, "sp");
+            roll.diagnosticRefresh();
+            // Drawn as two regions, and the note behind it still as four.  In
+            // the clip the 拼字 note sits between the two others.
+            const auto drawnAsTwo = roll.diagnosticRegionCount(1) == 2;
+            const auto othersStillFour = roll.diagnosticRegionCount(2) == 4;
+
+            AudioEngine engine;
+            if (arguments.size() >= 2)
+                engine.setUtauResamplerFile(juce::File(arguments[1].unquoted()));
+            engine.setUtauRenderNoteSelection({ lead, target, prefix });
+            engine.syncProject(project.snapshot());
+            for (int spin = 0; spin < 600 && !engine.renderProgress(); ++spin)
+                juce::Thread::sleep(5);
+            for (int spin = 0; spin < 1200 && engine.renderProgress(); ++spin)
+                juce::Thread::sleep(50);
+            juce::Thread::sleep(200);
+            auto output = work.getChildFile("out.wav");
+            juce::String error;
+            auto firstAudible = -1.0;
+            auto lastAudible = -1.0;
+            if (engine.exportWav(output, error))
+            {
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats();
+                if (auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                        formats.createReaderFor(output)))
+                {
+                    juce::AudioBuffer<float> buffer(
+                        static_cast<int>(reader->numChannels),
+                        static_cast<int>(reader->lengthInSamples));
+                    reader->read(&buffer, 0, buffer.getNumSamples(), 0, true, true);
+                    for (int index = 0; index < buffer.getNumSamples(); ++index)
+                        if (std::abs(buffer.getSample(0, index)) > 1.0e-4f)
+                        {
+                            const auto at = index / reader->sampleRate;
+                            if (firstAudible < 0.0) firstAudible = at;
+                            lastAudible = at;
+                        }
+                }
+            }
+            work.deleteRecursively();
+
+            const auto itSounds = notesMade && entryHasRegions && firstAudible >= 0.0;
+            // Heard right through the hand-over: the note behind sings from
+            // its own beat, and the 拼字 note crosses into it over its 40 ms
+            // overlap.  Squeezing the silent nucleus and coda into that
+            // stretch makes it go quiet before then.
+            const auto soundsThroughTheHandOver = itSounds
+                && std::abs(lastAudible - (beat + 0.04)) < 0.005;
+            const auto ok = itSounds && soundsThroughTheHandOver && drawnAsTwo
+                && othersStillFour;
+            std::cout << "notes_made=" << (notesMade ? 1 : 0)
+                      << "|made=" << (lead.isNotEmpty() ? 1 : 0)
+                      << (target.isNotEmpty() ? 1 : 0) << (prefix.isNotEmpty() ? 1 : 0)
+                      << "|entry_has_regions=" << (entryHasRegions ? 1 : 0)
+                      << "|it_sounds=" << (itSounds ? 1 : 0)
+                      << "|sounds_through_the_hand_over="
+                      << (soundsThroughTheHandOver ? 1 : 0)
+                      << "|heard=" << juce::String(firstAudible, 4)
+                      << ".." << juce::String(lastAudible, 4)
+                      << "|drawn_as_two=" << (drawnAsTwo ? 1 : 0)
+                      << "|others_still_four=" << (othersStillFour ? 1 : 0)
+                      << "|resampler=" << (arguments.size() >= 2 ? 1 : 0)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-prefix-note")
+        {
+            // 添加拼字音符: a note of no length in front of another one.  With
+            // no body of its own all it can sound is its lead-in, and the
+            // lead-in is the consonant -- the first region.  So the whole of
+            // it lies before its own beat, which is what the fixture measures.
+            I18n strings;
+            const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                .getChildFile("hachi-prefix-" + juce::Uuid().toDashedString());
+            // "bank" cannot be read as a note name; a uuid can.
+            const auto folder = work.getChildFile("bank");
+            folder.createDirectory();
+            constexpr auto rate = 44100.0;
+            const auto writeTone = [&](const juce::File& file, double seconds,
+                                       float amplitude)
+            {
+                juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * seconds));
+                for (int index = 0; index < buffer.getNumSamples(); ++index)
+                {
+                    const auto phase = 2.0 * juce::MathConstants<double>::pi * 220.0
+                        * static_cast<double>(index) / rate;
+                    buffer.setSample(0, index, amplitude
+                        * std::sin(static_cast<float>(phase)));
+                }
+                juce::WavAudioFormat format;
+                std::unique_ptr<juce::FileOutputStream> stream(file.createOutputStream());
+                std::unique_ptr<juce::AudioFormatWriter> writer(
+                    format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                if (writer != nullptr)
+                {
+                    stream.release();
+                    writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                }
+            };
+            writeTone(folder.getChildFile("tone.wav"), 2.0, 0.5f);
+            writeTone(folder.getChildFile("quiet.wav"), 1.0, 0.0f);
+            // 80 ms of lead-in on the audible entry, which is what a note with
+            // no length has to sound.
+            folder.getChildFile("oto.ini").replaceWithText(
+                "tone.wav=aa,0,100,1000,80,40\n"
+                "quiet.wav=bb,0,100,0,80,40\n"
+                "quiet.wav=bb2,0,100,0,80,40\n");
+            backend::UtauRenderer::invalidateVoicebankCache();
+            constexpr auto beat = 1.0;
+
+            ProjectModel project;
+            const auto clipId = project.addAudioFile(
+                folder.getChildFile("tone.wav"), 2.0, 0.0, {});
+            const auto trackId = project.snapshot().tracks.front().id;
+            project.setTrackCompose(trackId, true);
+            project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+            project.setTrackVoicebankDirectory(trackId, folder);
+            // Both notes are the silent entry, so anything heard at all comes
+            // from the note this menu item makes.
+            const auto lead = project.addNote(clipId, 0.0, beat, 60.0f);
+            const auto target = project.addNote(clipId, beat, 0.5, 62.0f);
+            project.setNoteLabel(lead, "bb");
+            project.setNoteLabel(target, "bb");
+
+            const auto notesOf = [&project]
+            {
+                return project.snapshot().tracks.front().clips.front().notes;
+            };
+
+            // On the UTAU menu and nowhere else.
+            PianoRollComponent roll(project, strings);
+            roll.setBounds(0, 0, 1400, 700);
+            roll.setPixelsPerSecond(200.0f);
+            roll.setFocusedTrack(trackId);
+            roll.setFocusedClip(clipId);
+            roll.diagnosticRefresh();
+            const auto has = [](const std::vector<int>& items, int id)
+            {
+                return std::find(items.begin(), items.end(), id) != items.end();
+            };
+            const auto onTheUtauMenu = has(roll.diagnosticNoteMenuIds(target), 20);
+            const auto plainIds = PianoRollComponent::noteMenuItemsFor(false);
+            const auto notOnThePlainMenu = !has(plainIds, 20);
+            // A note that begins where the clip does has nowhere to reach back
+            // into, so it is offered greyed rather than doing nothing.
+            const auto greyAtTheVeryStart =
+                has(roll.diagnosticNoteMenuIds(lead), 20)
+                && !has(roll.diagnosticEnabledNoteMenuIds(lead), 20)
+                && has(roll.diagnosticEnabledNoteMenuIds(target), 20);
+            const auto refusedAtTheVeryStart =
+                project.insertPrefixNote(lead, 0.0).isEmpty();
+
+            // Chosen from the menu, not asked of the model behind it: an
+            // item that is listed and does nothing is the failure this is
+            // guarding against.
+            const auto before = notesOf().size();
+            roll.applyNoteMenuChoice(target, 20, 0.0, {});
+            roll.diagnosticRefresh();
+            const auto after = notesOf();
+            juce::String prefix;
+            for (const auto& note : after)
+                if (note.id != lead && note.id != target) prefix = note.id;
+            NoteData made;
+            auto madeIndex = std::size_t{};
+            auto targetIndex = std::size_t{};
+            auto found = false;
+            for (std::size_t index = 0; index < after.size(); ++index)
+            {
+                if (after[index].id == prefix) { made = after[index]; madeIndex = index; found = true; }
+                if (after[index].id == target) targetIndex = index;
+            }
+            const auto oneMoreNote = prefix.isNotEmpty() && after.size() == before + 1
+                && found;
+            // No length, on the same beat, with the target's pitch and lyric.
+            const auto hasNoLength = oneMoreNote
+                && std::abs(made.durationSeconds) < 1.0e-12;
+            const auto sitsOnTheBeat = oneMoreNote
+                && std::abs(made.startSeconds - beat) < 1.0e-12;
+            const auto takesPitchAndLyric = oneMoreNote
+                && std::abs(made.midiNote - 62.0f) < 1.0e-6f && made.label == "bb";
+            // The note it leads into sings from its own beat now, keeping the
+            // overlap its entry gives it -- 40 ms here.
+            NoteData targetNow;
+            for (const auto& note : after)
+                if (note.id == target) targetNow = note;
+            const auto targetPinnedToItsBeat = targetNow.utauPreutteranceOverrideEnabled
+                && std::abs(targetNow.utauPreutteranceSeconds) < 1.0e-12
+                && targetNow.utauOverlapOverrideEnabled
+                && std::abs(targetNow.utauOverlapSeconds - 0.04) < 1.0e-9;
+            // In front of it in the list, which at the same instant is the only
+            // thing that says which of the two leads into the other.
+            const auto inFrontOfIt = oneMoreNote && madeIndex < targetIndex;
+
+            // The roll can be got at it: something to click, and a stretch to
+            // draw.  Without that a lyric could never be typed into it.
+            roll.diagnosticRefresh();
+            auto width = 0.0;
+            for (const auto& drawn : roll.diagnosticNotes())
+                if (drawn.id == prefix) width = drawn.soundingEnd - drawn.soundingStart;
+            const auto reachableInTheRoll = roll.diagnosticHasSoundingSpan(prefix)
+                && width > 0.01;
+
+            // What it sounds.  Its own lyric, since the point of it is a
+            // syllable of its own in front of the next one.
+            project.setNoteLabel(prefix, "aa");
+            // Each note's lead-in handle belongs to that note.  Zoomed out far
+            // enough that the two handles overlap, a press on each takes hold
+            // of the one it is nearest -- the note behind never could be had.
+            roll.setPixelsPerSecond(50.0f);
+            roll.diagnosticRefresh();
+            const auto handleX = [&roll](const juce::String& id)
+            {
+                return 58.0f + static_cast<float>(
+                    roll.diagnosticSoundingSpan(id).first) * 50.0f;
+            };
+            const auto handleY = roll.diagnosticYForMidi(62.0f);
+            const auto handlesOverlapHere =
+                std::abs(handleX(target) - handleX(prefix)) < 14.0f;
+            const auto targetHandleIsItsOwn = roll.diagnosticConsonantHandleAt(
+                { handleX(target), handleY }) == target;
+            const auto prefixHandleIsItsOwn = roll.diagnosticConsonantHandleAt(
+                { handleX(prefix), handleY }) == prefix;
+
+            // A press at the seam that never moves is a click, not a drag, and
+            // must leave the note behind exactly as it was.  The handle there
+            // is that note's lead-in, and letting go of it committed whatever
+            // the drag had got to -- releasing the pin, since a pinned lead-in
+            // outranks the velocity -- which put the note back to its entry's
+            // own timing.
+            const auto pointerSource = juce::Desktop::getInstance().getMainMouseSource();
+            const auto pointerEvent = [&](juce::Point<float> at, juce::Point<float> from,
+                                          bool dragged)
+            {
+                return juce::MouseEvent(pointerSource, at,
+                    juce::ModifierKeys::leftButtonModifier,
+                    juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f,
+                    &roll, &roll, juce::Time::getCurrentTime(), from,
+                    juce::Time::getCurrentTime(), 1, dragged);
+            };
+            const auto targetStillPinned = [&]
+            {
+                for (const auto& note : notesOf())
+                    if (note.id == target)
+                        return note.utauPreutteranceOverrideEnabled
+                            && std::abs(note.utauPreutteranceSeconds) < 1.0e-12;
+                return false;
+            };
+            const juce::Point<float> seam { handleX(target), handleY };
+            roll.mouseDown(pointerEvent(seam, seam, false));
+            roll.mouseUp(pointerEvent(seam, seam, false));
+            roll.diagnosticRefresh();
+            const auto clickLeavesItAlone = targetStillPinned();
+            // A hand that shakes a pixel or two on the way is still a click.
+            const auto shaken = seam + juce::Point<float>(2.0f, 1.0f);
+            roll.mouseDown(pointerEvent(seam, seam, false));
+            roll.mouseDrag(pointerEvent(shaken, seam, true));
+            roll.mouseUp(pointerEvent(shaken, seam, true));
+            roll.diagnosticRefresh();
+            const auto wobbleLeavesItAlone = targetStillPinned();
+            const auto heard = [&](bool withPrefix)
+            {
+                AudioEngine engine;
+                std::vector<juce::String> selection { lead, target };
+                if (withPrefix) selection.push_back(prefix);
+                engine.setUtauRenderNoteSelection(selection);
+                engine.syncProject(project.snapshot());
+                for (int spin = 0; spin < 600 && !engine.renderProgress(); ++spin)
+                    juce::Thread::sleep(5);
+                for (int spin = 0; spin < 1200 && engine.renderProgress(); ++spin)
+                    juce::Thread::sleep(50);
+                juce::Thread::sleep(200);
+                auto output = work.getChildFile("out.wav");
+                output.deleteFile();
+                juce::String error;
+                std::pair<double, double> span { -99.0, -99.0 };
+                if (!engine.exportWav(output, error)) return span;
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats();
+                auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                    formats.createReaderFor(output));
+                if (reader == nullptr) return span;
+                juce::AudioBuffer<float> buffer(
+                    static_cast<int>(reader->numChannels),
+                    static_cast<int>(reader->lengthInSamples));
+                reader->read(&buffer, 0, buffer.getNumSamples(), 0, true, true);
+                const auto outputRate = reader->sampleRate;
+                reader.reset();
+                output.deleteFile();
+                auto firstAudible = -1;
+                auto lastAudible = -1;
+                for (int index = 0; index < buffer.getNumSamples(); ++index)
+                    if (std::abs(buffer.getSample(0, index)) > 1.0e-4f)
+                    {
+                        if (firstAudible < 0) firstAudible = index;
+                        lastAudible = index;
+                    }
+                if (firstAudible < 0) return span;
+                return std::pair<double, double> {
+                    firstAudible / outputRate, lastAudible / outputRate };
+            };
+            const auto withoutIt = heard(false);
+            const auto withIt = heard(true);
+            // The control: both ordinary notes are the silent entry, so
+            // without this note the mix has nothing in it at all.
+            const auto silentWithoutIt = withoutIt.first < -1.0;
+            const auto itSounds = withIt.first > -1.0;
+            // All of it is its lead-in, and it is heard right up to the beat
+            // of the note it leads into: that note sings from its own beat
+            // now, so the hand-over is there, crossed over its 40 ms overlap.
+            const auto startsBeforeItsBeat = itSounds
+                && withIt.first < beat - 0.01 && withIt.first > beat - 0.12;
+            const auto heardUpToTheBeat = itSounds
+                && std::abs(withIt.second - (beat + 0.04)) < 0.005;
+
+            // Saved and reopened, and undone in one step.
+            const auto saved = work.getChildFile("prefix.hjpx");
+            juce::String saveError, loadError;
+            const auto wrote = project.save(saved, saveError);
+            ProjectModel reopened;
+            auto survivesSaving = false;
+            if (wrote && reopened.load(saved, loadError))
+            {
+                const auto reloaded = reopened.snapshot();
+                for (const auto& track : reloaded.tracks)
+                    for (const auto& clip : track.clips)
+                        for (const auto& note : clip.notes)
+                            if (note.id == prefix
+                                && std::abs(note.durationSeconds) < 1.0e-12)
+                                survivesSaving = true;
+            }
+            // Retyped, as it will be: the note behind becomes the vowel.
+            // Still heard right up to the beat afterwards, or the first thing
+            // anyone does after inserting one undoes it.
+            project.setNoteLabel(target, "bb2");
+            const auto afterRetyping = heard(true);
+            NoteData retyped;
+            for (const auto& note : notesOf())
+                if (note.id == target) retyped = note;
+            const auto survivesRetyping = afterRetyping.first > -1.0
+                && std::abs(afterRetyping.second - (beat + 0.04)) < 0.005
+                && retyped.utauPreutteranceOverrideEnabled
+                && std::abs(retyped.utauPreutteranceSeconds) < 1.0e-12;
+
+            // Dragged back out over the consonant by hand, the note behind
+            // crosses it from there: 50 ms of lead-in against its 40 ms of
+            // overlap ends the consonant 10 ms before the beat.
+            project.setNoteUtauTimingOverrides(target, true, 0.05, 0.04);
+            const auto draggedOut = heard(true);
+            const auto crossesOnlyWhenDragged = draggedOut.first > -1.0
+                && std::abs(draggedOut.second - (beat - 0.05 + 0.04)) < 0.005;
+
+            project.undo();   // the drag
+            project.undo();   // the retyped lyric
+            project.undo();   // the lyric
+            project.undo();   // the note, and the pin with it
+            NoteData targetAfterUndo;
+            for (const auto& note : notesOf())
+                if (note.id == target) targetAfterUndo = note;
+            const auto undoneInOneStep = notesOf().size() == before
+                && !targetAfterUndo.utauPreutteranceOverrideEnabled;
+
+            // And a real drag of that handle still moves the lead-in: a gate
+            // for clicks is not a licence to make the handle do nothing.
+            roll.applyNoteMenuChoice(target, 20, 0.0, {});
+            roll.diagnosticRefresh();
+            const juce::Point<float> seamAgain { handleX(target), handleY };
+            const auto startBeforeDrag = roll.diagnosticSoundingSpan(target).first;
+            const auto draggedTo = seamAgain + juce::Point<float>(-25.0f, 0.0f);
+            roll.mouseDown(pointerEvent(seamAgain, seamAgain, false));
+            roll.mouseDrag(pointerEvent(draggedTo, seamAgain, true));
+            roll.mouseUp(pointerEvent(draggedTo, seamAgain, true));
+            roll.diagnosticRefresh();
+            const auto startAfterDrag = roll.diagnosticSoundingSpan(target).first;
+            const auto realDragStillMoves = startAfterDrag < startBeforeDrag - 0.01;
+
+            work.deleteRecursively();
+            const auto ok = onTheUtauMenu && notOnThePlainMenu && greyAtTheVeryStart
+                && refusedAtTheVeryStart && oneMoreNote && hasNoLength
+                && sitsOnTheBeat && takesPitchAndLyric && targetPinnedToItsBeat
+                && inFrontOfIt && reachableInTheRoll && handlesOverlapHere
+                && targetHandleIsItsOwn && prefixHandleIsItsOwn && silentWithoutIt
+                && itSounds && startsBeforeItsBeat && heardUpToTheBeat
+                && crossesOnlyWhenDragged && survivesRetyping && survivesSaving
+                && undoneInOneStep && clickLeavesItAlone && wobbleLeavesItAlone
+                && realDragStillMoves;
+            std::cout << "on_the_utau_menu=" << (onTheUtauMenu ? 1 : 0)
+                      << "|not_on_the_plain_menu=" << (notOnThePlainMenu ? 1 : 0)
+                      << "|grey_at_the_very_start=" << (greyAtTheVeryStart ? 1 : 0)
+                      << "|refused_at_the_very_start=" << (refusedAtTheVeryStart ? 1 : 0)
+                      << "|one_more_note=" << (oneMoreNote ? 1 : 0)
+                      << "|has_no_length=" << (hasNoLength ? 1 : 0)
+                      << "|sits_on_the_beat=" << (sitsOnTheBeat ? 1 : 0)
+                      << "|takes_pitch_and_lyric=" << (takesPitchAndLyric ? 1 : 0)
+                      << "|target_pinned_to_its_beat=" << (targetPinnedToItsBeat ? 1 : 0)
+                      << "|in_front_of_it=" << (inFrontOfIt ? 1 : 0)
+                      << "|reachable_in_the_roll=" << (reachableInTheRoll ? 1 : 0)
+                      << "|handles_overlap_here=" << (handlesOverlapHere ? 1 : 0)
+                      << "|target_handle_is_its_own=" << (targetHandleIsItsOwn ? 1 : 0)
+                      << "|prefix_handle_is_its_own=" << (prefixHandleIsItsOwn ? 1 : 0)
+                      << "|silent_without_it=" << (silentWithoutIt ? 1 : 0)
+                      << "|it_sounds=" << (itSounds ? 1 : 0)
+                      << "|starts_before_its_beat=" << (startsBeforeItsBeat ? 1 : 0)
+                      << "|heard_up_to_the_beat=" << (heardUpToTheBeat ? 1 : 0)
+                      << "|crosses_only_when_dragged=" << (crossesOnlyWhenDragged ? 1 : 0)
+                      << "|survives_retyping=" << (survivesRetyping ? 1 : 0)
+                      << "|click_leaves_it_alone=" << (clickLeavesItAlone ? 1 : 0)
+                      << "|wobble_leaves_it_alone=" << (wobbleLeavesItAlone ? 1 : 0)
+                      << "|real_drag_still_moves=" << (realDragStillMoves ? 1 : 0)
+                      << "|drag_moved_start=" << juce::String(startBeforeDrag, 4)
+                      << "->" << juce::String(startAfterDrag, 4)
+                      << "|survives_saving=" << (survivesSaving ? 1 : 0)
+                      << "|undone_in_one_step=" << (undoneInOneStep ? 1 : 0)
+                      << "|heard=" << juce::String(withIt.first, 4)
+                      << ".." << juce::String(withIt.second, 4)
+                      << "|dragged_out=" << juce::String(draggedOut.second, 4)
+                      << "|after_retyping=" << juce::String(afterRetyping.second, 4)
+                      << "|drawn_width=" << juce::String(width, 4)
+                      << std::endl;
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 1 && arguments[0] == "--smoke-utau-overlap")
         {
             // Overlap is the stretch the two notes sound through together.
@@ -7621,7 +14705,8 @@ public:
             // first note always runs 0..1.
             const auto tailEndsAt = [&](double secondBeat, double secondLength,
                                         double preutterance, double overlap,
-                                        bool shaped = false)
+                                        bool shaped = false, bool spliced = false,
+                                        bool fromOwnOto = false)
             {
                 ProjectModel project;
                 const auto clipId = project.addAudioFile(
@@ -7635,7 +14720,22 @@ public:
                                                     secondLength, 60.0f);
                 project.setNoteLabel(first, "aa");
                 project.setNoteLabel(second, "bb");
-                project.setNoteUtauTimingOverrides(second, true, preutterance, overlap);
+                if (fromOwnOto)
+                {
+                    // The same two numbers from the note's own oto instead of
+                    // its timing fields: quiet.wav's row with them changed.
+                    backend::UtauOtoOverride own;
+                    own.enabled = true;
+                    own.consonantMs = 100.0;
+                    own.preutteranceMs = preutterance * 1000.0;
+                    own.overlapMs = overlap * 1000.0;
+                    project.setNoteUtauOto(second, own);
+                }
+                else
+                {
+                    project.setNoteUtauTimingOverrides(second, true, preutterance, overlap);
+                }
+                if (spliced) project.setNotesUtauSplice({ second }, true);
                 if (shaped)
                 {
                     // The shape a note gets the moment a lyric is typed into
@@ -7650,6 +14750,8 @@ public:
                     seeding.ensureDefaultEnvelope(second);
                 }
                 AudioEngine engine;
+                if (arguments.size() >= 2)
+                    engine.setUtauResamplerFile(juce::File(arguments[1].unquoted()));
                 engine.setUtauRenderNoteSelection({ first, second });
                 engine.syncProject(project.snapshot());
                 for (int spin = 0; spin < 600 && !engine.renderProgress(); ++spin)
@@ -7720,6 +14822,32 @@ public:
             const auto shapedTailSurvives =
                 std::abs(shapedTail - wantedNoLeadIn) < slack;
 
+            // Spliced.  A splice changes the shape of the crossfade -- a
+            // quarter-sine pair, so the join holds its loudness where two
+            // straight ramps sag -- and nothing else about it.  It is the same
+            // seam, in the same place, for the same length: an overlap longer
+            // than the lead-in carries the tail past the beat here too.
+            // Bare, the seam is the overlap exactly, as it is unspliced.
+            const auto splicedBare = tailEndsAt(1.0, 0.5, 0.03, 0.20, false, true);
+            // And with the shape a lyric writes.  This one dies away a little
+            // sooner than the fade's own zero: a quarter-sine falls away
+            // faster near the end than a straight ramp, and the note's closing
+            // ramp is falling at the same time, so the last sample still large
+            // enough to write into a 16-bit file comes a few milliseconds
+            // early.  It has to be most of the way there, not to the sample.
+            const auto splicedTail = tailEndsAt(1.0, 0.5, 0.03, 0.20, true, true);
+            const auto spliceCarriesTheTail =
+                std::abs(splicedBare - wantedReachIn) < slack
+                && splicedTail > wantedReachIn * 0.85
+                && splicedTail < wantedReachIn + slack;
+
+            // The next note's lead-in and overlap from its own oto, which is
+            // where 单独OTO编辑 puts them rather than in its timing fields.  The
+            // tail rendered under the seam has to reach just as far.
+            const auto ownOtoTail = tailEndsAt(1.0, 0.5, 0.03, 0.20, false, false, true);
+            const auto ownOtoCarriesTheTail =
+                std::abs(ownOtoTail - wantedReachIn) < slack;
+
             // A rest between them: the next note starts sounding after this
             // one has finished, nothing crosses, and the note must not go on
             // ringing into the gap.  It ends at its own end, bar the short
@@ -7742,9 +14870,13 @@ public:
             // have to agree about where a note stops: the same clamp was in
             // both, so the line on screen ended at the bar line too.
             // The drawn envelope's last point, so the shape on screen and the
-            // shape the mixer applies end in the same place.
-            std::vector<AmplitudeEnvelopePoint> drawnEnvelope;
-            const auto drawnEndFor = [&](double preutterance, double overlap)
+            // shape the mixer applies end in the same place.  Asked for by the
+            // caller that wants it, rather than left over from whichever
+            // measurement ran last.
+            const auto drawnEndFor = [&](double preutterance, double overlap,
+                                         bool spliced = false,
+                                         std::vector<AmplitudeEnvelopePoint>* shape
+                                             = nullptr)
             {
                 ProjectModel shown;
                 const auto shownClip = shown.addAudioFile(
@@ -7759,6 +14891,7 @@ public:
                 shown.setNoteLabel(shownSecond, "bb");
                 shown.setNoteUtauTimingOverrides(shownSecond, true,
                                                  preutterance, overlap);
+                if (spliced) shown.setNotesUtauSplice({ shownSecond }, true);
                 PianoRollComponent roll(shown, strings);
                 roll.setBounds(0, 0, 1400, 700);
                 roll.setPixelsPerSecond(200.0f);
@@ -7767,17 +14900,23 @@ public:
                 roll.ensureDefaultEnvelope(shownFirst);
                 roll.ensureDefaultEnvelope(shownSecond);
                 roll.diagnosticRefresh();
-                drawnEnvelope = roll.diagnosticDrawnEnvelope(shownFirst);
+                if (shape != nullptr)
+                    *shape = roll.diagnosticDrawnEnvelope(shownFirst);
                 return roll.diagnosticSoundingSpan(shownFirst).second;
             };
             const auto drawnEnd = drawnEndFor(0.03, 0.20);
             // The case with no lead-in as well: it is the one the drawing and
             // the mixer both used to leave out.
-            const auto drawnBare = drawnEndFor(0.0, 0.09);
+            std::vector<AmplitudeEnvelopePoint> drawnEnvelope;
+            const auto drawnBare = drawnEndFor(0.0, 0.09, false, &drawnEnvelope);
+            // And a spliced seam is drawn in the same place as any other,
+            // since that is now where it is mixed.
+            const auto drawnSpliced = drawnEndFor(0.03, 0.20, true);
             const auto drawnFollowsTheOverlap =
                 std::abs(drawnEnd - (1.0 + wantedReachIn)) < 0.001
-                && std::abs(drawnBare - (1.0 + wantedNoLeadIn)) < 0.001;
-            // drawnBare was the last one measured, so this is its envelope.
+                && std::abs(drawnBare - (1.0 + wantedNoLeadIn)) < 0.001
+                && std::abs(drawnSpliced - (1.0 + wantedReachIn)) < 0.001;
+            // The bare seam's own envelope, asked for above.
             const auto envelopeEnd = drawnEnvelope.empty()
                 ? -99.0 : drawnEnvelope.back().timeSeconds;
             // Envelope times run from the note's own start, and the note is
@@ -7788,8 +14927,9 @@ public:
             work.deleteRecursively();
             const auto ok = reachesIntoTheNextNote && stopsShortWhenOverlapIsSmall
                 && movesWithTheNumber && crossesWithNoLeadIn && shapedTailSurvives
-                && silentAcrossAGap && heldToTheNextNote && drawnFollowsTheOverlap
-                && shapeEndsWhereTheSoundDoes;
+                && spliceCarriesTheTail && silentAcrossAGap && heldToTheNextNote
+                && drawnFollowsTheOverlap && shapeEndsWhereTheSoundDoes
+                && ownOtoCarriesTheTail;
             const auto report = [](double got, double want)
             {
                 return juce::String(got, 4) + " (want " + juce::String(want, 4) + ")";
@@ -7800,11 +14940,15 @@ public:
                       << "|moves_with_the_number=" << (movesWithTheNumber ? 1 : 0)
                       << "|crosses_with_no_lead_in=" << (crossesWithNoLeadIn ? 1 : 0)
                       << "|shaped_tail_survives=" << (shapedTailSurvives ? 1 : 0)
+                      << "|splice_carries_the_tail=" << (spliceCarriesTheTail ? 1 : 0)
+                      << "|own_oto_carries_the_tail=" << (ownOtoCarriesTheTail ? 1 : 0)
+                      << "|own_oto_tail=" << juce::String(ownOtoTail, 4)
                       << "|silent_across_a_gap=" << (silentAcrossAGap ? 1 : 0)
                       << "|held_to_the_next_note=" << (heldToTheNextNote ? 1 : 0)
                       << "|drawn_follows_the_overlap=" << (drawnFollowsTheOverlap ? 1 : 0)
                       << "|drawn_end=" << report(drawnEnd, 1.0 + wantedReachIn)
                       << "|drawn_bare=" << report(drawnBare, 1.0 + wantedNoLeadIn)
+                      << "|drawn_spliced=" << report(drawnSpliced, 1.0 + wantedReachIn)
                       << "|shape_ends_where_the_sound_does="
                       << (shapeEndsWhereTheSoundDoes ? 1 : 0)
                       << "|envelope_end=" << report(envelopeEnd, 1.0 + wantedNoLeadIn)
@@ -7812,6 +14956,8 @@ public:
                       << "|stop_short=" << report(stopShort, wantedStopShort)
                       << "|no_lead_in=" << report(noLeadIn, wantedNoLeadIn)
                       << "|shaped=" << report(shapedTail, wantedNoLeadIn)
+                      << "|spliced_bare=" << report(splicedBare, wantedReachIn)
+                      << "|spliced=" << report(splicedTail, wantedReachIn)
                       << "|gap=" << report(acrossAGap, wantedAcrossAGap)
                       << "|outsized=" << report(outsized, wantedOutsized)
                       << std::endl;
@@ -8706,7 +15852,7 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
-        if (!arguments.isEmpty() && arguments[0] == "--smoke-envelope-base")
+        if (!arguments.isEmpty() && arguments[0] == "--smoke-native-envelope-base")
         {
             // 包络基础值: scales the whole amplitude envelope without reshaping
             // it, on any track type, persists through save/load, and undoes in
@@ -11095,18 +18241,337 @@ public:
             juce::MessageManager::callAsync([this] { quit(); });
             return;
         }
+        if (arguments.size() >= 1 && arguments[0] == "--smoke-envelope-shapes")
+        {
+            // In a frame of its own.  Every check is a branch of this one function,
+            // and its stack frame holds the locals of all of them at once; this
+            // one's -- a whole main window among them -- left so little stack that
+            // painting the preset buttons overflowed it (0xC00000FD) and the picture
+            // check exited without a word.  Inside a lambda they take stack only
+            // while this check runs.
+            const auto ok = [&]
+            {
+                // The loudness presets.  标准 and 柔起 must write exactly the points
+                // they always have.  The others ramp straight in amplitude, which
+                // only means anything if every place an envelope is read -- the
+                // mixer, the roll, a saved project, a split, a paste, a point added
+                // by hand -- reads it that way too.
+                I18n strings;
+                const auto work = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("hachi-envelope-" + juce::Uuid().toDashedString());
+                // "bank" cannot be read as a note name; a uuid can.
+                const auto folder = work.getChildFile("bank");
+                folder.createDirectory();
+                constexpr auto rate = 44100.0;
+                {
+                    // A steady tone, so whatever changes in loudness is the envelope.
+                    juce::AudioBuffer<float> buffer(1, static_cast<int>(rate * 2.0));
+                    for (int index = 0; index < buffer.getNumSamples(); ++index)
+                        buffer.setSample(0, index, 0.5f * std::sin(static_cast<float>(
+                            2.0 * juce::MathConstants<double>::pi * 220.0 * index / rate)));
+                    juce::WavAudioFormat format;
+                    std::unique_ptr<juce::FileOutputStream> stream(
+                        folder.getChildFile("tone.wav").createOutputStream());
+                    std::unique_ptr<juce::AudioFormatWriter> writer(
+                        format.createWriterFor(stream.get(), rate, 1, 16, {}, 0));
+                    if (writer != nullptr)
+                    {
+                        stream.release();
+                        writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+                    }
+                }
+                folder.getChildFile("oto.ini").replaceWithText("tone.wav=aa,100,100,-1500,80,40\n");
+                backend::UtauRenderer::invalidateVoicebankCache();
+
+                ProjectModel project;
+                const auto clipId = project.addAudioFile(folder.getChildFile("tone.wav"), 2.0, 0.0, {});
+                const auto trackId = project.snapshot().tracks.front().id;
+                project.setTrackCompose(trackId, true);
+                project.setTrackPitchAlgorithm(trackId, PitchAlgorithm::utau);
+                project.setTrackVoicebankDirectory(trackId, folder);
+                constexpr auto noteStart = 0.5;
+                const auto sung = project.addNote(clipId, noteStart, 0.6, 60.0f);
+                // A second note well after it, to carry an envelope to.
+                const auto other = project.addNote(clipId, 1.5, 0.3, 60.0f);
+                project.setNoteLabel(sung, "aa");
+                project.setNoteLabel(other, "aa");
+
+                PianoRollComponent roll(project, strings);
+                roll.setBounds(0, 0, 1400, 700);
+                roll.setPixelsPerSecond(200.0f);
+                roll.setFocusedTrack(trackId);
+                roll.setFocusedClip(clipId);
+                roll.diagnosticRefresh();
+
+                const auto& presets = PianoRollComponent::envelopePresets();
+                const auto presetNamed = [&presets](const char* name)
+                    -> const PianoRollComponent::EnvelopePreset*
+                {
+                    for (const auto& preset : presets)
+                        if (preset.name == juce::String::fromUTF8(name)) return &preset;
+                    return nullptr;
+                };
+                const auto envelopeOf = [&project](const juce::String& id)
+                {
+                    const auto current = project.snapshot();
+                    for (const auto& track : current.tracks)
+                        for (const auto& clip : track.clips)
+                            for (const auto& note : clip.notes)
+                                if (note.id == id) return note.amplitudeEnvelope;
+                    return std::vector<AmplitudeEnvelopePoint> {};
+                };
+                // Chosen from the list the toolbar is built from, applied the way a
+                // click applies it.
+                const auto applied = [&](const juce::String& id, const char* name)
+                {
+                    roll.setSelectedNoteIds({ id });
+                    const auto* preset = presetNamed(name);
+                    const auto count = preset != nullptr ? roll.applyEnvelopePreset(*preset) : 0;
+                    roll.diagnosticRefresh();
+                    return count == 1 ? envelopeOf(id) : std::vector<AmplitudeEnvelopePoint> {};
+                };
+                // Where the note sounds, in seconds from its beat.
+                const auto span = roll.diagnosticSoundingSpan(sung);
+                const auto first = std::min(0.0, span.first - noteStart);
+                const auto last = std::max(first + 0.02, span.second - noteStart);
+                struct Expected { double time; float db; bool linear; };
+                const auto matches = [](const std::vector<AmplitudeEnvelopePoint>& got,
+                                        const std::vector<Expected>& wanted)
+                {
+                    if (got.size() != wanted.size()) return false;
+                    for (std::size_t index = 0; index < got.size(); ++index)
+                        if (std::abs(got[index].timeSeconds - wanted[index].time) > 1.0e-6
+                            || std::abs(got[index].gainDb - wanted[index].db) > 1.0e-3f
+                            || got[index].linearToNext != wanted[index].linear)
+                            return false;
+                    return true;
+                };
+                const auto db = [](double percent)
+                {
+                    return static_cast<float>(20.0 * std::log10(percent / 100.0));
+                };
+
+                // Offered in this order: onsets, then endings.
+                juce::StringArray names;
+                for (const auto& preset : presets) names.add(preset.name);
+                const auto offeredInOrder = names.joinIntoString(",")
+                    == juce::String::fromUTF8("标准,柔起,缓起,渐弱,句尾,短收");
+
+                // 标准 and 柔起, exactly as they were: two ramps straight in dB.
+                const auto keptAsTheyWere = first < -0.05
+                    && matches(applied(sung, "标准"), { { first, -60.0f, false },
+                        { first + 0.005, 0.0f, false }, { last - 0.035, 0.0f, false },
+                        { last, -60.0f, false } })
+                    && matches(applied(sung, "柔起"), { { first, -60.0f, false },
+                        { first + 0.015, 0.0f, false }, { last - 0.035, 0.0f, false },
+                        { last, -60.0f, false } });
+
+                // The new ones, point by point.  缓起 reaches full level 50 ms after
+                // the beat, not after the consonant starts.
+                const auto newShapesAsDesigned =
+                    matches(applied(sung, "缓起"), { { first, -60.0f, true },
+                        { first + 0.005, db(60.0), true }, { 0.05, 0.0f, true },
+                        { last - 0.035, 0.0f, true }, { last, -60.0f, false } })
+                    && matches(applied(sung, "渐弱"), { { first, -60.0f, true },
+                        { first + 0.005, 0.0f, true }, { last - 0.035, db(80.0), true },
+                        { last, -60.0f, false } })
+                    && matches(applied(sung, "短收"), { { first, -60.0f, true },
+                        { first + 0.005, 0.0f, true }, { last - 0.010, 0.0f, true },
+                        { last, -60.0f, false } })
+                    && matches(applied(sung, "句尾"), { { first, -60.0f, true },
+                        { first + 0.005, 0.0f, true }, { last - 0.150, 0.0f, true },
+                        { last - 0.060, db(50.0), true }, { last, -60.0f, false } });
+                // 句尾 stays on the note for everything below.
+                const auto phraseEnd = envelopeOf(sung);
+
+                // A note too short for a shape gets thirds, never crossed points.
+                const auto* ending = presetNamed("句尾");
+                const auto thirds = ending != nullptr
+                    ? PianoRollComponent::envelopePresetPoints(*ending, -0.03, 0.09)
+                    : std::vector<AmplitudeEnvelopePoint> {};
+                const auto shortNoteGetsThirds = matches(thirds, { { -0.03, -60.0f, true },
+                    { 0.01, 0.0f, true }, { 0.05, db(50.0), true }, { 0.09, -60.0f, false } });
+
+                // Heard straight in amplitude.  Halfway through the final 60 ms the
+                // fade from half level is at a quarter; straight in dB it would be
+                // at 2%.
+                const auto rendered = [&]() -> std::pair<double, double>
+                {
+                    AudioEngine engine;
+                    if (arguments.size() >= 2)
+                        engine.setUtauResamplerFile(juce::File(arguments[1].unquoted()));
+                    engine.setUtauRenderNoteSelection({ sung });
+                    engine.syncProject(project.snapshot());
+                    for (int spin = 0; spin < 600 && !engine.renderProgress(); ++spin)
+                        juce::Thread::sleep(5);
+                    for (int spin = 0; spin < 1200 && engine.renderProgress(); ++spin)
+                        juce::Thread::sleep(50);
+                    juce::Thread::sleep(200);
+                    auto output = work.getChildFile("out.wav");
+                    output.deleteFile();
+                    juce::String error;
+                    if (!engine.exportWav(output, error)) return { -1.0, -1.0 };
+                    juce::AudioFormatManager formats;
+                    formats.registerBasicFormats();
+                    auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                        formats.createReaderFor(output));
+                    if (reader == nullptr) return { -1.0, -1.0 };
+                    juce::AudioBuffer<float> buffer(static_cast<int>(reader->numChannels),
+                                                    static_cast<int>(reader->lengthInSamples));
+                    reader->read(&buffer, 0, buffer.getNumSamples(), 0, true, true);
+                    const auto outputRate = reader->sampleRate;
+                    reader.reset();
+                    output.deleteFile();
+                    const auto rms = [&](double centreSeconds)
+                    {
+                        const auto half = static_cast<int>(outputRate * 0.01);
+                        const auto centre = static_cast<int>(outputRate * centreSeconds);
+                        auto sum = 0.0;
+                        auto count = 0;
+                        for (int index = centre - half; index < centre + half; ++index)
+                            if (index >= 0 && index < buffer.getNumSamples())
+                            {
+                                const auto value = buffer.getSample(0, index);
+                                sum += static_cast<double>(value) * value;
+                                ++count;
+                            }
+                        return count > 0 ? std::sqrt(sum / count) : 0.0;
+                    };
+                    // The held level mid-note, and halfway through the final fade.
+                    return { rms(noteStart + 0.25), rms(noteStart + last - 0.030) };
+                };
+                const auto [held, fading] = rendered();
+                const auto fadeRatio = held > 1.0e-4 ? fading / held : 0.0;
+                const auto heardStraightInAmplitude = fadeRatio > 0.17 && fadeRatio < 0.33;
+
+                // Drawn as it is heard: the roll reads the same quarter there.
+                const auto drawnDb = PianoRollComponent::diagnosticAmplitudeDbAt(
+                    roll.diagnosticDrawnEnvelope(sung), last - 0.030);
+                const auto drawnAsHeard = std::abs(drawnDb - db(25.0)) < 0.05f;
+
+                // The same points asking for dB are a different envelope, and one
+                // step of undo takes it back.
+                auto inDb = phraseEnd;
+                for (auto& point : inDb) point.linearToNext = false;
+                const auto flagAloneIsAChange = project.setNotesAmplitudeEnvelopes({ { sung, inDb } })
+                    && envelopeOf(sung).size() == phraseEnd.size()
+                    && !envelopeOf(sung)[1].linearToNext;
+                project.undo();
+                const auto backToTheCurve = envelopeOf(sung).size() == phraseEnd.size()
+                    && envelopeOf(sung)[1].linearToNext;
+
+                // Saved and opened again.
+                const auto sameFlags = [&phraseEnd](const std::vector<AmplitudeEnvelopePoint>& points)
+                {
+                    if (points.size() != phraseEnd.size()) return false;
+                    for (std::size_t index = 0; index < points.size(); ++index)
+                        if (points[index].linearToNext != phraseEnd[index].linearToNext) return false;
+                    return true;
+                };
+                const auto saved = work.getChildFile("envelope.hjpx");
+                juce::String saveError, loadError;
+                auto survivesSaving = false;
+                if (project.save(saved, saveError))
+                {
+                    ProjectModel reopened;
+                    if (reopened.load(saved, loadError))
+                    {
+                        const auto reloaded = reopened.snapshot();
+                        for (const auto& track : reloaded.tracks)
+                            for (const auto& clip : track.clips)
+                                for (const auto& note : clip.notes)
+                                    if (note.id == sung)
+                                        survivesSaving = sameFlags(note.amplitudeEnvelope);
+                    }
+                }
+
+                // Carried to another note, as a drag in the lane carries it to the
+                // selection: its ramps stay straight in amplitude.
+                const auto pasteKeepsTheCurve = sameFlags(
+                    roll.diagnosticMapAmplitudeEnvelope(phraseEnd, sung, other));
+
+                // A point added by hand inside a ramp: on the curve, and both halves
+                // of the ramp still straight in amplitude.
+                const auto added = PianoRollComponent::envelopeWithPointAt(phraseEnd, last - 0.030);
+                const auto insertedPointKeepsTheCurve = added.size() == phraseEnd.size() + 1
+                    && std::abs(added[4].timeSeconds - (last - 0.030)) < 1.0e-9
+                    && std::abs(added[4].gainDb - db(25.0)) < 0.05f
+                    && added[3].linearToNext && added[4].linearToNext;
+
+                // Split inside a ramp -- halfway down from full level to half -- the
+                // cut is on the curve, and the half after it carries on the same way.
+                const auto rightHalf = project.splitNote(sung, last - 0.105);
+                const auto leftHalf = envelopeOf(sung);
+                const auto afterCut = envelopeOf(rightHalf);
+                const auto splitGainOnTheCurve = !leftHalf.empty()
+                    && std::abs(leftHalf.back().gainDb - db(75.0)) < 0.05f;
+                const auto splitFlagKept = !afterCut.empty() && afterCut.front().linearToNext;
+
+                // The toolbar offers every one, laid out whole on a UTAU track in a
+                // window of the default size, ahead of the controls pinned right.
+                MainComponent window;
+                window.setBounds(0, 0, 1280, 760);
+                // Refreshed a second time, as closing the settings does: still one
+                // button per preset.
+                window.diagnosticRefreshTexts();
+                const auto layout = window.diagnosticEnvelopePresetLayout();
+                auto toolbarOffersEvery = layout.buttons.size() == presets.size();
+                auto previousRight = std::numeric_limits<int>::min();
+                for (std::size_t index = 0; toolbarOffersEvery && index < layout.buttons.size(); ++index)
+                {
+                    toolbarOffersEvery = layout.buttons[index].first == presets[index].name
+                        && layout.buttons[index].second.getWidth() == 46
+                        && layout.buttons[index].second.getX() >= previousRight;
+                    previousRight = layout.buttons[index].second.getRight();
+                }
+                const auto toolbarFits = toolbarOffersEvery && layout.viewMenu.getWidth() == 72
+                    && layout.viewMenu.getX() >= previousRight
+                    && layout.viewMenu.getRight() <= layout.rightControlsStart;
+                work.deleteRecursively();
+
+                const auto passed = offeredInOrder && keptAsTheyWere && newShapesAsDesigned
+                    && shortNoteGetsThirds && heardStraightInAmplitude && drawnAsHeard
+                    && flagAloneIsAChange && backToTheCurve && survivesSaving
+                    && pasteKeepsTheCurve && insertedPointKeepsTheCurve
+                    && splitGainOnTheCurve && splitFlagKept && toolbarOffersEvery && toolbarFits;
+                std::cout << "offered_in_order=" << (offeredInOrder ? 1 : 0)
+                          << "|kept_as_they_were=" << (keptAsTheyWere ? 1 : 0)
+                          << "|new_shapes_as_designed=" << (newShapesAsDesigned ? 1 : 0)
+                          << "|short_note_gets_thirds=" << (shortNoteGetsThirds ? 1 : 0)
+                          << "|heard_straight_in_amplitude=" << (heardStraightInAmplitude ? 1 : 0)
+                          << "|drawn_as_heard=" << (drawnAsHeard ? 1 : 0)
+                          << "|flag_alone_is_a_change=" << (flagAloneIsAChange ? 1 : 0)
+                          << "|back_to_the_curve=" << (backToTheCurve ? 1 : 0)
+                          << "|survives_saving=" << (survivesSaving ? 1 : 0)
+                          << "|paste_keeps_the_curve=" << (pasteKeepsTheCurve ? 1 : 0)
+                          << "|inserted_point_keeps_the_curve=" << (insertedPointKeepsTheCurve ? 1 : 0)
+                          << "|split_gain_on_the_curve=" << (splitGainOnTheCurve ? 1 : 0)
+                          << "|split_flag_kept=" << (splitFlagKept ? 1 : 0)
+                          << "|toolbar_offers_every=" << (toolbarOffersEvery ? 1 : 0)
+                          << "|toolbar_fits=" << (toolbarFits ? 1 : 0)
+                          << "|fade_ratio=" << juce::String(fadeRatio, 3)
+                          << "|drawn_db=" << juce::String(drawnDb, 2)
+                          << "|split_db=" << juce::String(leftHalf.empty() ? 0.0f
+                                                                            : leftHalf.back().gainDb, 3)
+                          << "|span=" << juce::String(first, 3) << ".." << juce::String(last, 3)
+                          << "|view=" << layout.viewMenu.getX() << ".." << layout.viewMenu.getRight()
+                          << "|right_controls=" << layout.rightControlsStart
+                          << "|resampler=" << (arguments.size() >= 2 ? 1 : 0)
+                          << std::endl;
+                return passed;
+            }();
+            setApplicationReturnValue(ok ? 0 : 4);
+            juce::MessageManager::callAsync([this] { quit(); });
+            return;
+        }
         if (arguments.size() >= 2 && arguments[0] == "--smoke-envelope-presets")
         {
             // These buttons say what they do by drawing it, and the drawing is
             // the one thing a text report cannot check.  This lays them out at
             // the size the parameter bar hands them and writes a PNG.
-            struct Preset { const char* text; double attack; double release; float plateauEnd; };
-            const Preset presets[] = {
-                { "\xe6\xa0\x87\xe5\x87\x86", 0.005, 0.035, 0.0f },
-                { "\xe6\xb8\x90\xe5\xbc\xb1", 0.005, 0.035, -0.92f },
-                { "\xe6\x9f\x94\xe8\xb5\xb7", 0.015, 0.035, 0.0f },
-                { "\xe7\x9f\xad\xe6\x94\xb6", 0.005, 0.005, 0.0f }
-            };
+            // Every preset the toolbar offers, in its order.
+            const auto& presets = PianoRollComponent::envelopePresets();
+            const auto count = static_cast<int>(presets.size());
             struct Strip final : public juce::Component
             {
                 void paint(juce::Graphics& g) override { g.fillAll(Palette::panel); }
@@ -11114,16 +18579,15 @@ public:
             HachiLookAndFeel presetLookAndFeel;
             juce::LookAndFeel::setDefaultLookAndFeel(&presetLookAndFeel);
             Strip strip;
-            strip.setBounds(0, 0, 4 * 46 + 3 * 3, 30);
-            std::array<EnvelopePresetButton, 4> buttons;
-            for (int index = 0; index < 4; ++index)
+            strip.setBounds(0, 0, count * 46 + (count - 1) * 3, 30);
+            std::vector<std::unique_ptr<EnvelopePresetButton>> buttons;
+            for (int index = 0; index < count; ++index)
             {
-                auto& button = buttons[static_cast<std::size_t>(index)];
-                button.configure(juce::String::fromUTF8(presets[index].text),
-                                 presets[index].attack, presets[index].release,
-                                 presets[index].plateauEnd);
-                button.setBounds(index * 49, 0, 46, 30);
-                strip.addAndMakeVisible(button);
+                auto button = std::make_unique<EnvelopePresetButton>();
+                button->configure(presets[static_cast<std::size_t>(index)]);
+                button->setBounds(index * 49, 0, 46, 30);
+                strip.addAndMakeVisible(*button);
+                buttons.push_back(std::move(button));
             }
             const auto shot = strip.createComponentSnapshot(strip.getLocalBounds(), true, 3.0f);
             juce::File out(arguments[1].unquoted());

@@ -10,6 +10,7 @@
 #endif
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace hachi::backend
 {
@@ -68,6 +69,36 @@ bool looksLikeUtf8(const juce::MemoryBlock& bytes)
     }
     return true;
 }
+
+#if JUCE_WINDOWS
+std::wstring readIn(const char* data, int size, UINT codePage)
+{
+    const auto length = MultiByteToWideChar(codePage, 0, data, size, nullptr, 0);
+    if (length <= 0) return {};
+    std::wstring text(static_cast<std::size_t>(length), L'\0');
+    MultiByteToWideChar(codePage, 0, data, size, text.data(), length);
+    return text;
+}
+
+// Japanese lyrics are written in kana, and a file read in the wrong code page
+// loses them: Shift-JIS kana read as GBK become rare hanzi, and GBK kana read
+// as Shift-JIS become half-width katakana, which are not counted here.
+int kanaCount(const std::wstring& text)
+{
+    return static_cast<int>(std::count_if(text.begin(), text.end(), [](wchar_t character)
+    {
+        return (character >= 0x3041 && character <= 0x3096)     // hiragana
+            || (character >= 0x30A1 && character <= 0x30FA);    // katakana
+    }));
+}
+
+juce::String codePageName(UINT codePage)
+{
+    if (codePage == 932) return "Shift-JIS";
+    if (codePage == 936) return "GBK";
+    return "code page " + juce::String(static_cast<int>(codePage));
+}
+#endif
 }
 
 bool UstNote::isRest() const
@@ -77,6 +108,17 @@ bool UstNote::isRest() const
 
 juce::String UstImporter::decode(const juce::MemoryBlock& bytes,
                                  juce::String& encodingUsed)
+{
+#if JUCE_WINDOWS
+    return decode(bytes, encodingUsed, static_cast<int>(GetACP()));
+#else
+    return decode(bytes, encodingUsed, 0);
+#endif
+}
+
+juce::String UstImporter::decode(const juce::MemoryBlock& bytes,
+                                 juce::String& encodingUsed,
+                                 [[maybe_unused]] int localCodePage)
 {
     if (bytes.getSize() == 0)
     {
@@ -98,18 +140,41 @@ juce::String UstImporter::decode(const juce::MemoryBlock& bytes,
         return juce::String::fromUTF8(data, static_cast<int>(bytes.getSize()));
     }
 #if JUCE_WINDOWS
-    // No UST declares its encoding, and UTAU reads them in the code page of
-    // the machine running it.  So does this, which is right for a file saved
-    // on a machine set to the same language and the best guess otherwise.
-    const auto wide = MultiByteToWideChar(CP_ACP, 0, data,
-                                          static_cast<int>(bytes.getSize()), nullptr, 0);
-    if (wide > 0)
+    // UTAU reads a UST in the code page of the machine running it, and so
+    // did this -- which garbled every Japanese file opened on a Chinese
+    // machine.  So Shift-JIS is read beside the local code page, and GBK too
+    // where the local one is Shift-JIS or GBK, and the reading with the most
+    // kana is taken.  A file with no kana either way reads as it always did,
+    // in the local code page.  GBK is not tried elsewhere: Big5 puts common
+    // hanzi on the bytes GBK uses for hiragana.
+    const auto size = static_cast<int>(bytes.getSize());
+    const auto local = static_cast<UINT>(localCodePage);
+    std::vector<UINT> candidates { local };
+    const auto consider = [&candidates](UINT codePage)
     {
-        std::vector<wchar_t> buffer(static_cast<std::size_t>(wide));
-        MultiByteToWideChar(CP_ACP, 0, data, static_cast<int>(bytes.getSize()),
-                            buffer.data(), wide);
-        encodingUsed = "code page " + juce::String(static_cast<int>(GetACP()));
-        return juce::String(buffer.data(), static_cast<std::size_t>(wide));
+        if (std::find(candidates.begin(), candidates.end(), codePage) == candidates.end())
+            candidates.push_back(codePage);
+    };
+    consider(932);
+    if (local == 932 || local == 936) consider(936);
+    std::wstring best;
+    auto bestKana = -1;
+    auto bestPage = local;
+    for (const auto codePage : candidates)
+    {
+        auto reading = readIn(data, size, codePage);
+        const auto kana = kanaCount(reading);
+        if (!reading.empty() && kana > bestKana)
+        {
+            best = std::move(reading);
+            bestKana = kana;
+            bestPage = codePage;
+        }
+    }
+    if (!best.empty())
+    {
+        encodingUsed = codePageName(bestPage);
+        return juce::String(best.c_str(), best.size());
     }
 #endif
     encodingUsed = "Latin-1";
@@ -223,6 +288,30 @@ UstProject UstImporter::parse(const juce::String& text, juce::StringArray& warni
             current.shapes.addTokens(value, ",", "");
             for (auto& shape : current.shapes) shape = shape.trim();
         }
+        else if (key.equalsIgnoreCase("VBR"))
+        {
+            const auto fields = numberList(value);
+            const auto at = [&fields](std::size_t index)
+            {
+                return index < fields.size() ? fields[index] : 0.0;
+            };
+            // Three numbers are the least that says anything: how long, how
+            // fast, how deep.  A note UTAU left without a vibrato writes a
+            // length of zero, and so does one whose vibrato was taken off.
+            if (fields.size() >= 3)
+            {
+                current.vibratoLengthPercent = at(0);
+                current.vibratoCycleMs = at(1);
+                current.vibratoDepthCents = at(2);
+                current.vibratoFadeInPercent = at(3);
+                current.vibratoFadeOutPercent = at(4);
+                current.vibratoPhasePercent = at(5);
+                current.vibratoOffsetPercent = at(6);
+                current.hasVibrato = current.vibratoLengthPercent > 0.0
+                    && current.vibratoDepthCents != 0.0
+                    && current.vibratoCycleMs > 0.0;
+            }
+        }
         else if (key.equalsIgnoreCase("Envelope"))
         {
             juce::StringArray fields;
@@ -297,9 +386,7 @@ std::optional<UstProject> UstImporter::read(const juce::File& file, juce::String
         return std::nullopt;
     }
     if (encoding != "UTF-8")
-        warnings.add("read as " + encoding
-                     + "; non-Latin lyrics may be wrong if the file came from"
-                       " a machine using a different language");
+        warnings.add("read as " + encoding);
     if (project.name.isEmpty()) project.name = file.getFileNameWithoutExtension();
     return project;
 }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(HachiShifterNext VERSION 0.2.0 LANGUAGES C CXX)
+project(HachiShifterNext VERSION 0.2.1 LANGUAGES C CXX)
 
 option(HACHI_ENABLE_ASAN "Enable AddressSanitizer for native crash diagnosis" OFF)
 
@@ -197,6 +197,8 @@ target_sources(HachiShifterNext PRIVATE
     src/AudioEngine.h
     src/ProjectModel.cpp
     src/ProjectModel.h
+    src/Pinyin.cpp
+    src/Pinyin.h
     src/PianoRollComponent.cpp
     src/PianoRollComponent.h
     src/TrackListComponent.cpp
@@ -233,6 +235,8 @@ target_sources(HachiShifterNext PRIVATE
     src/backend/RenderService.h
     src/backend/UtauRenderer.cpp
     src/backend/UtauRenderer.h
+    src/backend/UtauOtoOverride.h
+    src/backend/AmplitudeEnvelopeCurve.h
     src/backend/WorldRenderer.cpp
     src/backend/WorldRenderer.h
     src/backend/AudioFileReader.cpp
@@ -284,6 +288,9 @@ target_include_directories(HachiShifterNext PRIVATE
 )
 
 if(MSVC)
+    # The combined diagnostic entry point contains both upstream and local
+    # smoke fixtures. Reserve sufficient main-thread stack for its MSVC frame.
+    target_link_options(HachiShifterNext PRIVATE /STACK:8388608)
     # Avoid relying on the newer constexpr mutex ABI during startup when an
     # older compatible VC runtime (including Wine's implementation) is loaded.
     target_compile_definitions(HachiShifterNext PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)

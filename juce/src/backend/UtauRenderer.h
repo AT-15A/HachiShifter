@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_formats/juce_audio_formats.h>
+#include "UtauOtoOverride.h"
 #include <array>
 #include <functional>
 #include <optional>
@@ -18,6 +19,8 @@ struct UtauAmplitudePoint
 {
     double timeSeconds = 0.0;
     float gainDb = 0.0f;
+    // As AmplitudeEnvelopePoint::linearToNext.
+    bool linearToNext = false;
 };
 
 struct UtauNoteRenderSpec
@@ -28,15 +31,6 @@ struct UtauNoteRenderSpec
     double durationSeconds = 0.25;
     float midiNote = 60.0f;
     float gain = 1.0f;
-    // A continuous, unclamped native pitch evaluator: cents away from midiNote
-    // at any local time, including the negative lead-in and the tail past the
-    // note's end.  When set it is authoritative and the sampled pitchCurve
-    // below is only a preview/compatibility projection; the resampler reads the
-    // line at its real sounding times so a note's head/tail pitch follows the
-    // true contour across a seam instead of being held flat by clamping.  This
-    // is a native render feature (not UTAU-specific): the same evaluator feeds
-    // the native backends' per-frame target pitch.
-    std::function<float(double)> timelinePitchCents;
     std::vector<UtauPitchPoint> pitchCurve;
     std::vector<UtauAmplitudePoint> amplitudeEnvelope;
     int consonantVelocity = 100;
@@ -73,6 +67,13 @@ struct UtauNoteRenderSpec
     // earlier.  Declared last, like the fields above it, because several
     // callers build this struct positionally.
     double stpSeconds = 0.0;
+    // This note's own oto entry, when it has one: rendered from in place of
+    // the voicebank's.  The STP above moves whichever entry that is.
+    UtauOtoOverride oto;
+    // Immutable timeline evaluator. Ownership of editing handles must not
+    // restrict which sounding note can read this curve. Local time is relative
+    // to the nominal note start, including negative lead-in and overlap tails.
+    std::function<float(double)> timelinePitchCents;
 };
 
 struct UtauRenderRequest
@@ -88,6 +89,25 @@ struct UtauRenderRequest
     double bpm = 120.0;
     std::vector<UtauNoteRenderSpec> notes;
     std::function<void(double)> progress;
+    // Each note's own audio, as the engine made it and before it is mixed
+    // with its neighbours: which note of notes it is, the piece, its rate,
+    // and how far before the note's start the piece begins -- its first
+    // sample is one preutterance early, which is where the consonant is.
+    //
+    // A note drawn from the mix instead is drawn from a stretch that holds
+    // the note before it as well, and its own consonant lands in that note's
+    // row rather than its own.
+    // The last two read, at a time measured from the note's start, what the
+    // mix multiplies this note's samples by: everything, and everything but
+    // the envelope.  Everything means the envelope and the fades the mix puts
+    // on this note's own samples -- in across its overlap, out where the next
+    // note takes over.  A piece runs on well past that hand-over, and drawn
+    // without the fade it showed sound where the envelope had already ended,
+    // sound nobody hears.  The fades are this note's samples fading and
+    // nothing of the neighbour's, so the picture still holds one note.
+    std::function<void(std::size_t, const juce::AudioBuffer<float>&, double, double,
+                       const std::function<float(double)>&,
+                       const std::function<float(double)>&)> notePiece;
 };
 
 struct UtauRenderResult
@@ -135,7 +155,46 @@ struct UtauSampleTiming
 class UtauRenderer final
 {
 public:
+    [[nodiscard]] static juce::String diagnosticPitchbend(
+        const UtauNoteRenderSpec& note, double bpm, double preutterance, double outputSeconds);
     static void invalidateVoicebankCache();
+    // The HF vocoder daemon an engine talks to, started ahead of the first
+    // render: it takes 10-20 s to load its model, which the first HF note used
+    // to wait for.  Nothing happens unless the engine has an hf_backend beside
+    // it, and nothing is started when a daemon is already listening.  Runs on
+    // a background thread.
+    static void prewarmHfDaemon(const juce::File& resamplerExecutable);
+    // The same, on the calling thread, and whether a daemon was started.  The
+    // port is the daemon's own (51765) except in a check.
+    static bool startHfDaemonIfNeeded(const juce::File& resamplerExecutable,
+                                      int port = 51765);
+    // The interpreter the engine would start the daemon with: the first line of
+    // hf_backend/python.txt, a relative one taken from the engine's folder, and
+    // "pythonw" when there is no such file.  Read exactly as the engine reads
+    // it, so the daemon started here is the one the engine would have started.
+    [[nodiscard]] static juce::String hfDaemonInterpreter(const juce::File& engineDirectory);
+    // Whether sampleTiming can answer for this voicebank without first
+    // reading the whole of it.  When it cannot, the reading is started on a
+    // background thread -- once, however often this is asked -- and whenReady
+    // runs on the message thread after it is done.  For the roll, which asks
+    // on every layout and must not stop the window while a bank is read.
+    [[nodiscard]] static bool voicebankIndexReady(const juce::File& voicebankDirectory,
+                                                  bool fourRegion, bool consonantClasses,
+                                                  std::function<void()> whenReady);
+    // Test seams.  How many times a voicebank index has been read from disk;
+    // making every cached index re-check its files on the next look instead
+    // of within the second; and which sample an alias resolves to, through the
+    // index's tables or through the plain scan they replaced, described as
+    // "file|alias|offset" so the two can be compared.
+    [[nodiscard]] static int diagnosticIndexBuilds();
+    // How often the message thread had to read a bank itself or wait for one
+    // being read -- the stall the roll's background reading exists to avoid.
+    [[nodiscard]] static int diagnosticMessageThreadWaits();
+    static void diagnosticRecheckVoicebankFiles();
+    [[nodiscard]] static juce::String diagnosticResolve(const juce::File& voicebankDirectory,
+                                                        const juce::String& alias, float midiNote,
+                                                        bool fourRegion, bool consonantClasses,
+                                                        bool byScan);
     // Where the crossfade into the next note finishes, which is where the
     // note before it stops sounding.
     //
@@ -154,10 +213,35 @@ public:
     // lead-in, which is most of a plain CV bank.  Only a real gap -- the next
     // note beginning to sound after this one has finished -- has no seam.
     [[nodiscard]] static bool crossfadesInto(double soundStart, double noteEnd);
+    // 界: a 拼字 note -- one with no length of its own -- reads its entry's
+    // first two regions, the onset and the glide, and nothing after them, as
+    // though the entry had only two.  A four-region entry is cut where its
+    // second region ends.  Not 谋, whose entries say for themselves how many
+    // regions they have, and not plain UTAU, which has none.
+    //
+    // Both the renderer and the roll read this, so the lines drawn in such a
+    // note are where its regions really end up.
+    // 线性flag rides with the four-region modes: plain UTAU sends its flags as
+    // one string, the way UTAU itself does, whatever curve a note is still
+    // holding from another mode.  Pure, and public so a check reads the same
+    // rule the 16th argument is written by.
+    [[nodiscard]] static bool sendsFlagCurves(bool fourRegion, bool noteFlagCurve);
+    [[nodiscard]] static bool readsOnlyFirstTwoRegions(bool fourRegion,
+                                                       bool consonantClasses,
+                                                       double durationSeconds);
+    [[nodiscard]] static std::array<double, 4> firstTwoRegions(
+        const std::array<double, 4>& regionSeconds);
     [[nodiscard]] static std::optional<UtauSampleTiming> sampleTiming(
         const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
         int consonantVelocity = 100, bool fourRegion = false,
         bool consonantClasses = false);
+    // The timing one note sings with: its own oto when it has one enabled,
+    // otherwise its entry's.  Everything that draws or measures a note reads
+    // this, so the roll shows the entry the note will really be rendered from.
+    [[nodiscard]] static std::optional<UtauSampleTiming> sampleTiming(
+        const juce::File& voicebankDirectory, const juce::String& alias, float midiNote,
+        int consonantVelocity, bool fourRegion, bool consonantClasses,
+        const UtauOtoOverride* noteOto);
     // The recording an alias resolves to, plus its sounding region and OTO
     // timing after consonant-velocity scaling and STP.  Voicebank loading is
     // shared native material code; exposing the resolved sample lets a native
@@ -180,7 +264,8 @@ public:
         int consonantVelocity = 100, bool fourRegion = false,
         bool consonantClasses = false, double stpSeconds = 0.0,
         bool preutteranceOverrideEnabled = false, double preutteranceSeconds = 0.0,
-        bool overlapOverrideEnabled = false, double overlapSeconds = 0.0);
+        bool overlapOverrideEnabled = false, double overlapSeconds = 0.0,
+        const UtauOtoOverride* noteOto = nullptr);
     static UtauRenderResult render(const UtauRenderRequest& request);
     // How one note's four regions divide its output.  With no manual split
     // this reproduces the engine's own weight allocation, so what the piano

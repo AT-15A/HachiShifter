@@ -96,12 +96,55 @@ public:
     static bool importVoicebank(const juce::File& root, juce::StringArray& audioFiles,
                                 int& sidecarsWritten, int& regionsWritten,
                                 juce::StringArray& warnings);
+    // A note's own oto from what the editor produced, and the entry the editor
+    // opens with for a note that already has one.  Neither touches a file.
+    // withRegions says whether the track reads regions at all: an entry opened
+    // in 界 or 谋 is given its boundaries by the editor even if the voicebank
+    // had none written.
+    static backend::UtauOtoOverride noteOtoFromEntry(const VoicebankOtoEntry& entry,
+                                                     bool withRegions)
+    {
+        backend::UtauOtoOverride oto;
+        oto.enabled = true;
+        oto.offsetMs = entry.offsetMs;
+        oto.consonantMs = entry.consonantMs;
+        oto.cutoffMs = entry.cutoffMs;
+        oto.preutteranceMs = entry.preutteranceMs;
+        oto.overlapMs = entry.overlapMs;
+        oto.hasRegions = withRegions || entry.hasJieOto;
+        oto.onsetMs = entry.jieOnsetMs;
+        oto.glideMs = entry.jieGlideMs;
+        oto.nucleusMs = entry.jieNucleusMs;
+        oto.classes = entry.mouClasses;
+        return oto;
+    }
+    static VoicebankOtoEntry entryWithNoteOto(VoicebankOtoEntry entry,
+                                              const backend::UtauOtoOverride& oto)
+    {
+        if (!oto.enabled) return entry;
+        entry.offsetMs = oto.offsetMs;
+        entry.consonantMs = oto.consonantMs;
+        entry.cutoffMs = oto.cutoffMs;
+        entry.preutteranceMs = oto.preutteranceMs;
+        entry.overlapMs = oto.overlapMs;
+        entry.hasJieOto = oto.hasRegions;
+        entry.jieOnsetMs = oto.onsetMs;
+        entry.jieGlideMs = oto.glideMs;
+        entry.jieNucleusMs = oto.nucleusMs;
+        entry.mouClasses = oto.classes;
+        return entry;
+    }
     // mouMode lays 谋•OTO over the entries as well.  It is off for UTAU and
     // 界•UTAU, which have no annotation: with it off, an otomou.ini sitting
     // in the folder is never even opened.
     static std::vector<VoicebankOtoEntry> loadVoicebankOto(
         const juce::File& root, juce::StringArray& warnings,
         bool jieMode = false, bool mouMode = false);
+    // Counts the writes made here to the files a voicebank is read from --
+    // oto.ini, oto.jie.ini, oto4.ini, otomou.ini and the sample sidecars.  The
+    // renderer keys its voicebank index on it, so what is written here is what
+    // the next note is sung from, with no wait.
+    [[nodiscard]] static std::uint64_t voicebankFilesRevision();
     static bool updateVoicebankOtoEntry(const VoicebankOtoEntry& original,
                                         const VoicebankOtoEntry& updated,
                                         juce::String& error);

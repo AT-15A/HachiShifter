@@ -6,11 +6,14 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <array>
 #include <functional>
+#include <memory>
+#include <optional>
 
 namespace hachi
 {
 class OtoWaveformEditorComponent final : public juce::Component,
-                                         private juce::ScrollBar::Listener
+                                         private juce::ScrollBar::Listener,
+                                         private juce::Timer
 {
 public:
     // jieMode adds the three inner boundaries that turn a classic two-region
@@ -22,7 +25,58 @@ public:
     OtoWaveformEditorComponent(VoicebankOtoEntry entry, bool jieMode,
                                bool mouMode,
                                std::function<void()> savedCallback);
+    ~OtoWaveformEditorComponent() override;
 
+    // 单独OTO编辑 for one note: the editor on that note's entry -- its own copy
+    // when it already has one, so a second edit carries on from the first --
+    // with Save handing the result to the note instead of to any file.  Empty,
+    // with the reason in error, when the note cannot have one.  The window and
+    // the checks both open it through here.
+    [[nodiscard]] static std::unique_ptr<OtoWaveformEditorComponent> forNote(
+        ProjectModel& project, const juce::String& noteId, juce::String& error);
+    [[nodiscard]] const VoicebankOtoEntry& originalEntry() const { return original; }
+    // 单独OTO编辑: the edited entry goes to one note instead of into any oto
+    // file.  Saving then changes nothing on disk.
+    void saveToNoteInstead(std::function<void(const VoicebankOtoEntry&)> handoff);
+
+    // 播放原音: what the play button sounds through.  The editor owns no audio
+    // device; whoever opens the window hands one over, and says what has to
+    // happen before a sound is made -- the song stopped, an output opened.
+    struct PlaybackHost
+    {
+        // The device to play through, or nothing once there is none any more.
+        std::function<juce::AudioDeviceManager*()> devices;
+        // Asked before every start; false and nothing plays.
+        std::function<bool()> beforeStart;
+    };
+    // Without a host the recording still plays, into nothing: that is how the
+    // checks pull it and listen to what a device would have been sent.
+    void setPlaybackHost(PlaybackHost host) { playbackHost = std::move(host); }
+
+    // Test seams: press Save the way the button does, and read its caption.
+    void diagnosticSave() { save(); }
+    [[nodiscard]] juce::String diagnosticSaveCaption() const
+    {
+        return saveButton.getButtonText();
+    }
+    // Test seams for 播放原音: press the button the way a click does, read
+    // what it says and where the playhead is, and pull the sound a device
+    // would be sent -- up to maxSeconds at outputRate, in blocks, the playhead
+    // moved after each block the way the window's timer moves it.  Appended to
+    // out; returns how many samples came.
+    void diagnosticPressPlay() { togglePlayback(); }
+    [[nodiscard]] juce::String diagnosticPlayCaption() const
+    {
+        return playButton.getButtonText();
+    }
+    [[nodiscard]] bool diagnosticPreviewPlaying() const { return preview != nullptr; }
+    [[nodiscard]] bool diagnosticPreviewAttached() const { return previewDevices != nullptr; }
+    [[nodiscard]] std::optional<double> diagnosticPlayheadMs() const
+    {
+        return waveform.playheadMilliseconds();
+    }
+    int diagnosticPullPreview(juce::AudioBuffer<float>& out, double outputRate,
+                              double maxSeconds);
     // Native-material save: when set, Save hands the edited entry to this
     // instead of writing oto.ini, so the same waveform editor persists a
     // from-scratch material as its native HJM sidecar.  Editing is one native
@@ -150,6 +204,14 @@ private:
         double visibleLengthMilliseconds() const { return visibleSpanMs(); }
         void setVisibleStartMilliseconds(double startMs);
         std::function<void()> onViewChanged;
+        // 播放原音: where the sound being played has got to in the file, drawn
+        // over everything else; empty while nothing plays.
+        void setPlayheadMilliseconds(std::optional<double> milliseconds)
+        {
+            playheadMs = milliseconds;
+            repaint();
+        }
+        [[nodiscard]] std::optional<double> playheadMilliseconds() const { return playheadMs; }
         void diagnosticDragOffsetTo(double ms) { applyHandle(Handle::offset, ms); }
         // Drag one region boundary, 0 for the first, to an absolute time.
         void diagnosticDragBoundary(int index, double ms)
@@ -221,6 +283,7 @@ private:
         std::vector<std::pair<float, float>> waveformPeaks;
         double durationMs = 0.0;
         Handle dragging = Handle::none;
+        std::optional<double> playheadMs;
     };
 
     // Which parameters this mode shows, in the order they are laid out.  Jie
@@ -256,12 +319,21 @@ private:
     void save();
     void closeWindow();
     static juce::String formatNumber(double value);
+    // 播放原音: start the whole recording from the top, or stop it.
+    void togglePlayback();
+    void startPlayback();
+    void stopPlayback();
+    // While playing: the playhead follows the sound, and the end of the
+    // recording puts the button back.
+    void timerCallback() override;
 
     const bool jie;
     const bool mou;
     VoicebankOtoEntry original;
     VoicebankOtoEntry edited;
     std::function<void()> onSaved;
+    // Set for 单独OTO编辑, where the entry belongs to one note.
+    std::function<void(const VoicebankOtoEntry&)> noteHandoff;
     std::function<bool(const VoicebankOtoEntry&, juce::String&)> saveOverride;
     juce::Label fileLabel;
     juce::Label helpLabel;
@@ -293,5 +365,19 @@ private:
     void scrollBarMoved(juce::ScrollBar* bar, double newRangeStart) override;
     void refreshScrollBar();
     bool refreshingEditors = false;
+    // 播放原音: the whole recording the entry is cut from, never anything an
+    // engine made of it.  It is read into memory when play is pressed and
+    // handed to the host's device as a callback of its own, beside the song's
+    // rather than instead of it: the song's position, and the view that
+    // follows it, stay where they were.
+    class SourcePreview;
+    PlaybackHost playbackHost;
+    std::unique_ptr<SourcePreview> preview;
+    // Made only when there is a device to hand it to.  Held by pointer as well
+    // because a player carries 256 channel pointers, and every editor the
+    // checks build by value sits in the one stack frame they all share.
+    std::unique_ptr<juce::AudioSourcePlayer> previewPlayer;
+    juce::AudioDeviceManager* previewDevices = nullptr;
+    juce::TextButton playButton;
 };
 }

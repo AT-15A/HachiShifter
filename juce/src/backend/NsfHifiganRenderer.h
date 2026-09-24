@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include "OrtExecution.h"
 #include "UtauRenderer.h"
@@ -112,7 +113,8 @@ struct NsfUtauPitchPoint
 
 [[nodiscard]] std::vector<float> buildNsfUtauTargetMidi(
     float midiNote, const std::vector<NsfUtauPitchPoint>& pitchCurve,
-    double framePeriodMs, double outputSeconds, double soundStartOffsetSeconds);
+    double framePeriodMs, double outputSeconds, double soundStartOffsetSeconds,
+    const std::function<float(double)>& timelinePitchCents = {});
 
 // One synthesised note laid into the phrase (audio at soundStartSeconds,
 // crossfading its head over overlapSeconds; a rest holds its place).
@@ -141,7 +143,8 @@ struct NsfUtauSynthResult
 [[nodiscard]] NsfUtauSynthResult synthesizeNsfUtauNote(
     const juce::File& sampleFile, const NsfUtauNotePlan& plan,
     float midiNote, const std::vector<NsfUtauPitchPoint>& pitchCurve,
-    const juce::File& modelDirectory, const OrtExecutionConfig& execution);
+    const juce::File& modelDirectory, const OrtExecutionConfig& execution,
+    const std::function<float(double)>& timelinePitchCents = {});
 
 // Render a whole UTAU voicebank phrase through the one NSF-HiFiGAN renderer:
 // resolve each note's sample by alias (and prefix-mapped pitch bank), plan its

@@ -73,6 +73,12 @@ public:
     void setFocusedClip(const juce::String& clipId);
     void setFocusedTrack(const juce::String& trackId);
     void setShowNoteLabels(bool enabled);
+    // Read a voicebank on a background thread rather than stopping the window
+    // for it.  Until a bank is read its notes are drawn where they were last
+    // drawn -- or, the first time, at their written place -- and the layout is
+    // redone once it is in.  Off unless asked for, so a check that builds a
+    // roll gets its lead-ins at once.
+    void setReadsVoicebankInBackground(bool enabled) { readsVoicebankInBackground = enabled; }
     void setShowWaveforms(bool enabled);
     // The rendered UTAU notes, as peaks.  A UTAU note has no source file to
     // take a thumbnail of, so what is drawn is what came back from the
@@ -150,7 +156,21 @@ public:
     // of its original and nothing appeared to happen.
     [[nodiscard]] std::optional<double> pasteAnchorSeconds() const;
     // The ids the built menu really carries, in order.
+    // The same, less the items offered greyed: whether a thing can be
+    // reached is a separate question from whether it is listed.
+    [[nodiscard]] std::vector<int> diagnosticEnabledNoteMenuIds(
+        const juce::String& noteId) const;
+    // What choosing an item on the note menu does.  Public, because inside
+    // the popup's own callback nothing could ask whether an item does
+    // anything at all.
+    void applyNoteMenuChoice(const juce::String& noteId, int result, double split,
+                             const std::vector<juce::String>& mergeIds);
     [[nodiscard]] std::vector<int> diagnosticNoteMenuIds(const juce::String& noteId) const;
+    // Both of those include what is inside 高级.  This is the menu row by row
+    // instead: an item's id, a submenu as its name with its ids in brackets,
+    // a separator as "-".
+    [[nodiscard]] std::vector<juce::String> diagnosticNoteMenuLayout(
+        const juce::String& noteId) const;
 
     // The steps a drawn note may grow by: a 128th of a bar up to a quarter
     // of one, doubling.  Generated rather than written out, so doubling is
@@ -176,6 +196,11 @@ public:
     [[nodiscard]] double diagnosticDrawnLength() const { return drawLengthSeconds; }
 
     [[nodiscard]] bool showsUtauWaveforms() const { return showUtauWaveforms; }
+    // Where a note's waveform is drawn, in seconds on the timeline: the same
+    // span the paint uses, so a check reads what is on screen rather than a
+    // second copy of the rule.
+    [[nodiscard]] std::optional<std::pair<double, double>> diagnosticWaveformSpan(
+        const juce::String& noteId) const;
     // The orange outline around what a note actually sounds, and the
     // envelope shape inside it.  Independent: either alone still leaves a
     // note visible, since the nominal baseline is always drawn.
@@ -199,7 +224,75 @@ public:
     }
     // Closes it without writing, so a check can go on to the next case.
     void diagnosticCancelAliasEdit() { finishInlineAliasEdit(false); }
+    // Which note the box is on and what it holds, for the Tab check.
+    [[nodiscard]] juce::String diagnosticAliasEditorNoteId() const
+    {
+        return inlineAliasNoteId;
+    }
+    [[nodiscard]] juce::String diagnosticAliasEditorText() const
+    {
+        return inlineAliasEditor.getText();
+    }
+    [[nodiscard]] bool diagnosticAliasEditorHasFocus() const
+    {
+        return inlineAliasEditor.hasKeyboardFocus(false);
+    }
+    // The whole lyric highlighted, so the first keystroke replaces it.
+    [[nodiscard]] bool diagnosticAliasEditorAllSelected() const
+    {
+        return inlineAliasEditor.getHighlightedRegion().getLength()
+            == inlineAliasEditor.getTotalNumChars();
+    }
+    [[nodiscard]] juce::Rectangle<int> diagnosticAliasEditorBounds() const
+    {
+        return inlineAliasEditor.getBounds();
+    }
+    // Puts text in the box without accepting it, as typing would.
+    void diagnosticTypeInAliasEditor(const juce::String& text)
+    {
+        inlineAliasEditor.setText(text, false);
+    }
     // Whether the point tool has taken hold of a pitch anchor.
+    // Which note's lead-in handle a press at this point takes hold of, or
+    // empty.  Where two handles overlap only one of them can be had, and the
+    // note behind a 拼字 note was the one that never could.
+    [[nodiscard]] juce::String diagnosticConsonantHandleAt(
+        juce::Point<float> position) const
+    {
+        const auto handle = consonantHandleAt(position);
+        return handle ? handle->noteId : juce::String();
+    }
+    // The pitch handles a note is drawn and edited with.
+    // Where a vibrato handle of a note sits on screen -- "length" (its start),
+    // "end", "fadeIn", "fadeOut", "depth", "cycle" or "offset".
+    [[nodiscard]] std::optional<juce::Point<float>> diagnosticVibratoHandle(
+        const juce::String& noteId, const juce::String& which) const;
+    [[nodiscard]] std::vector<PitchCurveEditPoint> diagnosticPitchAnchors(const juce::String& id)
+    {
+        if (const auto* note = findNote(id)) return pitchAnchorsFor(*note);
+        return {};
+    }
+    // The pitch line drawn for a note, at an absolute time, and the stretch it
+    // is drawn over -- read the way paint reads them.
+    // The automatic transition between two adjacent notes: from where this
+    // note's own line ends to where the next one's begins.
+    struct TransitionBridge
+    {
+        double startSeconds = 0.0;   // absolute
+        double endSeconds = 0.0;
+        float startMidi = 60.0f;
+        float endMidi = 60.0f;
+    };
+    [[nodiscard]] std::optional<TransitionBridge> diagnosticTransitionBridge(
+        const juce::String& id);
+    [[nodiscard]] std::optional<float> diagnosticPitchLineAt(const juce::String& id,
+                                                             double absoluteSeconds);
+    [[nodiscard]] std::optional<std::pair<double, double>> diagnosticPitchLineSpan(
+        const juce::String& id);
+    // The handles a note offers: on a shared line, only those in the stretch
+    // its own points decide.
+    [[nodiscard]] std::vector<PitchCurveEditPoint> diagnosticOfferedPitchAnchors(
+        const juce::String& id);
     [[nodiscard]] bool diagnosticDraggingAnchor() const
     {
         return dragMode == DragMode::pointPitch;
@@ -315,6 +408,8 @@ public:
     // would be asking for.
     void diagnosticDragConsonantTo(double preutteranceSeconds)
     {
+        // Asked for a lead-in outright, which is a drag and not a click.
+        consonantDragTravelled = true;
         dragConsonantTo(consonantNoteAbsoluteStart - preutteranceSeconds);
     }
     void diagnosticReleaseDrag() { finishDrag(); }
@@ -329,13 +424,88 @@ public:
     {
         return previewMoveDeltaSeconds;
     }
-    // Writes a trapezoid over each selected note, sized to what that note
-    // actually sounds.  plateauEndDb lets a preset decay across the hold.
     // Gives a note that has just been given a lyric the shape it is already
     // being drawn with, so it sounds like its neighbours straight away.
     void ensureDefaultEnvelope(const juce::String& noteId);
+    // A loudness envelope preset, point by point.  Each point is placed by
+    // what a note is laid out by rather than by clock time -- after the moment
+    // it starts sounding, after its beat, or before the moment it stops -- so
+    // a rise can reach full level a set time into the vowel whatever the
+    // consonant in front of it is.  A note starts and ends in silence; the
+    // points are what lies between.
+    struct EnvelopePresetPoint
+    {
+        enum class From { soundStart, beat, soundEnd };
+        From from = From::soundStart;
+        double seconds = 0.0;
+        float gainDb = 0.0f;
+        // The stretch from this point to the next runs straight in amplitude.
+        bool linearToNext = false;
+    };
+    struct EnvelopePreset
+    {
+        juce::String name;
+        juce::String tip;
+        std::vector<EnvelopePresetPoint> points;
+        // The stretch from the silent start to the first point.
+        bool linearRise = false;
+    };
+    // The toolbar's presets, in the order they are offered.
+    [[nodiscard]] static const std::vector<EnvelopePreset>& envelopePresets();
+    // The envelope a preset gives a note sounding from `first` to `last`,
+    // both in seconds from its beat.
+    [[nodiscard]] static std::vector<AmplitudeEnvelopePoint> envelopePresetPoints(
+        const EnvelopePreset& preset, double first, double last);
+    // Writes a preset over each selected note, sized to what that note
+    // actually sounds.
+    int applyEnvelopePreset(const EnvelopePreset& preset);
+    // The same for a two-ramp shape given by its numbers, straight in dB:
+    // attack, release, and the level the hold ends on.
     int applyEnvelopePreset(double attackSeconds, double releaseSeconds,
                             float plateauEndDb);
+    // An envelope with a point added at this time, on the line where it
+    // already runs.  What a double-click in the envelope lane does.
+    [[nodiscard]] static std::vector<AmplitudeEnvelopePoint> envelopeWithPointAt(
+        std::vector<AmplitudeEnvelopePoint> envelope, double timeSeconds);
+    // Test seams: the level the roll reads between two points, and the shape
+    // an envelope takes when it is carried to another note.
+    // Where the loudness lane puts a level, so a check can aim at a handle.
+    [[nodiscard]] float diagnosticAmplitudeLaneY(float gainDb) const
+    {
+        return amplitudeLaneY(gainDb);
+    }
+    // A note's envelope as the lane shows it -- the shape with its base value
+    // already in it, which is what the audio will be shaped by.
+    [[nodiscard]] std::vector<AmplitudeEnvelopePoint> diagnosticDisplayEnvelope(
+        const juce::String& noteId) const
+    {
+        for (const auto& track : snapshot.tracks)
+            for (const auto& clip : track.clips)
+                for (const auto& note : clip.notes)
+                    if (note.id == noteId)
+                        return displayAmplitudeEnvelope(note,
+                            clip.startSeconds + note.startSeconds);
+        return {};
+    }
+    [[nodiscard]] static float diagnosticAmplitudeDbAt(
+        const std::vector<AmplitudeEnvelopePoint>& points, double timeSeconds)
+    {
+        return amplitudeDbAt(points, timeSeconds);
+    }
+    // What the paint draws for a note, bucket by bucket: the picture in its
+    // row and the faint layer behind the envelope lane, each as a level.
+    // Empty when the note has no waveform the roll would draw.
+    struct DrawnNoteWaveform
+    {
+        double leadInSeconds = 0.0;
+        std::vector<float> picture;
+        std::vector<float> ghost;
+    };
+    [[nodiscard]] std::optional<DrawnNoteWaveform> diagnosticDrawnNoteWaveform(
+        const juce::String& noteId) const;
+    [[nodiscard]] std::vector<AmplitudeEnvelopePoint> diagnosticMapAmplitudeEnvelope(
+        const std::vector<AmplitudeEnvelopePoint>& source,
+        const juce::String& sourceNoteId, const juce::String& targetNoteId) const;
     void setSampleRegions(const std::vector<SampleRegionSetting>& regions, int activeRegion);
     void setPlayheadSeconds(double seconds);
     void setTool(Tool nextTool);
@@ -386,6 +556,10 @@ public:
     // touches only the switched-on ones.
     [[nodiscard]] bool flagResetAvailable(
         const std::vector<juce::String>& noteIds) const;
+    // Whether 恢复为音源OTO has anything to do: at least one of these notes has
+    // an oto of its own.  The rest of a mixed selection is left as it is.
+    [[nodiscard]] bool ownOtoRestoreAvailable(
+        const std::vector<juce::String>& noteIds) const;
     // Whether one note's curve for the flag on show can be reset: only when it
     // has one.  A note showing the starting handle has nothing stored, so
     // there is nothing to undo.
@@ -396,6 +570,10 @@ public:
     [[nodiscard]] bool flagResetAvailableForLane() const;
     void showFlagLaneSwitchContextMenu(juce::Point<int> screenPosition);
     [[nodiscard]] const TrackData* trackForNote(const juce::String& noteId) const;
+    // Whether this note's 线性flag is in play: the switch is on and its track is
+    // in a mode that offers curves at all.  A note keeps its curve when the
+    // track moves to plain UTAU, and there the lane leaves it alone.
+    [[nodiscard]] bool flagCurveActiveFor(const juce::String& noteId) const;
     [[nodiscard]] juce::Rectangle<float> flagLanePlotBounds() const;
     [[nodiscard]] float flagLaneY(float value) const;
     [[nodiscard]] float flagValueFromLaneY(float y) const;
@@ -479,6 +657,8 @@ public:
     std::function<void(const juce::String&)> onNoteAliasCommitted;
     // Open the four-region / oto editor for this note's voicebank entry.
     std::function<void(const juce::String&)> onOpenRegionEditor;
+    // 单独OTO编辑: the OTO editor, for this note's own copy of its entry.
+    std::function<void(const juce::String&)> onOpenNoteOtoEditor;
     std::function<void(int, const SampleRegionSetting&, bool)> onSampleRegionEdited;
 
 private:
@@ -504,6 +684,7 @@ private:
         juce::String id;
         double startSeconds = 0.0;
         double endSeconds = 0.0;
+        bool automaticTransition = true;
     };
 
     struct ConsonantHandleInfo
@@ -526,7 +707,7 @@ private:
 
     // Vibrato is shaped by dragging its own trace rather than by typing
     // numbers: the handles sit on the swing itself, the way UTAU does it.
-    enum class VibratoHandle { none, length, fadeIn, fadeOut, depth, cycle, offset };
+    enum class VibratoHandle { none, length, fadeIn, fadeOut, depth, cycle, offset, end };
     struct VibratoHandleInfo
     {
         juce::String noteId;
@@ -549,6 +730,12 @@ private:
     [[nodiscard]] NoteData effectiveVibrato(const NoteData& note) const;
     [[nodiscard]] std::optional<VibratoHandleInfo> vibratoHandleAt(
         juce::Point<float> position) const;
+    // Where a vibrato handle is drawn and grabbed, on screen.  The one place
+    // both read it from, since the end handle steps off the line where the
+    // fade-out handle would otherwise sit on top of it.
+    [[nodiscard]] juce::Point<float> vibratoHandleCentre(const NoteData& shown,
+                                                         VibratoHandle which,
+                                                         double absoluteStart) const;
 
     // One of the three draggable four-region boundaries drawn inside a note
     // in the Jie/UTAU mode.
@@ -617,6 +804,13 @@ private:
     [[nodiscard]] int noteEditDivision() const;
     void beginInlineAliasEdit(const NoteHit& hit);
     void finishInlineAliasEdit(bool accept);
+    // Tab in the lyric box: keep this lyric and carry on at the next note on
+    // the track (Shift+Tab, the one before).
+    void advanceInlineAliasEdit(bool forward);
+    void commitInlineAlias(const juce::String& noteId, juce::String alias);
+    [[nodiscard]] juce::String adjacentNoteOnTrack(const juce::String& noteId,
+                                                   bool forward) const;
+    void revealInViewport(juce::Rectangle<float> area);
     void updateCanvasSize();
     void drawClipWaveforms(juce::Graphics& g);
     [[nodiscard]] float timeToX(double seconds) const;
@@ -685,12 +879,8 @@ private:
     void showGapDialog(const juce::String& noteId);
     // Asks for an STP in milliseconds and gives it to every selected note.
     void showStpDialog(const juce::String& noteId);
-    // Scales the whole amplitude envelope of the note up or down by a base
-    // percent without reshaping it.  A shared amplitude concept, offered on
-    // every track type.
     void showEnvelopeBaseDialog(const juce::String& noteId);
-    // The overlap this note's lyric resolves to, honouring an override.  Used
-    // when inserting a lead-in note so it inherits the right crossfade.
+    // A UTAU note's overlap as it stands: its own pin, else its entry's.
     [[nodiscard]] double effectiveUtauOverlapFor(const juce::String& noteId) const;
     // A silence with a note on either side of it.  Right-clicking one offers
     // to close it up or to open a note into it; both move what follows.
@@ -735,6 +925,20 @@ private:
         const NoteData& note, double absoluteStart) const;
     [[nodiscard]] static float amplitudeDbAt(
         const std::vector<AmplitudeEnvelopePoint>& points, double timeSeconds);
+    // One millisecond of a note's picture: the piece as the mix fades it,
+    // shaped by the envelope on screen.  The note's row and the envelope lane
+    // both draw from this.
+    [[nodiscard]] static float notePictureAt(const UtauNoteWaveform& waveform,
+                                             const std::vector<AmplitudeEnvelopePoint>& envelope,
+                                             std::size_t bucket, bool high);
+    // And the faint layer behind the lane, as a level: the same piece with
+    // the envelope's shape left out between its first and last points.
+    [[nodiscard]] static float noteGhostAt(const UtauNoteWaveform& waveform,
+                                           const std::vector<AmplitudeEnvelopePoint>& envelope,
+                                           std::size_t bucket);
+    [[nodiscard]] static bool withinEnvelope(const UtauNoteWaveform& waveform,
+                                             const std::vector<AmplitudeEnvelopePoint>& envelope,
+                                             std::size_t bucket);
     [[nodiscard]] float amplitudeY(float midi, float gainDb) const;
     [[nodiscard]] float amplitudeDbFromY(float midi, float y) const;
     [[nodiscard]] juce::Rectangle<float> amplitudeLaneBounds() const;
@@ -775,6 +979,13 @@ private:
     juce::Rectangle<int> playheadBand;
     bool cullOffscreenNotes = true;
     std::unordered_map<std::string, std::pair<double, double>> utauSoundSpans;
+    bool readsVoicebankInBackground = false;
+    // A layout is already due when a bank finishes reading.
+    mutable bool awaitingVoicebank = false;
+    // Whether a track's bank can be asked about without waiting for it to be
+    // read.  Always, unless reading in the background; when it cannot, the
+    // reading is under way and a layout follows it.
+    [[nodiscard]] bool voicebankReadFor(const TrackData& track) const;
     // Who a note sits between, worked out once with the spans.  Asking for it
     // per note meant rebuilding and sorting the whole track's note list twice
     // for every note drawn, which turned one paint into quadratic work.
@@ -805,6 +1016,14 @@ private:
     bool showUtauWaveforms = false;
     std::shared_ptr<const std::vector<UtauNoteWaveform>> utauWaveforms;
     void drawUtauNoteWaveforms(juce::Graphics& g);
+    // The rendered audio behind the loudness envelope, in the lane's own
+    // percent scale.  Returns how many notes it drew, which is what a check
+    // can ask for without counting pixels.
+    int drawAmplitudeLaneWaveforms(juce::Graphics& g);
+    // The envelope a note is drawn with right now, which during a drag is the
+    // one being dragged rather than the one the project still holds.
+    [[nodiscard]] std::vector<AmplitudeEnvelopePoint> displayAmplitudeEnvelope(
+        const NoteData& note, double absoluteStart) const;
     void showBatchLyricDialog(const juce::String& noteId);
     // The notes a batch of lyrics fills, in the order they are sung: the
     // selection when several are selected, otherwise this note and the ones
@@ -869,12 +1088,55 @@ private:
     int previewConsonantVelocity = 100;
     bool consonantSetsPin = false;
     double consonantOverlapSeconds = 0.0;
+    // Whether the pointer has gone anywhere since the lead-in handle was
+    // pressed.  A press that never did is a click, and a release commits
+    // nothing: committing released the note's pin, which put a note behind a
+    // 拼字 note back to its entry's own timing every time its seam was clicked.
+    bool consonantDragTravelled = false;
+    // Hand shake on a click, not a drag.  Well under the six the note body
+    // waits for, since a handle is grabbed on purpose and a small deliberate
+    // nudge has to count.
+    static constexpr int consonantClickSlopPixels = 3;
     double pitchEditAbsoluteStart = 0.0;
     std::vector<PitchCurveEditPoint> pitchStroke;
     bool pointDragCanMoveHorizontally = false;
     double pointDragMinimumTime = 0.0;
     double pointDragMaximumTime = 0.0;
+    // On a shared pitch line: how far right any point of the dragged note may
+    // go and still decide something.  Relative to the note's start.
+    double pointDragOwnedUntil = std::numeric_limits<double>::infinity();
     std::unordered_map<std::string, std::vector<PitchCurveEditPoint>> pitchAnchorCache;
+    // The pitch lines notes share, per track id; see sharedPitchLines.  While a
+    // pitch point is being dragged, the dragged note's track is read with the
+    // stroke standing in for that note's points, so the line follows the drag.
+    // followDrag false reads the lines as they were before the drag began:
+    // which handles are shown is decided by those, so none appear or vanish
+    // while a point is being dragged.
+    [[nodiscard]] const SharedPitchLines& sharedLinesFor(const TrackData& track,
+                                                         bool followDrag = true) const;
+    [[nodiscard]] const TrackData* trackOf(const juce::String& noteId) const;
+    // The line as drawn for a note: the corners it passes through, relative to
+    // the note's start, and its pitch at a time relative to the note's start.
+    [[nodiscard]] std::optional<TransitionBridge> transitionBridge(
+        const TrackData& track, const NoteData& note, double absoluteStart);
+    [[nodiscard]] std::vector<double> pitchLineBreaks(const TrackData& track,
+                                                      const NoteData& note,
+                                                      double absoluteStart);
+    [[nodiscard]] float pitchLineMidiAt(const TrackData& track, const NoteData& note,
+                                        double absoluteStart, double time);
+    // Whether a handle of this note at this absolute moment decides anything:
+    // on a shared line, only inside the stretch the note owns.
+    [[nodiscard]] bool pitchHandleOffered(const NoteData& note, double absoluteSeconds) const;
+    // The last point a note shows, and the first, in absolute seconds: where
+    // the notes either side of it may bring their own points up to, and no
+    // further.
+    [[nodiscard]] std::optional<double> lastShownPitchPoint(const juce::String& noteId,
+                                                            double absoluteStart);
+    [[nodiscard]] std::optional<double> firstShownPitchPoint(const juce::String& noteId,
+                                                             double absoluteStart);
+    mutable std::map<juce::String, SharedPitchLines> sharedLineCache;
+    mutable std::uint64_t draggedSharedKey = 0;
+    mutable SharedPitchLines draggedSharedLines;
     int draggedPitchAnchor = -1;
     std::vector<FlagCurvePoint> flagStroke;
     int draggedFlagPoint = -1;

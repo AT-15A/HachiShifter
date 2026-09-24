@@ -38,6 +38,9 @@ const std::unordered_map<std::string, Row> strings {
     { "file.new",        { "新建工程", "新增工程", "新規プロジェクト", "새 프로젝트", "New Project" } },
     { "file.midi",       { "导入 MIDI", "匯入 MIDI", "MIDIを読み込む", "MIDI 가져오기", "Import MIDI" } },
     { "file.ust",        { "导入 UST", "匯入 UST", "USTを読み込む", "UST 가져오기", "Import UST" } },
+    { "file.exportMidi", { "导出 MIDI", "匯出 MIDI", "MIDIを書き出す", "MIDI 내보내기", "Export MIDI" } },
+    { "error.exportMidi", { "无法导出 MIDI", "無法匯出 MIDI", "MIDIを書き出せません", "MIDI를 내보낼 수 없습니다", "Could not export the MIDI" } },
+    { "status.midiExported", { "MIDI 已导出", "MIDI 已匯出", "MIDIを書き出しました", "MIDI를 내보냈습니다", "MIDI exported" } },
     { "error.ust",       { "无法读取 UST 工程", "無法讀取 UST 專案", "USTを読み込めません", "UST를 읽을 수 없습니다", "Could not read the UST" } },
     { "status.ustLoaded", { "UST 已导入为 UTAU 轨道", "UST 已匯入為 UTAU 軌道", "USTをUTAUトラックとして読み込みました", "UST를 UTAU 트랙으로 가져왔습니다", "UST imported as a UTAU track" } },
     { "file.exit",       { "退出", "結束", "終了", "종료", "Exit" } },
@@ -60,6 +63,7 @@ const std::unordered_map<std::string, Row> strings {
     { "edit.setPitch", { "设置音高…", "設定音高…", "ピッチを設定…", "피치 설정…", "Set Pitch…" } },
     { "edit.averagePitch", { "平均所选音高", "平均所選音高", "選択ピッチを平均化", "선택 피치 평균", "Average Selected Pitch" } },
     { "edit.quantizePitch", { "量化到半音", "量化到半音", "半音にクオンタイズ", "반음으로 퀀타이즈", "Quantize to Semitone" } },
+    { "edit.hanziToPinyin", { "汉字转拼音", "漢字轉拼音", "漢字をピンインに変換", "한자를 병음으로 변환", "Convert Chinese Lyrics to Pinyin" } },
     { "edit.cents", { "音分", "音分", "セント", "센트", "Cents" } },
     { "edit.midiNote", { "MIDI 音高", "MIDI 音高", "MIDI ノート", "MIDI 음높이", "MIDI Note" } },
     { "edit.copyClip",   { "复制所选采样", "複製所選取樣", "選択クリップをコピー", "선택 클립 복사", "Copy Selected Clip" } },
@@ -145,6 +149,10 @@ const std::unordered_map<std::string, Row> strings {
     { "track.newHere", { "新建轨道", "新建軌道", "トラックを新規作成", "새 트랙", "New Track" } },
     { "track.newReference", { "新建素材轨道", "新建素材軌道", "素材トラックを新規作成",
                               "소재 트랙 새로 만들기", "New Reference Track" } },
+    { "track.importMidi", { "导入 MIDI 轨道", "匯入 MIDI 軌道", "MIDIトラックを読み込む",
+                            "MIDI 트랙 가져오기", "Import MIDI Track" } },
+    { "status.midiTrackImported", { "已导入 MIDI 轨道：", "已匯入 MIDI 軌道：", "MIDIトラックを読み込みました：",
+                                    "MIDI 트랙을 가져왔습니다: ", "MIDI track imported: " } },
     { "track.rename", { "重命名所选轨道…", "重新命名所選軌道…", "選択トラック名を変更…", "선택 트랙 이름 바꾸기…", "Rename Selected Track…" } },
     { "track.name", { "轨道名称", "軌道名稱", "トラック名", "트랙 이름", "Track Name" } },
     { "track.delete",    { "删除所选轨道", "刪除所選軌道", "選択トラックを削除", "선택 트랙 삭제", "Delete Selected Track" } },
@@ -219,6 +227,14 @@ const std::unordered_map<std::string, Row> strings {
     ,{ "dialog.apply", { "应用", "套用", "適用", "적용", "Apply" } }
     ,{ "dialog.save", { "保存", "儲存", "保存", "저장", "Save" } }
     ,{ "dialog.discard", { "放弃更改", "放棄變更", "変更を破棄", "변경 내용 버리기", "Discard Changes" } }
+    ,{ "dialog.ustImportTitle", { "导入 UST", "匯入 UST", "USTの読み込み", "UST 가져오기", "Import UST" } }
+    ,{ "dialog.ustImportMessage", { "当前工程已有内容。要用这个 UST 新建工程，还是把它添加为一条新音轨？", "目前工程已有內容。要用這個 UST 新建工程，還是把它加為一條新軌道？", "プロジェクトには既に内容があります。このUSTで新しく開き直しますか、それとも新しいトラックとして追加しますか？", "프로젝트에 이미 내용이 있습니다. 이 UST로 새로 열까요, 아니면 새 트랙으로 추가할까요?", "This project already has content. Open this UST as the project, or add it as a new track?" } }
+    ,{ "dialog.ustReplace", { "作为新工程打开", "作為新工程開啟", "新しいプロジェクトとして開く", "새 프로젝트로 열기", "Open as the Project" } }
+    ,{ "dialog.ustAddTrack", { "添加为新音轨", "加為新軌道", "新しいトラックとして追加", "새 트랙으로 추가", "Add as a New Track" } }
+    ,{ "dialog.midiTrackTitle", { "导入 MIDI 轨道", "匯入 MIDI 軌道", "MIDIトラックの読み込み", "MIDI 트랙 가져오기", "Import MIDI Track" } }
+    ,{ "dialog.midiTrackMessage", { "这个 MIDI 文件有多个带音符的轨道，选择要导入哪一个。", "這個 MIDI 檔案有多個帶音符的軌道，選擇要匯入哪一個。", "このMIDIファイルには音符のあるトラックが複数あります。読み込むトラックを選んでください。", "이 MIDI 파일에는 음표가 있는 트랙이 여러 개 있습니다. 가져올 트랙을 선택하세요.", "This MIDI file has more than one track with notes. Choose the one to import." } }
+    ,{ "dialog.midiTrackLabel", { "轨道", "軌道", "トラック", "트랙", "Track" } }
+    ,{ "dialog.midiTrackNotes", { "个音符", "個音符", "音符", "개 음표", "notes" } }
     ,{ "dialog.unsavedTitle", { "工程尚未保存", "工程尚未儲存", "プロジェクトは未保存です", "프로젝트가 저장되지 않음", "Unsaved Project" } }
     ,{ "dialog.unsavedMessage", { "是否先保存当前工程的更改？", "是否先儲存目前工程的變更？", "現在のプロジェクトの変更を保存しますか？", "현재 프로젝트 변경 내용을 저장할까요?", "Save changes to the current project first?" } }
     ,{ "settings.title", { "设置", "設定", "設定", "설정", "Settings" } }

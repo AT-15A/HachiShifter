@@ -2,7 +2,10 @@
 
 #include <juce_data_structures/juce_data_structures.h>
 #include <juce_audio_formats/juce_audio_formats.h>
+#include "backend/UtauOtoOverride.h"
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -71,6 +74,14 @@ enum class UtauMode { classic, jie, mou };
 // CV and only adds the VC beside it, so everything that reads oto4 reads it
 // for both.  Only the labels tell the two apart.
 [[nodiscard]] constexpr bool utauModeUsesRegions(UtauMode mode)
+{
+    return mode != UtauMode::classic;
+}
+
+// 线性flag -- a flag drawn as a curve along the note instead of written once in
+// the Flags box -- is offered by 界 and 谋 only.  Plain UTAU stays what UTAU
+// itself sends: one flag string for the whole note.
+[[nodiscard]] constexpr bool utauModeUsesFlagCurves(UtauMode mode)
 {
     return mode != UtauMode::classic;
 }
@@ -173,7 +184,22 @@ struct AmplitudeEnvelopePoint
 {
     double timeSeconds = 0.0;
     float gainDb = 0.0f;
+    // The stretch from this point to the next runs straight in amplitude, the
+    // way UTAU reads an envelope, instead of straight in dB.  Only presets ask
+    // for it; everything drawn by hand, imported or saved before keeps dB.
+    bool linearToNext = false;
 };
+
+// The envelope scaled by a base value, in linear percent -- the way UTAU
+// counts an envelope, so 200 really is twice as loud and not twice the dB.
+// A point at silence stays at silence: nothing multiplied by anything is
+// still nothing, and the two ends of a UST envelope are there to be silent.
+[[nodiscard]] float scaledEnvelopeGainDb(float gainDb, double factor);
+[[nodiscard]] std::vector<AmplitudeEnvelopePoint> scaledAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& points, float basePercent);
+// And back again, for writing an edited shape into a note that carries a base.
+[[nodiscard]] std::vector<AmplitudeEnvelopePoint> unscaledAmplitudeEnvelope(
+    const std::vector<AmplitudeEnvelopePoint>& points, float basePercent);
 
 // A handle on a per-frame flag curve.  Times are relative to the nominal note
 // start, exactly like an amplitude envelope point, and may be negative to
@@ -218,7 +244,9 @@ struct FlagCurve
 // ranges are the engine's own clamps, so a handle cannot be put somewhere that
 // would not be rendered.  Only flags whose effect is decided frame by frame
 // are here: a kernel choice or a whole-note normalisation has no per-frame
-// meaning, and the engine says so and ignores it.
+// meaning, and the engine says so and ignores it.  The one exception is MY,
+// the scream: the engine runs it on the finished mix rather than frame by
+// frame, and reads the curve there for its depth.
 struct FlagCurveKind
 {
     const char* flag;
@@ -288,6 +316,16 @@ struct NoteData
     // offset, so shifting the offset carries all of them along together.  It
     // changes which audio is played, never where the note sits in the piece.
     double utauStpSeconds = 0.0;
+    // This note's own oto entry, edited for it alone through 单独OTO编辑.  When
+    // enabled the note renders from it instead of its voicebank entry, and the
+    // oto files are never touched.  It describes one recording, so a new lyric
+    // takes it away.
+    backend::UtauOtoOverride utauOto;
+    // The note's own oto for a timing lookup, or nothing when it has none.
+    [[nodiscard]] const backend::UtauOtoOverride* ownOto() const
+    {
+        return utauOto.enabled ? &utauOto : nullptr;
+    }
     // Manual four-region split, as three cumulative fractions of the note's
     // sounding span (onset|glide, glide|nucleus, nucleus|coda).  Unset means
     // the regions are allocated by weight from the sample's own lengths.
@@ -302,6 +340,10 @@ struct NoteData
     double vibratoFadeOutPercent = 20.0;
     double vibratoPhasePercent = 0.0;      // 100 = one whole cycle
     double vibratoOffsetPercent = 0.0;     // shifts the swing centre, in depths
+    // Where the swing stops, as a share of the note from its start.  UTAU's
+    // always stops at the note's end, which is 100 and what a UST brings; the
+    // length is then measured back from here rather than from the note's end.
+    double vibratoEndPercent = 100.0;
     // Display only: draw the pitch line with the vibrato already folded in,
     // instead of a flat pitch line plus a separate swing.  Purely how the
     // note is shown; what is rendered is the same either way.
@@ -314,6 +356,12 @@ struct NoteData
     // not a timing override: splicing must not touch preutterance or
     // overlap, which belong to the voicebank and drive the drawn spans.
     bool utauSplice = false;
+    // Whether this note and a note that abuts it are joined by the editor's
+    // own short S transition.  On for notes made here.  Off for notes read
+    // from a UST, whose pitch is what the file says: a note with no bend of
+    // its own sits on its own pitch to its edges, as UTAU sings it, and a bend
+    // it does carry is sung as written rather than having its ends replaced.
+    bool utauAutoPitchTransition = true;
     juce::String utauRegionFlags1, utauRegionFlags2,
                  utauRegionFlags3, utauRegionFlags4;
     // Per-frame ("linear") flags for this note.  While this is on, g comes
@@ -354,10 +402,9 @@ struct NoteData
     // deliberately added collinear handle survives simplification and save/load.
     std::vector<PitchCurveEditPoint> pitchControlPoints;
     std::vector<AmplitudeEnvelopePoint> amplitudeEnvelope;
-    // Scales the whole amplitude envelope up or down without changing its
-    // shape.  100 is the envelope as drawn; 200 is twice as loud; 0 is silence.
-    // A note with no envelope of its own still has an implied flat 100% line,
-    // which this raises like any other.
+    // The envelope's height as a whole, in UTAU's own linear percent: 100 is
+    // the envelope as drawn, 200 twice as tall, 0 silence.  A note with no
+    // envelope has a flat 100% one, so this raises it just the same.
     float amplitudeEnvelopeBasePercent = 100.0f;
     std::vector<double> sibilantMarkers;
 };
@@ -443,6 +490,97 @@ struct TrackData
     std::vector<ClipData> clips;
 };
 
+// One pitch line for UTAU notes whose pitch points reach into one another.
+//
+// A note's points used to be its own and nothing else's: the first point of a
+// UST bend sits before its note, over the tail of the one before, and dragging
+// it reshaped only its own note's consonant -- the tail it visibly lay on sang
+// on unchanged.  Now, where the next note's bend reaches back into a note, the
+// two sing one line, and what decides the pitch at any moment is the points
+// drawn there, whichever note they were placed on.
+//
+// At each moment the line belongs to the latest note whose first point has
+// been reached.  Within that stretch the note's own curve is sung exactly as
+// it stands, up to its last point there; from that point the line runs
+// smoothly into the next note's first point, and on along the next note's
+// curve.  Both ends of that join are points on screen: nothing is laid in
+// between, since anything worked out from the points either side moves when
+// either of them is dragged, and the line never stands still only to drop
+// straight down at the hand-over.  A note's points past the
+// moment the next one takes over decide nothing any more -- a UST bend often
+// runs on for hundreds of milliseconds past its note -- so they are neither
+// drawn nor offered, rather than left there to be dragged in vain.
+//
+// Unedited notes that only touch keep their own lines. Explicit edits meeting
+// a boundary, or reaching across one or more adjacent notes, are read by every
+// affected note; a receiving note need not own any control points. Rests, gaps
+// and independent overlapping voices separate lines -- except a rest shorter
+// than 80 ms (a UST's rests come in as gaps) that a bend drawn on both sides
+// reaches over.
+struct SharedPitchLine
+{
+    // A stretch of the line: a note's whole curve, over the stretch it owns,
+    // or the join from its last point to the next note's first.  Before the
+    // first stretch and after the last, the ends are held.
+    struct Piece
+    {
+        double from = 0.0;   // absolute seconds
+        std::vector<PitchCurveEditPoint> points;   // absolute seconds, absolute MIDI
+    };
+    std::vector<Piece> pieces;   // in time order, each running to the next's start
+    [[nodiscard]] float midiAt(double absoluteSeconds) const;
+    // Where the line has corners, absolute: every point of every piece within
+    // its stretch, and every stretch's start.
+    [[nodiscard]] std::vector<double> cornersBetween(double from, double to) const;
+};
+struct SharedPitchLineMember
+{
+    std::shared_ptr<const SharedPitchLine> line;
+    // The stretch this note's own points decide, absolute.  Points outside it
+    // are overruled by a later note.  Empty when a later note's bend reaches
+    // back past all of this one.
+    double ownFrom = -std::numeric_limits<double>::infinity();
+    double ownTo = std::numeric_limits<double>::infinity();
+    // Where its part of the line is drawn: its own stretch, up to where the
+    // next note takes over, so the notes of a line draw it end to end.
+    double drawFrom = 0.0;
+    double drawTo = 0.0;
+    // Where the next note takes over: its first point.
+    double takeover = std::numeric_limits<double>::infinity();
+    bool joinsPrevious = false;
+    bool joinsNext = false;
+    [[nodiscard]] bool owns(double absoluteSeconds) const
+    {
+        return ownTo > ownFrom && absoluteSeconds >= ownFrom - 1.0e-9
+            && absoluteSeconds <= ownTo + 1.0e-9;
+    }
+};
+struct SharedPitchLines
+{
+    std::map<juce::String, SharedPitchLineMember> byNote;
+    [[nodiscard]] const SharedPitchLineMember* memberFor(const juce::String& noteId) const
+    {
+        const auto found = byNote.find(noteId);
+        return found != byNote.end() ? &found->second : nullptr;
+    }
+};
+// The shared lines of one track.  replacedNoteId/replacedPoints stand in for
+// that note's placed points, so a point being dragged is seen before it lands.
+[[nodiscard]] SharedPitchLines sharedPitchLines(
+    const TrackData& track, const juce::String& replacedNoteId = {},
+    const std::vector<PitchCurveEditPoint>* replacedPoints = nullptr);
+// A note's own pitch points, relative to its start: the ones placed on it, or
+// the contour it is sung along when it has none.
+[[nodiscard]] std::vector<PitchCurveEditPoint> ownPitchPoints(const NoteData& note);
+
+// Whether a track can carry a 线性flag at all: the UTAU algorithm in one of the
+// two modes that offer it.  Pure, and public so the window, the roll, the model
+// and a check all read the same rule.
+[[nodiscard]] inline bool trackTakesFlagCurves(const TrackData& track)
+{
+    return track.pitchAlgorithm == PitchAlgorithm::utau
+        && utauModeUsesFlagCurves(track.utauMode);
+}
 // A native connection is explicit and can cross source files or HJM regions.
 // The legacy note booleans remain as a compatibility projection for existing
 // renderers; new editing code can identify both endpoints without guessing
@@ -461,6 +599,11 @@ struct NativeConnection
 // Vibrato offset in cents at a time inside the note.  Shared by the piano roll
 // and the renderer so what is drawn is what is heard.
 double vibratoCentsAt(const NoteData& note, double localSeconds);
+// Where a note's vibrato runs, in seconds from the note's start: it stops at
+// vibratoEndPercent of the note and reaches back vibratoLengthPercent of the
+// note from there, never before the note begins.
+struct VibratoSpan { double start = 0.0; double end = 0.0; };
+[[nodiscard]] VibratoSpan vibratoSpanOf(const NoteData& note);
 
 struct TempoChange
 {
@@ -514,13 +657,48 @@ public:
     void setTrackName(const juce::String& trackId, const juce::String& name);
     bool setClipNotesIfEmpty(const juce::String& clipId, std::vector<NoteData> notes);
     bool addMidiFile(const juce::File& file, juce::String& error);
+    // One track of a MIDI file, as the import offers it.
+    struct MidiTrackChoice
+    {
+        int index = 0;         // its place in the file, from 0
+        juce::String name;     // the name it gives itself, when it gives one
+        int noteCount = 0;
+    };
+    // The tracks of a MIDI file that have notes on them, in file order.  A
+    // conductor track, or any other with nothing to sing, is not one of them.
+    [[nodiscard]] static std::vector<MidiTrackChoice> midiTrackChoices(const juce::File& file,
+                                                                       juce::String& error);
+    // One of them as a new track, the way 新建轨道 makes one, with its notes
+    // and their lyrics.  The notes land on the project's beats -- as a UST's
+    // do -- and the file's tempo, tempo changes and time signature are taken
+    // only when the project has no tracks yet.  One undo takes it away again.
+    // Returns the new track's id, or nothing with error set.
+    [[nodiscard]] juce::String addMidiTrack(const juce::File& file, int trackIndex,
+                                            juce::String& error);
+    // The same song written back out: every track that has notes, with the
+    // tempo map, the time signature and the lyrics, as a type 1 file at 480
+    // ticks to the quarter.  Musical time, not seconds -- a project read back
+    // into this editor, or opened in anything else, lands on the same beats.
+    static bool writeMidiFile(const ProjectData& data, const juce::File& file,
+                              juce::String& error);
 
     // A UTAU project file, opened as a plain UTAU track: the notes, their
     // lyrics and timing, and the per-note UTAU parameters the renderer reads.
     // warnings collects what could not be carried over, which is worth saying
     // out loud rather than leaving it to be noticed missing.
+    //
+    // A UST is a song, so importing one is opening it: replaceProject leaves
+    // nothing of what was open, which is what lets the new song own the tempo
+    // map and the project's name.  addTrack lays it beside what is already
+    // there instead -- a harmony part beside a lead -- and is what the MCP
+    // tool asks for.  Either way one undo brings the previous project back
+    // whole.  importedTrackId, when given, comes back naming the new track,
+    // because that is the one worth showing afterwards.
+    enum class UstImportMode { addTrack, replaceProject };
     bool addUstFile(const juce::File& file, juce::String& error,
-                    juce::StringArray& warnings);
+                    juce::StringArray& warnings,
+                    UstImportMode mode = UstImportMode::addTrack,
+                    juce::String* importedTrackId = nullptr);
     void setTempo(double bpm, int numerator, int denominator = 4);
     void setTempoChange(double quarterPosition, double bpm);
     // Digest of everything the project serialiser writes.  Use this to ask
@@ -551,8 +729,9 @@ public:
     // been edited by hand there is no way back to the parametric form.
     bool bakeNoteVibratoIntoPitch(const juce::String& noteId);
     void setNotesUtauSplice(const std::vector<juce::String>& noteIds, bool enabled);
-    // Turning this on gives a note that has no curve yet a flat one at zero,
-    // so there is something to drag rather than an empty lane.
+    // Only where trackTakesFlagCurves says so -- 界 and 谋: asking for one on a
+    // plain UTAU track does nothing.  Turning it off is allowed anywhere, so a
+    // track moved to plain UTAU can put away what it was holding.
     void setNotesUtauFlagCurveEnabled(const std::vector<juce::String>& noteIds,
                                       bool enabled);
     // Drop every flag curve on the given notes, back to what they looked like
@@ -565,6 +744,7 @@ public:
     bool resetNotesUtauFlagCurve(const std::vector<juce::String>& noteIds,
                                  const juce::String& flag);
     // An empty list drops that flag's curve; the others are left alone.
+    // Points land on 界 and 谋 tracks only; dropping works on any of them.
     bool setNoteUtauFlagCurve(const juce::String& noteId, const juce::String& flag,
                               std::vector<FlagCurvePoint> points);
     void setNotesRegionFlags(const std::vector<juce::String>& noteIds, bool split,
@@ -633,21 +813,57 @@ public:
     void setNoteBreath(const juce::String& noteId, float breath);
     void setNoteFormant(const juce::String& noteId, float semitones);
     void setNoteGain(const juce::String& noteId, float gain);
+    void setNotesAmplitudeEnvelopeBase(const std::vector<juce::String>& noteIds,
+                                       float basePercent);
     void setNoteAttack(const juce::String& noteId, double consonantSeconds, float attackSpeed);
     void setNoteAttackSpeed(const juce::String& noteId, float attackSpeed);
     void setNoteLabel(const juce::String& noteId, const juce::String& label);
+    // Every Chinese character in the lyrics of a UTAU track turned into its
+    // pinyin (see lyricInPinyin), in one undoable step.  Nothing on a track
+    // that is not UTAU.  How many notes changed.
+    int convertTrackLyricsToPinyin(const juce::String& trackId);
     // Several at once, as one undoable step.  Typing a line of lyrics is one
     // action to the person doing it, so one Ctrl+Z should take it back rather
     // than walking the phrase backwards a syllable at a time.
     void setNoteLabels(const std::vector<std::pair<juce::String, juce::String>>& labels);
     // Convert Chinese lyrics without tying the command to an import source or
     // renderer; callers decide which track/selection to apply it to.
-    int convertTrackLyricsToPinyin(const juce::String& trackId);
+
     void setNoteUtauFlags(const juce::String& noteId, const juce::String& flags);
     void setNotesUtauFlags(const std::vector<juce::String>& noteIds,
                            const juce::String& flags);
     void setNotesUtauConsonantVelocity(const std::vector<juce::String>& noteIds,
                                        int velocity);
+    // Puts a note of no length immediately in front of this one: 拼字.
+    //
+    // A note with no body of its own sounds only its lead-in, and the lead-in
+    // is the consonant -- the first region.  That is what it is for: a
+    // consonant of its own in front of a note that is to be sung as a vowel.
+    //
+    // It sits on the same beat as the note it leads into and takes that note's
+    // pitch and lyric, so it renders something rather than the preview tone
+    // until a lyric of its own is typed.  Listed in front of it, and on the
+    // same beat the shorter note leads, so the two agree about the order.
+    //
+    // The note it leads into has its preutterance pinned to nothing, keeping
+    // the overlap it had, so its vowel starts on its own beat and the
+    // consonant is heard right up to it.  Left as it was, that note went on
+    // reaching back over the consonant with its own lead-in and cut it off
+    // early -- and its handle sat exactly on top of the new note's, so it could
+    // not be taken hold of to change that.  Pinned, it can be dragged back out
+    // over the consonant by hand, and crosses it only then.
+    //
+    // One undoable step for both.  Empty when the note is not found, or when
+    // it begins at the very start of its clip -- a lead-in reaches back before
+    // the beat, and there is nothing to reach back into there.
+
+    // Gives one note its own oto entry, or takes it away again with one whose
+    // enabled is false.  One undoable step.
+    void setNoteUtauOto(const juce::String& noteId, const backend::UtauOtoOverride& oto);
+    // 恢复为音源OTO: these notes go back to their voicebank entries.  Notes with
+    // no oto of their own are left alone.  One undoable step, and none at all
+    // when there was nothing to restore.
+    void clearNotesUtauOto(const std::vector<juce::String>& noteIds);
     // Sets the STP of these notes, in seconds.  One undoable step.
     void setNotesUtauStp(const std::vector<juce::String>& noteIds, double seconds);
     void setNoteUtauTimingOverrides(const juce::String& noteId, bool enabled,
@@ -663,8 +879,7 @@ public:
         std::vector<std::pair<juce::String, std::vector<AmplitudeEnvelopePoint>>> envelopes);
     // Scales the whole amplitude envelope of these notes by a base percent
     // (100 = unchanged, 200 = twice as loud, 0 = silence) without reshaping it.
-    void setNotesAmplitudeEnvelopeBase(const std::vector<juce::String>& noteIds,
-                                       float basePercent);
+
     // Where a new note goes, and whether there is room for one at all.
     //
     // Notes on one track are a sequence, not a chord: the UTAU modes splice
